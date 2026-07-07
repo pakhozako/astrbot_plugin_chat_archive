@@ -68,7 +68,7 @@ tests/
 | 媒体归档 | 复制本地可访问图片、视频、语音、文件，记录媒体元数据 |
 | 媒体去重 | 以 SHA-256 命名实体文件，`media_blobs.ref_count` 管理引用生命周期 |
 | 安全路由 | `/media/<media_id>` 只接受数据库数字 ID，并校验路径位于媒体目录内 |
-| Telegram 风格 WebUI | 会话列表、消息气泡、日期分组、连续消息合并、虚拟滚动 |
+| Telegram 风格 WebUI | 会话列表、消息气泡、日期分组、连续消息合并、分页加载 |
 | 搜索与过滤 | 支持 FTS5/LIKE 搜索、高亮、发送者/类型/媒体/时间/标签过滤 |
 | 收藏与标签 | 支持收藏消息、标签筛选、搜索历史和会话已读状态 |
 | 多格式导出 | 支持 JSON、Markdown、TXT、HTML、ZIP，ZIP 可打包本地媒体 |
@@ -123,6 +123,9 @@ exports/                    导出文件
 | `capture_group` | `true` | 是否归档群聊消息 |
 | `capture_media_files` | `true` | 是否复制本地可访问的媒体文件 |
 | `max_media_mb` | `200` | 单个媒体文件最大复制大小，单位 MB |
+| `download_remote_media` | `true` | 自动下载远程图片，入库后在 WebUI 内联预览 |
+| `remote_media_timeout_seconds` | `10` | 远程图片下载超时时间，单位秒 |
+| `allow_private_remote_media` | `false` | 是否允许下载内网/本机媒体 URL，默认关闭以降低 SSRF 风险 |
 | `max_storage_mb` | `0` | 归档总存储上限，0 表示不限制 |
 | `durable_write` | `true` | 消息入队时写入 pending journal 并执行 fsync |
 | `retention_days` | `0` | 默认保留天数，0 表示不自动清理 |
@@ -158,7 +161,7 @@ timeline
 | 区域 | 能力 |
 |------|------|
 | 会话栏 | 会话列表、多会话切换、未读数、最近消息时间 |
-| 时间线 | 日期分组、连续消息合并、Telegram 风格消息气泡、虚拟滚动 |
+| 时间线 | 日期分组、连续消息合并、Telegram 风格消息气泡、分页加载 |
 | 搜索 | 关键词高亮、上一个/下一个结果、发送者/类型/媒体/时间过滤 |
 | 媒体 | 图片缩略图、视频/音频播放、文件下载、全屏预览 |
 | 操作 | 收藏、标签、复制文本、查看原始 JSON、右键菜单 |
@@ -204,9 +207,10 @@ Chat Archive fallback replay
 
 - SQLite 使用 WAL 和增量索引：`sessions(session_id)`、`messages(session_id, timestamp)`、`messages(platform)`。
 - 媒体文件以 `sha256` 文件名保存，相同内容只保存一份实体文件。
+- 远程图片 URL 会先下载到插件媒体目录，再通过 `/media/<media_id>` 渲染；默认只允许公网 `http/https` 图片，避免前端直接暴露外链和降低 SSRF 风险。
 - `/media/<media_id>` 不接受任意路径或 hash 字符串，只接受数据库媒体数字 ID。
 - `durable_write=true` 会带来每条消息一次 journal append + fsync 的成本；这是为了优先保证“消息进入插件后不丢失”。
-- WebUI 使用虚拟滚动，只渲染可见消息，适合大归档浏览。
+- WebUI 使用分页加载和稳定 DOM 信息流，避免媒体消息滚动时反复重建节点。
 
 ---
 

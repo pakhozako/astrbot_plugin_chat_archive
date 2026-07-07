@@ -32,6 +32,9 @@ class ChatArchivePlugin(Star):
             ArchiveConfig(
                 capture_media_files=bool(config.get("capture_media_files", True)),
                 max_media_mb=int(config.get("max_media_mb", 200) or 200),
+                download_remote_media=bool(config.get("download_remote_media", True)),
+                remote_media_timeout_seconds=float(config.get("remote_media_timeout_seconds", 10) or 10),
+                allow_private_remote_media=bool(config.get("allow_private_remote_media", False)),
                 max_storage_mb=self._optional_number(config.get("max_storage_mb", None)),
                 durable_write=bool(config.get("durable_write", True)),
             ),

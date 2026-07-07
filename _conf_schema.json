@@ -25,6 +25,23 @@
     "type": "int",
     "default": 200
   },
+  "download_remote_media": {
+    "description": "自动下载远程图片并在 WebUI 中内联预览",
+    "type": "bool",
+    "default": true,
+    "hint": "只下载 http/https 图片，保存到插件媒体目录后通过 /media/<id> 访问；关闭后只保存原始 URL。"
+  },
+  "remote_media_timeout_seconds": {
+    "description": "远程图片下载超时时间（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "allow_private_remote_media": {
+    "description": "允许下载内网或本机地址的远程媒体",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭以降低 SSRF 风险；只有适配器明确使用可信本机/内网媒体代理时再开启。"
+  },
   "max_storage_mb": {
     "description": "归档总存储上限 MB，留空或 0 表示不限制",
     "type": "int",

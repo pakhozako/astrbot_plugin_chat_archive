@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
+import mimetypes
 import os
 import shutil
+import socket
 import sqlite3
 import time
 import uuid
@@ -14,6 +17,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import unquote, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 MEDIA_COMPONENT_TYPES = {"image", "video", "record", "file"}
@@ -21,10 +27,23 @@ DEFAULT_BATCH_SIZE = 20
 DEFAULT_FLUSH_INTERVAL_SECONDS = 3.0
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise HTTPError(req.full_url, code, msg, headers, fp)
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
 @dataclass
 class ArchiveConfig:
     capture_media_files: bool = True
     max_media_mb: int = 200
+    download_remote_media: bool = True
+    remote_media_timeout_seconds: float = 10.0
+    allow_private_remote_media: bool = False
     max_storage_mb: float | None = None
     batch_size: int = DEFAULT_BATCH_SIZE
     flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS
@@ -257,7 +276,7 @@ class ChatArchiveStore:
     async def store_event(self, event: Any) -> str:
         payload = await self._event_payload(event)
         message_uid = payload["message_uid"]
-        media_rows = await self._extract_media(payload["components"], message_uid, payload["created_at"])
+        media_rows = await self._extract_media(payload["components"], message_uid, payload["created_at"], capture_files=False)
         payload["media_count"] = len(media_rows)
 
         entry = {
@@ -559,6 +578,7 @@ class ChatArchiveStore:
             pass
 
     def _write_entries(self, entries: list[dict[str, Any]]) -> int:
+        self._prepare_media_for_write(entries)
         records_to_append: list[dict[str, Any]] = []
         inserted = False
         with self._connection() as conn:
@@ -819,7 +839,14 @@ class ChatArchiveStore:
             }
         return repr(value)
 
-    async def _extract_media(self, components: list[dict[str, Any]], message_uid: str, created_at: int) -> list[dict[str, Any]]:
+    async def _extract_media(
+        self,
+        components: list[dict[str, Any]],
+        message_uid: str,
+        created_at: int,
+        *,
+        capture_files: bool = True,
+    ) -> list[dict[str, Any]]:
         rows = []
         for component in components:
             kind = str(component.get("kind") or "").lower()
@@ -831,7 +858,15 @@ class ChatArchiveStore:
                 raw_data = {}
             source = raw_data.get("file") or raw_data.get("url") or raw_data.get("path") or raw_data.get("file_") or ""
             name = raw_data.get("name") or _safe_name(str(source or kind), fallback=kind)
-            local_path, relative_path, size, sha256 = self._copy_media_file(kind, str(source or ""), str(name or kind), created_at)
+            local_path = relative_path = sha256 = detected_mime = None
+            size = raw_data.get("size")
+            if capture_files:
+                local_path, relative_path, size, sha256, detected_mime = self._copy_media_file(
+                    kind,
+                    str(source or ""),
+                    str(name or kind),
+                    created_at,
+                )
             rows.append(
                 {
                     "component_index": int(component.get("index") or 0),
@@ -841,7 +876,7 @@ class ChatArchiveStore:
                     "hash": sha256,
                     "local_path": local_path,
                     "relative_path": relative_path,
-                    "mime": raw_data.get("mime") or raw_data.get("content_type"),
+                    "mime": detected_mime or raw_data.get("mime") or raw_data.get("content_type"),
                     "size": size,
                     "width": raw_data.get("width"),
                     "height": raw_data.get("height"),
@@ -850,41 +885,205 @@ class ChatArchiveStore:
             )
         return rows
 
-    def _copy_media_file(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None]:
+    def _prepare_media_for_write(self, entries: list[dict[str, Any]]) -> None:
+        for entry in entries:
+            payload = entry.get("payload") or {}
+            created_at = int(payload.get("created_at") or time.time())
+            media_rows = entry.get("media") or []
+            if not isinstance(media_rows, list):
+                continue
+            for row in media_rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("local_path") and row.get("hash"):
+                    continue
+                source = str(row.get("source") or "")
+                if not source:
+                    continue
+                local_path, relative_path, size, sha256, detected_mime = self._copy_media_file(
+                    str(row.get("kind") or ""),
+                    source,
+                    str(row.get("name") or row.get("kind") or "media"),
+                    created_at,
+                )
+                if local_path:
+                    row["local_path"] = local_path
+                if relative_path:
+                    row["relative_path"] = relative_path
+                if size is not None:
+                    row["size"] = size
+                if sha256:
+                    row["hash"] = sha256
+                if detected_mime and not row.get("mime"):
+                    row["mime"] = detected_mime
+
+    def _copy_media_file(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         if not self.config.capture_media_files or not source:
-            return None, None, None, None
-        if source.startswith(("http://", "https://", "base64://", "data:")):
-            return None, None, None, None
+            return None, None, None, None, None
+        if source.startswith(("http://", "https://")):
+            return self._download_remote_media(kind, source, name, created_at)
+        if source.startswith(("base64://", "data:")):
+            return None, None, None, None, None
         source_path = source
         if source_path.startswith("file:///"):
             try:
-                from urllib.parse import unquote, urlparse
-
                 parsed = urlparse(source_path)
                 source_path = unquote(parsed.path)
                 if os.name == "nt" and source_path.startswith("/"):
                     source_path = source_path[1:]
             except Exception:
-                return None, None, None, None
+                return None, None, None, None, None
         try:
             src = Path(source_path)
             if not src.exists() or not src.is_file():
-                return None, None, None, None
+                return None, None, None, None, None
             size = src.stat().st_size
             if size > max(1, int(self.config.max_media_mb)) * 1024 * 1024:
-                return None, None, size, None
+                return None, None, size, None, None
             sha256 = self._file_sha256(src)
-            date_part = time.strftime("%Y/%m/%d", time.localtime(created_at))
-            target_dir = self.media_dir / kind / date_part
-            target_dir.mkdir(parents=True, exist_ok=True)
             suffix = src.suffix or Path(_safe_name(name)).suffix
-            target_name = f"{sha256}{suffix}"
-            target = target_dir / target_name
+            target = self._media_target_path(kind, created_at, sha256, suffix)
             if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)
-            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256
+            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, mimetypes.guess_type(target.name)[0]
         except Exception:
-            return None, None, None, None
+            return None, None, None, None, None
+
+    def _download_remote_media(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+        if kind != "image" or not self.config.download_remote_media:
+            return None, None, None, None, None
+        max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
+        try:
+            final_url, response = self._open_remote_media(source)
+            with response:
+                content_type = self._normalize_image_mime(response.headers.get("Content-Type"))
+                if response.headers.get("Content-Type") and not content_type:
+                    return None, None, None, None, None
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None and int(content_length) > max_bytes:
+                    return None, None, int(content_length), None, content_type or None
+
+                temp_dir = self.media_dir / ".tmp"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                temp_path = temp_dir / f"remote-{uuid.uuid4().hex}.tmp"
+                digest = hashlib.sha256()
+                size = 0
+                try:
+                    with temp_path.open("wb") as f:
+                        while True:
+                            chunk = response.read(1024 * 256)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > max_bytes:
+                                return None, None, size, None, content_type or None
+                            digest.update(chunk)
+                            f.write(chunk)
+                    if size <= 0:
+                        return None, None, 0, None, content_type or None
+                    detected_type = self._detect_image_mime(temp_path)
+                    if not detected_type:
+                        return None, None, size, None, content_type or None
+                    content_type = detected_type
+                    sha256 = digest.hexdigest()
+                    suffix = self._remote_media_suffix(final_url, name, content_type)
+                    target = self._media_target_path(kind, created_at, sha256, suffix)
+                    if not target.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        temp_path.replace(target)
+                        temp_path = None
+                    return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, content_type or mimetypes.guess_type(target.name)[0]
+                finally:
+                    if temp_path is not None:
+                        try:
+                            temp_path.unlink()
+                        except FileNotFoundError:
+                            pass
+        except (OSError, HTTPError, TimeoutError, ValueError):
+            return None, None, None, None, None
+
+    def _open_remote_media(self, source: str):
+        current_url = source
+        opener = build_opener(_NoRedirectHandler)
+        timeout = max(1.0, float(self.config.remote_media_timeout_seconds or 10.0))
+        for _ in range(4):
+            parsed = urlparse(current_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("unsupported remote media url")
+            self._validate_remote_media_host(parsed.hostname)
+            request = Request(
+                current_url,
+                headers={
+                    "User-Agent": "astrbot-plugin-chat-archive/0.1",
+                    "Accept": "image/*,*/*;q=0.8",
+                },
+            )
+            try:
+                response = opener.open(request, timeout=timeout)
+            except HTTPError as exc:
+                if exc.code in {301, 302, 303, 307, 308}:
+                    location = exc.headers.get("Location")
+                    if not location:
+                        raise
+                    current_url = urljoin(current_url, location)
+                    continue
+                raise
+            return current_url, response
+        raise ValueError("too many remote media redirects")
+
+    def _validate_remote_media_host(self, hostname: str) -> None:
+        if self.config.allow_private_remote_media:
+            return
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        for info in infos:
+            address = info[4][0]
+            ip = ipaddress.ip_address(address)
+            if not ip.is_global:
+                raise ValueError("blocked private remote media address")
+
+    @staticmethod
+    def _normalize_image_mime(value: Any) -> str | None:
+        content_type = str(value or "").split(";", 1)[0].strip().lower()
+        if not content_type:
+            return None
+        aliases = {"image/jpg": "image/jpeg", "image/x-png": "image/png"}
+        content_type = aliases.get(content_type, content_type)
+        if content_type in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/avif"}:
+            return content_type
+        return None
+
+    @staticmethod
+    def _detect_image_mime(path: Path) -> str | None:
+        try:
+            with path.open("rb") as f:
+                header = f.read(32)
+        except OSError:
+            return None
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if header.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if header.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if header.startswith(b"BM"):
+            return "image/bmp"
+        if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+            return "image/webp"
+        if len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12] in {b"avif", b"avis"}:
+            return "image/avif"
+        return None
+
+    def _remote_media_suffix(self, url: str, name: str, content_type: str) -> str:
+        suffix = Path(_safe_name(name)).suffix or Path(urlparse(url).path).suffix
+        if suffix:
+            return suffix[:16]
+        guessed = mimetypes.guess_extension(content_type or "")
+        return guessed or ".bin"
+
+    def _media_target_path(self, kind: str, created_at: int, sha256: str, suffix: str) -> Path:
+        date_part = time.strftime("%Y/%m/%d", time.localtime(created_at))
+        return self.media_dir / kind / date_part / f"{sha256}{suffix}"
 
     @staticmethod
     def _file_sha256(path: Path) -> str:

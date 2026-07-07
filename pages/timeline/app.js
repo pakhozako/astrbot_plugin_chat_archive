@@ -105,158 +105,17 @@ const els = {
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
 };
 
-class VirtualTimeline {
-  constructor(container, renderItem, options = {}) {
-    this.container = container;
-    this.renderItem = renderItem;
-    this.estimateHeight = options.estimateHeight || 104;
-    this.overscan = options.overscan || 8;
-    this.items = [];
-    this.heights = new Map();
-    this.offsets = [];
-    this.total = 0;
-    this.pendingFrame = 0;
-    this.loadingTop = false;
+let loadingOlder = false;
 
-    this.spacer = document.createElement("div");
-    this.spacer.className = "virtual-spacer";
-    this.window = document.createElement("div");
-    this.window.className = "virtual-window";
-    this.spacer.appendChild(this.window);
-    this.container.replaceChildren(this.spacer);
-
-    this.container.addEventListener("scroll", () => {
-      this.schedule();
-      if (this.container.scrollTop < 72 && !this.loadingTop) {
-        this.loadingTop = true;
-        loadMessages({ append: true }).finally(() => {
-          this.loadingTop = false;
-        });
-      }
-      updateJumpButton();
-    });
-    window.addEventListener("resize", () => this.schedule());
-  }
-
-  setItems(items, { preserveTop = false, stickToBottom = false } = {}) {
-    const oldHeight = this.totalHeight();
-    const oldTop = this.container.scrollTop;
-    this.items = items;
-    this.recalculateOffsets();
-    this.render();
-    requestAnimationFrame(() => {
-      if (preserveTop) {
-        this.container.scrollTop = oldTop + Math.max(0, this.totalHeight() - oldHeight);
-      } else if (stickToBottom) {
-        this.scrollToBottom();
-      }
-      updateJumpButton();
+els.timeline.addEventListener("scroll", () => {
+  if (els.timeline.scrollTop < 72 && !loadingOlder && state.hasMore && !state.loading) {
+    loadingOlder = true;
+    loadMessages({ append: true }).finally(() => {
+      loadingOlder = false;
     });
   }
-
-  totalHeight() {
-    return this.total || 0;
-  }
-
-  getHeight(item) {
-    return this.heights.get(item.key) || item.estimate || this.estimateHeight;
-  }
-
-  recalculateOffsets() {
-    this.offsets = new Array(this.items.length);
-    let offset = 0;
-    for (let i = 0; i < this.items.length; i += 1) {
-      this.offsets[i] = offset;
-      offset += this.getHeight(this.items[i]);
-    }
-    this.total = offset;
-  }
-
-  indexAtOffset(target) {
-    let low = 0;
-    let high = this.items.length - 1;
-    let answer = this.items.length;
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2);
-      const itemBottom = this.offsets[mid] + this.getHeight(this.items[mid]);
-      if (itemBottom >= target) {
-        answer = mid;
-        high = mid - 1;
-      } else {
-        low = mid + 1;
-      }
-    }
-    return Math.max(0, Math.min(answer, this.items.length));
-  }
-
-  schedule() {
-    if (this.pendingFrame) return;
-    this.pendingFrame = requestAnimationFrame(() => {
-      this.pendingFrame = 0;
-      this.render();
-    });
-  }
-
-  visibleRange() {
-    const top = this.container.scrollTop;
-    const bottom = top + this.container.clientHeight;
-    const start = Math.max(0, this.indexAtOffset(top) - this.overscan);
-    const end = Math.min(this.items.length, this.indexAtOffset(bottom) + this.overscan + 1);
-    return { start, end };
-  }
-
-  offsetFor(index) {
-    return this.offsets[index] || 0;
-  }
-
-  render() {
-    const total = this.totalHeight();
-    this.spacer.style.height = `${Math.max(total, this.container.clientHeight)}px`;
-    const { start, end } = this.visibleRange();
-    const fragment = document.createDocumentFragment();
-
-    for (let i = start; i < end; i += 1) {
-      const item = this.items[i];
-      const wrapper = document.createElement("div");
-      wrapper.className = "virtual-row";
-      wrapper.dataset.key = item.key;
-      wrapper.style.transform = `translateY(${this.offsetFor(i)}px)`;
-      wrapper.appendChild(this.renderItem(item));
-      fragment.appendChild(wrapper);
-    }
-
-    this.window.replaceChildren(fragment);
-    requestAnimationFrame(() => this.measure());
-  }
-
-  measure() {
-    let changed = false;
-    for (const row of this.window.children) {
-      const key = row.dataset.key;
-      const height = Math.ceil(row.getBoundingClientRect().height);
-      if (key && height && Math.abs((this.heights.get(key) || 0) - height) > 2) {
-        this.heights.set(key, height);
-        changed = true;
-      }
-    }
-    if (changed) {
-      this.recalculateOffsets();
-      this.schedule();
-    }
-  }
-
-  scrollToBottom() {
-    this.container.scrollTop = Math.max(0, this.totalHeight() - this.container.clientHeight);
-  }
-
-  scrollToKey(key) {
-    const index = this.items.findIndex((item) => item.key === key);
-    if (index < 0) return;
-    this.container.scrollTo({ top: Math.max(0, this.offsetFor(index) - 96), behavior: "smooth" });
-  }
-}
-
-const timeline = new VirtualTimeline(els.timeline, renderTimelineItem, { estimateHeight: 112, overscan: 10 });
+  updateJumpButton();
+});
 
 function endpoint(path) {
   return String(path || "").replace(/^\/+/, "");
@@ -447,6 +306,7 @@ async function loadMessages({ append = false, stickToBottom = !append } = {}) {
     throw error;
   } finally {
     state.loading = false;
+    if (append) loadingOlder = false;
     els.loadMoreBtn.disabled = !state.hasMore;
   }
 }
@@ -524,10 +384,18 @@ function renderTimeline(options = {}) {
     els.timeline.replaceChildren(empty);
     return;
   }
-  if (!els.timeline.querySelector(".virtual-spacer")) {
-    els.timeline.replaceChildren(timeline.spacer);
+  const oldHeight = els.timeline.scrollHeight;
+  const oldTop = els.timeline.scrollTop;
+  const fragment = document.createDocumentFragment();
+  for (const item of items) {
+    fragment.appendChild(renderTimelineItem(item));
   }
-  timeline.setItems(items, options);
+  els.timeline.replaceChildren(fragment);
+  if (options.preserveTop) {
+    els.timeline.scrollTop = oldTop + Math.max(0, els.timeline.scrollHeight - oldHeight);
+  } else if (options.stickToBottom) {
+    scrollTimelineToBottom();
+  }
   updateSearchUi();
 }
 
@@ -544,7 +412,7 @@ function buildTimelineItems(messages) {
     const item = messages[index];
     const day = fmtDay(item.created_at);
     if (day !== lastDay) {
-      result.push({ type: "day", key: `day-${day}-${item.created_at}`, label: day, estimate: 44 });
+      result.push({ type: "day", key: `day-${day}-${item.created_at}`, label: day });
       lastDay = day;
       previousMessage = null;
     }
@@ -558,12 +426,11 @@ function buildTimelineItems(messages) {
       message: item,
       group,
       active,
-      estimate: estimateMessageHeight(item, group),
     });
     previousMessage = item;
 
     if (nextMessage && sameDay(item.created_at, nextMessage.created_at) && Math.abs(Number(nextMessage.created_at || 0) - Number(item.created_at || 0)) > 300) {
-      result.push({ type: "gap", key: `gap-${messageKey(item)}`, label: fmtFullTime(nextMessage.created_at), estimate: 36 });
+      result.push({ type: "gap", key: `gap-${messageKey(item)}`, label: fmtFullTime(nextMessage.created_at) });
       previousMessage = null;
     }
   }
@@ -601,6 +468,7 @@ function renderMessage(item, group, active = false) {
     .join(" ");
   node.setAttribute("role", "article");
   node.dataset.uid = uid;
+  node.dataset.key = `msg-${uid}`;
 
   const text = item.text || textFromComponents(item.components);
   const sender = item.sender_name || item.sender_id || "未知用户";
@@ -998,9 +866,15 @@ function jumpSearch(direction) {
   state.activeMatchIndex = (start + direction + matches.length) % matches.length;
   renderTimeline({ preserveTop: true });
   requestAnimationFrame(() => {
-    timeline.scrollToKey(`msg-${messageKey(matches[state.activeMatchIndex].item)}`);
+    scrollTimelineToKey(`msg-${messageKey(matches[state.activeMatchIndex].item)}`);
     updateSearchUi();
   });
+}
+
+function scrollTimelineToKey(key) {
+  const target = els.timeline.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (!target) return;
+  target.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 
 function updateJumpButton() {
@@ -1015,6 +889,10 @@ function updateJumpButton() {
 
 function isNearBottom() {
   return els.timeline.scrollHeight - els.timeline.scrollTop - els.timeline.clientHeight < 120;
+}
+
+function scrollTimelineToBottom() {
+  els.timeline.scrollTop = Math.max(0, els.timeline.scrollHeight - els.timeline.clientHeight);
 }
 
 function textFromComponents(components) {
@@ -1045,12 +923,6 @@ function sameDay(a, b) {
   const da = new Date(Number(a || 0) * 1000);
   const db = new Date(Number(b || 0) * 1000);
   return da.getFullYear() === db.getFullYear() && da.getMonth() === db.getMonth() && da.getDate() === db.getDate();
-}
-
-function estimateMessageHeight(item, group) {
-  const text = item.text || textFromComponents(item.components);
-  const media = Array.isArray(item.media) ? item.media.length : 0;
-  return 62 + (group.showName ? 18 : 0) + Math.ceil(String(text || "").length / 44) * 22 + media * 140;
 }
 
 function messageKey(item) {
