@@ -111,6 +111,7 @@ const els = {
 
 let loadingOlder = false;
 let messageCacheDb = null;
+let messageCacheUnavailable = false;
 
 els.timeline.addEventListener("scroll", () => {
   if (els.timeline.scrollTop < 72 && !loadingOlder && state.hasMore && !state.loading) {
@@ -392,11 +393,22 @@ function viewSignature() {
 }
 
 async function openMessageCacheDb() {
+  if (messageCacheUnavailable) return null;
   const dbFactory = window.indexedDB;
-  if (!dbFactory) return null;
+  if (!dbFactory) {
+    messageCacheUnavailable = true;
+    return null;
+  }
   if (messageCacheDb) return messageCacheDb;
   return new Promise((resolve) => {
-    const request = dbFactory.open(MESSAGE_CACHE_DB, MESSAGE_CACHE_VERSION);
+    let request;
+    try {
+      request = dbFactory.open(MESSAGE_CACHE_DB, MESSAGE_CACHE_VERSION);
+    } catch {
+      messageCacheUnavailable = true;
+      resolve(null);
+      return;
+    }
     request.onerror = () => resolve(null);
     request.onsuccess = () => {
       messageCacheDb = request.result;
@@ -420,13 +432,18 @@ async function getCachedMessagesForCurrentView(cacheKey = messageCacheKey()) {
   const db = await openMessageCacheDb();
   if (!db) return [];
   return new Promise((resolve) => {
-    const tx = db.transaction(MESSAGE_CACHE_STORE, "readonly");
-    const request = tx.objectStore(MESSAGE_CACHE_STORE).get(cacheKey);
-    request.onerror = () => resolve([]);
-    request.onsuccess = () => {
-      const messages = Array.isArray(request.result?.messages) ? request.result.messages : [];
-      resolve(dedupeMessages(messages));
-    };
+    try {
+      const tx = db.transaction(MESSAGE_CACHE_STORE, "readonly");
+      const request = tx.objectStore(MESSAGE_CACHE_STORE).get(cacheKey);
+      request.onerror = () => resolve([]);
+      request.onsuccess = () => {
+        const messages = Array.isArray(request.result?.messages) ? request.result.messages : [];
+        resolve(dedupeMessages(messages));
+      };
+    } catch {
+      messageCacheUnavailable = true;
+      resolve([]);
+    }
   });
 }
 
@@ -436,14 +453,19 @@ async function setCachedMessagesForCurrentView(messages, cacheKey = messageCache
   if (!db) return;
   const cached = dedupeMessages(messages || []).slice(-MESSAGE_CACHE_LIMIT);
   await new Promise((resolve) => {
-    const tx = db.transaction(MESSAGE_CACHE_STORE, "readwrite");
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => resolve();
-    tx.objectStore(MESSAGE_CACHE_STORE).put({
-      cacheKey,
-      messages: cached,
-      updatedAt: Date.now(),
-    });
+    try {
+      const tx = db.transaction(MESSAGE_CACHE_STORE, "readwrite");
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.objectStore(MESSAGE_CACHE_STORE).put({
+        cacheKey,
+        messages: cached,
+        updatedAt: Date.now(),
+      });
+    } catch {
+      messageCacheUnavailable = true;
+      resolve();
+    }
   });
 }
 
