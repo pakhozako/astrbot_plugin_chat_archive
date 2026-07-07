@@ -8,6 +8,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -1114,25 +1115,53 @@ class ChatArchiveStore:
         if isinstance(data, str):
             return data
         if isinstance(data, list):
-            return str(data[0] or "") if data else ""
+            for item in data:
+                found = self._media_source_from_value(item, keys)
+                if found:
+                    return found
+            return ""
         if not isinstance(data, dict):
             return ""
         for key in keys:
-            value = data.get(key)
-            if isinstance(value, str) and value:
-                return value
-            if isinstance(value, list) and value:
-                return str(value[0] or "")
-            if isinstance(value, dict) and value:
-                first = next((str(item) for item in value.values() if item), "")
-                if first:
-                    return first
-        for key in ("data", "meta", "extra"):
-            nested = data.get(key)
+            value = self._case_insensitive_get(data, key)
+            found = self._media_source_from_value(value, keys)
+            if found:
+                return found
+        for key in ("data", "meta", "extra", "media", "picElement", "imageElement", "mfaceElement", "marketFaceElement", "market_face", "videoElement", "pttElement", "voiceElement", "recordElement", "audioElement", "fileElement"):
+            nested = self._case_insensitive_get(data, key)
             if isinstance(nested, dict):
                 found = self._first_media_value(nested, keys)
                 if found:
                     return found
+        for key, value in data.items():
+            if not re.search(r"(url|path|file|source|thumb|preview|cover|origin|md5)", str(key), re.I):
+                continue
+            found = self._media_source_from_value(value, keys)
+            if found:
+                return found
+        return ""
+
+    @staticmethod
+    def _case_insensitive_get(data: dict[str, Any], key: str) -> Any:
+        if key in data:
+            return data.get(key)
+        lower_key = key.lower()
+        for candidate, value in data.items():
+            if str(candidate).lower() == lower_key:
+                return value
+        return None
+
+    def _media_source_from_value(self, value: Any, keys: tuple[str, ...]) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                found = self._media_source_from_value(item, keys)
+                if found:
+                    return found
+            return ""
+        if isinstance(value, dict):
+            return self._first_media_value(value, keys)
         return ""
 
     @staticmethod
@@ -1140,9 +1169,9 @@ class ChatArchiveStore:
         value = str(source or "").strip()
         if value.startswith("//"):
             return "https:" + value
-        if value.startswith("http://gchat.qpic.cn/"):
+        if re.match(r"^http://([a-z0-9.-]+\.)?(qpic\.cn|qq\.com)/", value, re.I):
             return "https://" + value[len("http://") :]
-        if value.startswith("/"):
+        if value.startswith("/") and not value.startswith("//"):
             return "https://gchat.qpic.cn" + value
         return value
 
@@ -1401,9 +1430,16 @@ class ChatArchiveStore:
             "image/avif",
             "image/heic",
             "image/heif",
+            "image/jxl",
+            "image/tiff",
+            "image/x-tiff",
+            "image/x-xbitmap",
+            "image/x-xpixmap",
             "image/svg+xml",
             "image/vnd.microsoft.icon",
         }:
+            if content_type == "image/x-tiff":
+                return "image/tiff"
             return content_type
         return None
 
@@ -1424,12 +1460,18 @@ class ChatArchiveStore:
             return "image/gif"
         if header.startswith(b"BM"):
             return "image/bmp"
+        if header.startswith((b"II*\x00", b"MM\x00*")):
+            return "image/tiff"
         if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
             return "image/webp"
+        if header.startswith(b"\xff\x0a"):
+            return "image/jxl"
         if len(header) >= 12 and header[4:8] == b"ftyp":
             brand = header[8:12]
             if brand in {b"avif", b"avis"}:
                 return "image/avif"
+            if brand in {b"jxl "}:
+                return "image/jxl"
             if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
                 return "image/heic"
         if header.startswith(b"\x00\x00\x01\x00"):

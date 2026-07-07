@@ -61,6 +61,7 @@ const demoMessages = buildDemoMessages();
 const imageDataCache = new Map();
 const imageDataInFlight = new Map();
 const IMAGE_LOAD_TIMEOUT_MS = 12000;
+const IMAGE_DATA_FALLBACK_TIMEOUT_MS = 5000;
 
 const els = {
   statLine: document.getElementById("statLine"),
@@ -225,6 +226,18 @@ function mediaDisplayUrl(item) {
   return mediaSourceDisplayUrl(item);
 }
 
+function markMediaContainerLoaded(container) {
+  if (!container) return;
+  container.classList.remove("load-error");
+  container.classList.add("loaded");
+}
+
+function markMediaContainerError(container) {
+  if (!container) return;
+  container.classList.remove("loaded");
+  container.classList.add("load-error");
+}
+
 function protectedImageDataRequest(src) {
   const value = String(src || "");
   if (!value || /^(data:|blob:)/i.test(value)) return null;
@@ -277,14 +290,21 @@ async function protectedImageDataUrl(src) {
   const key = `${request.path}?${JSON.stringify(request.params || {})}`;
   if (imageDataCache.has(key)) return imageDataCache.get(key);
   if (!imageDataInFlight.has(key)) {
+    const fetchDataUrl = apiGet(request.path, request.params || {})
+      .then((data) => {
+        const dataUrl = data?.data_url || "";
+        if (dataUrl) imageDataCache.set(key, dataUrl);
+        return dataUrl;
+      })
+      .catch(() => "");
     imageDataInFlight.set(
       key,
-      apiGet(request.path, request.params || {})
-        .then((data) => {
-          const dataUrl = data?.data_url || "";
-          if (dataUrl) imageDataCache.set(key, dataUrl);
-          return dataUrl;
-        })
+      Promise.race([
+        fetchDataUrl,
+        new Promise((resolve) => {
+          setTimeout(() => resolve(""), IMAGE_DATA_FALLBACK_TIMEOUT_MS);
+        }),
+      ])
         .finally(() => imageDataInFlight.delete(key)),
     );
   }
@@ -314,6 +334,21 @@ async function recoverImageSource(image) {
   } finally {
     delete image.dataset.recovering;
   }
+}
+
+function bindInlineRecoverableImage(image, options = {}) {
+  if (!image || image.dataset.inlineRecoverBound === "1") return;
+  image.dataset.inlineRecoverBound = "1";
+  const removeOnFinalError = options.removeOnFinalError !== false;
+  image.dataset.originalSrc = image.dataset.originalSrc || image.getAttribute("src") || image.currentSrc || "";
+  image.addEventListener("load", () => {
+    image.parentElement?.classList.remove("no-image");
+  });
+  image.addEventListener("error", async () => {
+    if (await recoverImageSource(image)) return;
+    image.parentElement?.classList.add("no-image");
+    if (removeOnFinalError) image.remove();
+  });
 }
 
 function fmtNumber(value) {
@@ -1069,26 +1104,8 @@ function renderMessage(item, group, active = false) {
       showProfilePopover(item, event.clientX, event.clientY);
     });
   });
-  node.querySelectorAll(".inline-market-face").forEach((image) => {
-    image.addEventListener("error", async () => {
-      if (await recoverImageSource(image)) return;
-      image.parentElement?.classList.add("no-image");
-      image.remove();
-    });
-  });
-  node.querySelectorAll(".inline-face-img").forEach((image) => {
-    image.addEventListener("error", async () => {
-      if (await recoverImageSource(image)) return;
-      image.parentElement?.classList.add("no-image");
-      image.remove();
-    });
-  });
-  node.querySelectorAll(".reaction-chip img").forEach((image) => {
-    image.addEventListener("error", async () => {
-      if (await recoverImageSource(image)) return;
-      image.parentElement?.classList.add("no-image");
-      image.remove();
-    });
+  node.querySelectorAll(".inline-market-face, .inline-face-img, .reaction-chip img").forEach((image) => {
+    bindInlineRecoverableImage(image);
   });
   node.querySelectorAll(".inline-image-preview img").forEach((image) => {
     bindImageLoadState(image, image.closest(".inline-image-preview"));
@@ -1159,19 +1176,33 @@ function bindImageLoadState(image, container) {
   if (image.loading === "lazy") image.loading = "eager";
   let finished = false;
   let timeout = null;
+  let recoveryAttempts = 0;
+  const scheduleTimeout = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => {
+      if (finished) return;
+      if (image.complete && image.naturalWidth > 0) {
+        markLoaded();
+        return;
+      }
+      markError();
+    }, IMAGE_LOAD_TIMEOUT_MS);
+  };
   const markLoaded = () => {
     finished = true;
     if (timeout) clearTimeout(timeout);
-    container.classList.remove("load-error");
-    container.classList.add("loaded");
+    markMediaContainerLoaded(container);
   };
   const markError = async () => {
     if (finished) return;
-    if (await recoverImageSource(image)) return;
+    if (await recoverImageSource(image)) {
+      recoveryAttempts += 1;
+      if (recoveryAttempts <= 2) scheduleTimeout();
+      return;
+    }
     finished = true;
     if (timeout) clearTimeout(timeout);
-    container.classList.remove("loaded");
-    container.classList.add("load-error");
+    markMediaContainerError(container);
   };
   image.addEventListener("load", markLoaded);
   image.addEventListener("error", markError);
@@ -1186,9 +1217,7 @@ function bindImageLoadState(image, container) {
         // Direct image loading remains the fallback; error/timeout will set UI state.
       });
   }
-  timeout = setTimeout(() => {
-    if (!finished && !image.complete) markError();
-  }, IMAGE_LOAD_TIMEOUT_MS);
+  scheduleTimeout();
   if (image.complete) {
     if (image.naturalWidth > 0) markLoaded();
     else markError();
@@ -1225,7 +1254,7 @@ function renderMedia(item) {
       <img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(item.name || "图片")}" />
     `;
     const image = button.querySelector("img");
-    bindImageLoadState(image, button);
+    if (image) bindImageLoadState(image, button);
     button.addEventListener("click", () => openMediaViewer(item));
     card.appendChild(button);
   } else if (displayUrl && kind === "video") {
@@ -1822,11 +1851,7 @@ function renderFaceHtml(face) {
   const id = face?.faceIndex ?? face?.faceId ?? face?.id ?? "";
   const label = face?.faceText || face?.name || (id !== "" ? `[表情${id}]` : "[表情]");
   const source = firstMediaSource(face, ["url", "faceUrl", "face_url", "imageUrl", "image_url", "fileUrl", "file_url", "filePath", "file_path", "path"]);
-  const displayUrl = source
-    ? mediaSourceDisplayUrl({ kind: "image", source })
-    : id !== "" && /^\d+$/.test(String(id))
-      ? pluginApiUrl(`image-proxy?url=${encodeURIComponent(`https://gxh.vip.qq.com/club/item/parcel/item/${String(id).slice(0, 2)}/${id}/100x100.png`)}`)
-      : "";
+  const displayUrl = source ? mediaSourceDisplayUrl({ kind: "image", source }) : "";
   if (!displayUrl) return `<span class="inline-face" title="${escapeAttr(label)}">${escapeHtml(label)}</span>`;
   return `<span class="inline-face-shell"><img class="inline-face-img" loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" title="${escapeAttr(label)}" /><em>${escapeHtml(label)}</em></span>`;
 }
@@ -2442,9 +2467,40 @@ function matchFirst(value, pattern) {
 
 function firstMapValue(value) {
   if (!value) return "";
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value[0] || "";
-  if (typeof value === "object") return Object.values(value)[0] || "";
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = firstMapValue(item);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    const directKeys = [
+      "url",
+      "src",
+      "source",
+      "path",
+      "filePath",
+      "file_path",
+      "localPath",
+      "originImageUrl",
+      "picUrl",
+      "thumbUrl",
+      "previewUrl",
+      "fileUrl",
+      "downloadUrl",
+      "imageUrl",
+      "videoUrl",
+      "audioUrl",
+      "recordUrl",
+      "pttUrl",
+    ];
+    for (const key of directKeys) {
+      const found = firstMapValue(value[key]);
+      if (found) return found;
+    }
+  }
   return "";
 }
 
@@ -2520,8 +2576,8 @@ function normalizeQpicSource(source) {
   const value = String(source || "").trim();
   if (!value) return "";
   if (value.startsWith("//")) return `https:${value}`;
-  if (value.startsWith("http://gchat.qpic.cn/")) return `https://${value.slice("http://".length)}`;
-  if (value.startsWith("/")) return `https://gchat.qpic.cn${value}`;
+  if (/^http:\/\/([a-z0-9.-]+\.)?(qpic\.cn|qq\.com)\//i.test(value)) return `https://${value.slice("http://".length)}`;
+  if (value.startsWith("/") && !value.startsWith("//")) return `https://gchat.qpic.cn${value}`;
   return value;
 }
 
@@ -2543,6 +2599,14 @@ function firstMediaSource(value, keys = []) {
     const found = firstMapValue(value[key]);
     if (found) return found;
   }
+  for (const key of keys) {
+    const lowerKey = String(key).toLowerCase();
+    const matchedKey = Object.keys(value).find((candidate) => candidate.toLowerCase() === lowerKey);
+    if (matchedKey && matchedKey !== key) {
+      const found = firstMapValue(value[matchedKey]);
+      if (found) return found;
+    }
+  }
   const nested = [
     value.data,
     value.meta,
@@ -2556,12 +2620,20 @@ function firstMediaSource(value, keys = []) {
     value.recordElement,
     value.audioElement,
     value.fileElement,
+    value.marketFaceElement,
+    value.mfaceElement,
+    value.market_face,
   ];
   for (const item of nested) {
     if (item && typeof item === "object" && item !== value) {
       const found = firstMediaSource(item, keys);
       if (found) return found;
     }
+  }
+  const looseKey = Object.keys(value).find((key) => /(url|path|file|source|thumb|preview|cover|origin|md5)/i.test(key));
+  if (looseKey) {
+    const found = firstMapValue(value[looseKey]);
+    if (found) return found;
   }
   return "";
 }
