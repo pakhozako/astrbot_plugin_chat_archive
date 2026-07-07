@@ -1210,7 +1210,6 @@ function bindRecoverableImages(root, options = {}) {
 
 function renderMedia(item) {
   const card = document.createElement("div");
-  const hasLocal = Boolean(item.local_path);
   const displayUrl = mediaDisplayUrl(item);
   const kind = normalizeMediaKind(item.kind);
   card.className = `media-card ${kind}`;
@@ -1236,11 +1235,18 @@ function renderMedia(item) {
     video.src = displayUrl;
     card.appendChild(video);
   } else if (displayUrl && kind === "audio") {
-    const audio = document.createElement("audio");
-    audio.controls = true;
-    audio.preload = "metadata";
-    audio.src = displayUrl;
-    card.appendChild(audio);
+    if (isBrowserPlayableAudio(item)) {
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.preload = "metadata";
+      audio.src = displayUrl;
+      card.appendChild(audio);
+    } else {
+      const note = document.createElement("div");
+      note.className = "media-playback-note";
+      note.textContent = "该语音格式可能无法在浏览器直接播放，可下载后转换或播放。";
+      card.appendChild(note);
+    }
   }
 
   const meta = document.createElement("div");
@@ -1909,7 +1915,9 @@ function renderPttElementHtml(ptt, wrapper = {}) {
   const width = Math.min(220, Math.max(96, 96 + duration * 4));
   const text = ptt?.text || ptt?.transcribedText || "";
   const source = firstMediaSource(ptt, mediaSourceKeys("audio"));
-  const displayUrl = mediaSourceDisplayUrl({ kind: "audio", source });
+  const mediaItem = { kind: "audio", source, mime: ptt?.mime || ptt?.contentType || ptt?.content_type, name: ptt?.fileName || ptt?.name || source };
+  const displayUrl = mediaSourceDisplayUrl(mediaItem);
+  const playable = displayUrl && isBrowserPlayableAudio(mediaItem);
   return `
     <span class="voice-element">
       <span class="voice-bar" style="width:${width}px">
@@ -1917,7 +1925,9 @@ function renderPttElementHtml(ptt, wrapper = {}) {
         <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
         <span class="voice-duration">${escapeHtml(formatDuration(duration))}</span>
       </span>
-      ${displayUrl ? `<audio class="voice-audio" controls preload="metadata" src="${escapeAttr(displayUrl)}"></audio>` : ""}
+      ${playable ? `<audio class="voice-audio" controls preload="metadata" src="${escapeAttr(displayUrl)}"></audio>` : ""}
+      ${displayUrl && !playable ? `<a class="voice-download" href="${escapeAttr(displayUrl)}" target="_blank" rel="noopener" download>下载语音</a>` : ""}
+      ${!displayUrl ? `<span class="voice-unavailable">语音源不可用</span>` : ""}
       ${text ? `<span class="voice-text">${highlightText(text, state.q)}</span>` : ""}
     </span>
   `;
@@ -1934,6 +1944,7 @@ function renderVideoElementHtml(video, wrapper = {}) {
   return `
     <button class="video-element" type="button" data-inline-media-kind="video" data-inline-media-name="${escapeAttr(name)}" ${displayUrl ? `data-inline-video="${escapeAttr(displayUrl)}"` : ""} aria-label="预览视频" style="width:${size.width}px;height:${size.height}px">
       <span class="video-cover">
+        ${thumbUrl ? `<span class="media-loading">缩略图加载中</span><span class="media-error">缩略图不可用</span>` : ""}
         ${thumbUrl ? `<img loading="lazy" src="${escapeAttr(thumbUrl)}" alt="${escapeAttr(name)}" />` : `<span>视频</span>`}
         <b>▶</b>
       </span>
@@ -2456,6 +2467,19 @@ function mediaSourceDisplayUrl(item) {
   }
   if (/^file:\/\//i.test(source) || /^[a-z]:[\\/]/i.test(source) || source.startsWith("/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   return "";
+}
+
+function isBrowserPlayableAudio(item) {
+  const mime = String(item?.mime || item?.content_type || item?.contentType || "").split(";", 1)[0].trim().toLowerCase();
+  const source = String(firstMediaSource(item, ["source", "url", "relative_path", "relativePath", "localPath", "filePath", "path", "name"]) || "");
+  const ext = source.split(/[?#]/, 1)[0].toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "";
+  if (mime) {
+    if (["audio/silk", "audio/amr", "audio/x-amr"].includes(mime)) return false;
+    if (mime.startsWith("audio/")) return true;
+  }
+  if (["silk", "amr"].includes(ext)) return false;
+  if (["mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "weba", "flac"].includes(ext)) return true;
+  return false;
 }
 
 function mediaSourceKeys(kind) {

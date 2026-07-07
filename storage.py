@@ -1217,7 +1217,8 @@ class ChatArchiveStore:
             if not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)
-            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, mimetypes.guess_type(target.name)[0]
+            detected_mime = self._detect_media_mime(kind, target) or mimetypes.guess_type(target.name)[0]
+            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, detected_mime
         except Exception:
             return None, None, None, None, None
 
@@ -1242,7 +1243,7 @@ class ChatArchiveStore:
             if not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
-            detected_mime = self._detect_image_mime(target) or mime or mimetypes.guess_type(target.name)[0]
+            detected_mime = self._detect_media_mime(kind, target) or self._normalize_image_mime(mime) or mime or mimetypes.guess_type(target.name)[0]
             return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, detected_mime
         except (ValueError, OSError, binascii.Error):
             return None, None, None, None, None
@@ -1440,6 +1441,21 @@ class ChatArchiveStore:
 
     def detect_image_mime(self, path: Path) -> str | None:
         return self._detect_image_mime(path)
+
+    def _detect_media_mime(self, kind: Any, path: Path) -> str | None:
+        media_kind = self._normalize_media_kind(kind) or "file"
+        if media_kind == "image":
+            return self._detect_image_mime(path) or mimetypes.guess_type(path.name)[0]
+        if media_kind == "video":
+            return self._detect_video_mime(path) or mimetypes.guess_type(path.name)[0]
+        if media_kind == "record":
+            return self._detect_audio_mime(path) or mimetypes.guess_type(path.name)[0]
+        return (
+            self._detect_image_mime(path)
+            or self._detect_video_mime(path)
+            or self._detect_audio_mime(path)
+            or mimetypes.guess_type(path.name)[0]
+        )
 
     @staticmethod
     def _content_type_allows_sniffing(value: Any) -> bool:
@@ -2272,7 +2288,10 @@ class ChatArchiveStore:
                 return None
         except Exception:
             return None
-        item["path"] = path
+        detected_mime = self._detect_media_mime(item.get("kind"), resolved_path)
+        if detected_mime:
+            item["mime"] = detected_mime
+        item["path"] = resolved_path
         return item
 
     def get_safe_media_path(self, value: str) -> dict[str, Any] | None:
@@ -2293,7 +2312,7 @@ class ChatArchiveStore:
                 continue
             if not resolved.exists() or not resolved.is_file():
                 continue
-            mime = self._detect_image_mime(resolved) or mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            mime = self._detect_media_mime("", resolved) or "application/octet-stream"
             return {"path": resolved, "name": resolved.name, "mime": mime}
         return None
 
@@ -2423,7 +2442,7 @@ class ChatArchiveStore:
             return "audio/mp4"
         if header.startswith(b"#!SILK"):
             return "audio/silk"
-        if header.startswith(b"AMR"):
+        if header.startswith(b"#!AMR"):
             return "audio/amr"
         return None
 
