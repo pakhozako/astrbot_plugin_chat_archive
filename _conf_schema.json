@@ -1,0 +1,55 @@
+{
+  "enabled": {
+    "description": "启用聊天归档",
+    "type": "bool",
+    "default": true
+  },
+  "capture_private": {
+    "description": "归档私聊消息",
+    "type": "bool",
+    "default": true
+  },
+  "capture_group": {
+    "description": "归档群聊消息",
+    "type": "bool",
+    "default": true
+  },
+  "capture_media_files": {
+    "description": "尝试复制图片、视频、语音和文件到归档目录",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只保存媒体来源 URL/路径，不复制实体文件。"
+  },
+  "max_media_mb": {
+    "description": "单个媒体文件最大复制大小 MB",
+    "type": "int",
+    "default": 200
+  },
+  "max_storage_mb": {
+    "description": "归档总存储上限 MB，留空或 0 表示不限制",
+    "type": "int",
+    "default": 0,
+    "hint": "超过上限时，/chatlog prune 会优先删除最早的消息。"
+  },
+  "durable_write": {
+    "description": "消息入队时同步写入 pending journal 并 fsync",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后进程被强杀也能回放未 flush 的消息；关闭后延迟更低，但系统崩溃时可能丢失 OS 缓存中的 journal 写入。"
+  },
+  "retention_days": {
+    "description": "默认保留天数，0 表示不自动清理",
+    "type": "int",
+    "default": 0
+  },
+  "web_page_size": {
+    "description": "WebUI 每页消息数量",
+    "type": "int",
+    "default": 80
+  },
+  "ignore_command_prefixes": {
+    "description": "不归档的命令前缀",
+    "type": "list",
+    "default": ["/chatlog"]
+  }
+}

@@ -1,0 +1,22 @@
+name: "astrbot_plugin_chat_archive"
+display_name: "Chat Archive"
+short_desc: "将聊天记录、图片、视频和文件归档为 SQLite/JSON，并提供时间线 WebUI"
+desc: "监听 AstrBot 消息事件，归档文本与媒体元数据到 SQLite，同时保存 JSONL，可在插件页以类似 Telegram 的信息流浏览、搜索和导出。"
+help: "命令: /chatlog status 查看统计；/chatlog export [json|markdown|txt|html|zip] 多格式导出；/chatlog prune <天数> [最大MB] 清理旧记录。WebUI: 插件页 timeline。"
+pages:
+  - name: timeline
+    title: "聊天归档时间线"
+    desc: "以类似 Telegram 的信息流浏览已归档消息、媒体和原始 JSON。"
+version: "0.1.0"
+author: "Codex"
+repo: ""
+support_platforms:
+  - aiocqhttp
+  - webchat
+  - telegram
+  - discord
+  - slack
+  - satori
+  - wecom
+  - lark
+astrbot_version: ">=4.16"
