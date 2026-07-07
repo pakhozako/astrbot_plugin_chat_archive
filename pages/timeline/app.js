@@ -515,8 +515,9 @@ function renderTimeline(options = {}) {
   const anchor = options.anchorKey ? els.timeline.querySelector(`[data-key="${CSS.escape(options.anchorKey)}"]`) : null;
   const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
   const fragment = document.createDocumentFragment();
+  const existing = new Map(Array.from(els.timeline.children).map((node) => [node.dataset?.key || "", node]).filter(([key]) => key));
   for (const item of items) {
-    fragment.appendChild(renderTimelineItem(item));
+    fragment.appendChild(renderTimelineItem(item, existing));
   }
   els.timeline.replaceChildren(fragment);
   if (options.anchorKey && anchor) {
@@ -586,20 +587,69 @@ function buildTimelineItems(messages) {
   return result;
 }
 
-function renderTimelineItem(item) {
+function renderTimelineItem(item, existing = new Map()) {
   if (item.type === "day") {
+    const reused = existing.get(item.key);
+    if (reused) return reused;
     const node = document.createElement("div");
     node.className = "day-divider";
+    node.dataset.key = item.key;
     node.textContent = item.label;
     return node;
   }
   if (item.type === "gap") {
+    const reused = existing.get(item.key);
+    if (reused) return reused;
     const node = document.createElement("div");
     node.className = "time-gap";
+    node.dataset.key = item.key;
     node.textContent = item.label;
     return node;
   }
-  return renderMessage(item.message, item.group, item.active);
+  const reused = existing.get(item.key);
+  const signature = messageRenderSignature(item.message, item.group, item.active);
+  if (reused?.dataset?.renderSignature === signature) return reused;
+  const node = renderMessage(item.message, item.group, item.active);
+  node.dataset.renderSignature = signature;
+  return node;
+}
+
+function messageRenderSignature(item, group, active) {
+  const mediaSig = (Array.isArray(item.media) ? item.media : [])
+    .map((media) => [media.id, media.kind, media.name, media.source, media.local_path, media.relative_path, media.size, media.width, media.height].join(":"))
+    .join("|");
+  const tagSig = (Array.isArray(item.tags) ? item.tags : [])
+    .map((tag) => [tag.id, tag.name, tag.color].join(":"))
+    .join("|");
+  return JSON.stringify({
+    uid: messageKey(item),
+    text: item.text || "",
+    createdAt: item.created_at || "",
+    senderId: item.sender_id || "",
+    selfId: item.self_id || "",
+    messageType: item.message_type || "",
+    components: stableSignatureValue(item.components_json || item.components || null),
+    raw: stableSignatureValue(item.raw_json || item.raw || null),
+    sender: item.sender_name || item.sender_id || "",
+    platform: item.platform || "",
+    favorite: Boolean(item.favorite),
+    tags: tagSig,
+    media: mediaSig,
+    q: state.q || "",
+    active: Boolean(active),
+    group,
+  });
+}
+
+function stableSignatureValue(value) {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(stableSignatureValue);
+  return Object.keys(value)
+    .sort()
+    .reduce((result, key) => {
+      result[key] = stableSignatureValue(value[key]);
+      return result;
+    }, {});
 }
 
 function renderSystemTip(item, text, active = false) {
@@ -687,6 +737,9 @@ function renderMessage(item, group, active = false) {
       image.remove();
     }, { once: true });
   });
+  node.querySelectorAll(".inline-image-preview img").forEach((image) => {
+    bindImageLoadState(image, image.closest(".inline-image-preview"));
+  });
 
   node.addEventListener("click", (event) => {
     const inlineImage = event.target?.closest?.("[data-inline-image]");
@@ -721,6 +774,24 @@ function openInlineImageViewer(url) {
   els.mediaViewer.hidden = false;
 }
 
+function bindImageLoadState(image, container) {
+  if (!image || !container) return;
+  const markLoaded = () => {
+    container.classList.remove("load-error");
+    container.classList.add("loaded");
+  };
+  const markError = () => {
+    container.classList.remove("loaded");
+    container.classList.add("load-error");
+  };
+  image.addEventListener("load", markLoaded, { once: true });
+  image.addEventListener("error", markError, { once: true });
+  if (image.complete) {
+    if (image.naturalWidth > 0) markLoaded();
+    else markError();
+  }
+}
+
 function renderMedia(item) {
   const card = document.createElement("div");
   const hasLocal = Boolean(item.local_path);
@@ -732,7 +803,14 @@ function renderMedia(item) {
     button.className = "media-thumb";
     button.type = "button";
     button.setAttribute("aria-label", `预览 ${item.name || "图片"}`);
-    button.innerHTML = `<img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(item.name || "图片")}" />`;
+    applyMediaPreviewSize(button, item);
+    button.innerHTML = `
+      <span class="media-loading">图片加载中</span>
+      <span class="media-error">图片不可用</span>
+      <img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(item.name || "图片")}" />
+    `;
+    const image = button.querySelector("img");
+    bindImageLoadState(image, button);
     button.addEventListener("click", () => openMediaViewer(item));
     card.appendChild(button);
   } else if (displayUrl && kind === "video") {
@@ -1208,7 +1286,14 @@ function renderPicElementHtml(pic) {
   const displayUrl = mediaSourceDisplayUrl({ kind: "image", source });
   const label = pic?.summary || pic?.fileName || pic?.name || "图片";
   if (!displayUrl) return `<span class="inline-face">${escapeHtml(`[${label}]`)}</span>`;
-  return `<button class="inline-image-preview" type="button" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片"><img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" /></button>`;
+  const size = previewSize(pic?.picWidth || pic?.width || pic?.originWidth || pic?.thumbWidth, pic?.picHeight || pic?.height || pic?.originHeight || pic?.thumbHeight, 260, 220, 120, 92);
+  return `
+    <button class="inline-image-preview" type="button" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片" style="width:${size.width}px;height:${size.height}px">
+      <span class="media-loading">图片加载中</span>
+      <span class="media-error">图片不可用</span>
+      <img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" />
+    </button>
+  `;
 }
 
 function renderFileElementHtml(file) {
@@ -1331,6 +1416,25 @@ function mediaSourceDisplayUrl(item) {
   if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
   return "";
+}
+
+function applyMediaPreviewSize(node, item) {
+  const size = previewSize(item?.width || item?.picWidth, item?.height || item?.picHeight, 320, 340, 160, 96);
+  node.style.width = `${size.width}px`;
+  node.style.height = `${size.height}px`;
+}
+
+function previewSize(width, height, maxWidth, maxHeight, fallbackWidth, fallbackHeight) {
+  let displayWidth = Number(width || 0);
+  let displayHeight = Number(height || 0);
+  if (!displayWidth || !displayHeight) {
+    displayWidth = fallbackWidth;
+    displayHeight = fallbackHeight;
+  }
+  const scale = Math.min(maxWidth / displayWidth, maxHeight / displayHeight, 1);
+  displayWidth = Math.max(64, Math.round(displayWidth * scale));
+  displayHeight = Math.max(48, Math.round(displayHeight * scale));
+  return { width: displayWidth, height: displayHeight };
 }
 
 function normalizeQpicSource(source) {
