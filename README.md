@@ -65,9 +65,9 @@ tests/
 | Batch Flush | 默认 20 条或 3 秒批量提交 SQLite，减少每条消息单独事务开销 |
 | SQLite WAL | 开启 SQLite WAL 和常用索引，提升读写并发和时间线查询性能 |
 | Fallback Recovery | SQLite 写入失败时落 `fallback_failed_batches.jsonl`，启动自动重放 |
-| 媒体归档 | 复制本地可访问图片、视频、语音、文件，记录媒体元数据 |
+| 媒体归档 | 复制本地可访问图片、视频、语音、文件，支持 `base64://`、`data:`、`file://` 和公网图片 URL |
 | 媒体去重 | 以 SHA-256 命名实体文件，`media_blobs.ref_count` 管理引用生命周期 |
-| 安全路由 | `/media/<media_id>` 只接受数据库数字 ID，并校验路径位于媒体目录内 |
+| 安全路由 | `/media/<media_id>` 只接受数据库数字 ID；远程图片代理仅允许配置白名单域名 |
 | Telegram 风格 WebUI | 会话列表、消息气泡、日期分组、连续消息合并、分页加载 |
 | 搜索与过滤 | 支持 FTS5/LIKE 搜索、高亮、发送者/类型/媒体/时间/标签过滤 |
 | 收藏与标签 | 支持收藏消息、标签筛选、搜索历史和会话已读状态 |
@@ -109,6 +109,7 @@ messages.jsonl              已成功写入消息的追加日志
 pending.jsonl               未提交 SQLite 的 Pending WAL
 fallback_failed_batches.jsonl
 media/                      去重后的媒体实体文件
+proxy_cache/                WebUI 远程图片代理缓存
 exports/                    导出文件
 ```
 
@@ -126,6 +127,8 @@ exports/                    导出文件
 | `download_remote_media` | `true` | 自动下载远程图片，入库后在 WebUI 内联预览 |
 | `remote_media_timeout_seconds` | `10` | 远程图片下载超时时间，单位秒 |
 | `allow_private_remote_media` | `false` | 是否允许下载内网/本机媒体 URL，默认关闭以降低 SSRF 风险 |
+| `proxy_remote_media` | `true` | WebUI 中图片未能归档落盘时，允许通过受控代理兜底显示 |
+| `remote_media_allowed_hosts` | QQ 图片/头像/表情域名 | 允许 `/image-proxy` 访问的远程图片域名白名单 |
 | `max_storage_mb` | `0` | 归档总存储上限，0 表示不限制 |
 | `durable_write` | `true` | 消息入队时写入 pending journal 并执行 fsync |
 | `retention_days` | `0` | 默认保留天数，0 表示不自动清理 |
@@ -207,10 +210,14 @@ Chat Archive fallback replay
 
 - SQLite 使用 WAL 和增量索引：`sessions(session_id)`、`messages(session_id, timestamp)`、`messages(platform)`。
 - 媒体文件以 `sha256` 文件名保存，相同内容只保存一份实体文件。
-- 远程图片 URL 会先下载到插件媒体目录，再通过 `/media/<media_id>` 渲染；默认只允许公网 `http/https` 图片，避免前端直接暴露外链和降低 SSRF 风险。
+- OneBot/QQ 常见媒体来源会尽量规范化：支持 `base64://`、`data:*;base64,`、`file://`、本地路径和公网图片 URL。
+- 远程图片 URL 会优先下载到插件媒体目录，再通过 `/media/<media_id>` 渲染；默认只允许公网 `http/https` 图片，避免前端直接暴露外链和降低 SSRF 风险。
+- 若远程图片没有成功归档落盘，WebUI 可通过 `/image-proxy?url=...` 兜底显示；该代理默认只允许 QQ 图片、头像、表情相关域名，并带浏览器请求头和 Referer 重试。
 - `/media/<media_id>` 不接受任意路径或 hash 字符串，只接受数据库媒体数字 ID。
+- `/file-proxy?path=...` 只允许读取插件媒体目录内文件，不能代理任意系统路径。
 - `durable_write=true` 会带来每条消息一次 journal append + fsync 的成本；这是为了优先保证“消息进入插件后不丢失”。
 - WebUI 使用分页加载和稳定 DOM 信息流，避免媒体消息滚动时反复重建节点。
+- WebUI 借鉴 OneBot/QQ 客户端的只读展示经验：本地 IndexedDB 只做会话预显示缓存，后端数据仍是唯一可信来源；系统提示、撤回、回复、QQ 表情、表情回应、语音条、文件卡片、视频摘要、合并转发和 Ark 转发卡片会尽量从 `raw/components` 中解析展示，但不会提供发送、撤回或群管理能力。
 
 ---
 

@@ -7,7 +7,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .storage import ArchiveConfig, ChatArchiveStore
+from .storage import ArchiveConfig, ChatArchiveStore, REMOTE_MEDIA_ALLOWED_HOSTS
 from .web import ChatArchiveWeb
 
 
@@ -35,6 +35,12 @@ class ChatArchivePlugin(Star):
                 download_remote_media=bool(config.get("download_remote_media", True)),
                 remote_media_timeout_seconds=float(config.get("remote_media_timeout_seconds", 10) or 10),
                 allow_private_remote_media=bool(config.get("allow_private_remote_media", False)),
+                proxy_remote_media=bool(config.get("proxy_remote_media", True)),
+                remote_media_allowed_hosts=tuple(
+                    str(item).strip().lower()
+                    for item in (config.get("remote_media_allowed_hosts", None) or sorted(REMOTE_MEDIA_ALLOWED_HOSTS))
+                    if str(item).strip()
+                ),
                 max_storage_mb=self._optional_number(config.get("max_storage_mb", None)),
                 durable_write=bool(config.get("durable_write", True)),
             ),

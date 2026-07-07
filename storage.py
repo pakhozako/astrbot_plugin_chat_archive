@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -25,6 +27,14 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 MEDIA_COMPONENT_TYPES = {"image", "video", "record", "file"}
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_FLUSH_INTERVAL_SECONDS = 3.0
+REMOTE_MEDIA_ALLOWED_HOSTS = {
+    "gchat.qpic.cn",
+    "multimedia.nt.qq.com.cn",
+    "c2cpicdw.qpic.cn",
+    "p.qlogo.cn",
+    "q1.qlogo.cn",
+    "gxh.vip.qq.com",
+}
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -44,6 +54,8 @@ class ArchiveConfig:
     download_remote_media: bool = True
     remote_media_timeout_seconds: float = 10.0
     allow_private_remote_media: bool = False
+    proxy_remote_media: bool = True
+    remote_media_allowed_hosts: tuple[str, ...] = tuple(sorted(REMOTE_MEDIA_ALLOWED_HOSTS))
     max_storage_mb: float | None = None
     batch_size: int = DEFAULT_BATCH_SIZE
     flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS
@@ -71,6 +83,7 @@ class ChatArchiveStore:
         self.config = config
         self.media_dir = self.data_dir / "media"
         self.export_dir = self.data_dir / "exports"
+        self.proxy_cache_dir = self.data_dir / "proxy_cache"
         self.db_path = self.data_dir / "chat_archive.sqlite3"
         self.jsonl_path = self.data_dir / "messages.jsonl"
         self.fallback_path = self.data_dir / "fallback_failed_batches.jsonl"
@@ -82,6 +95,7 @@ class ChatArchiveStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        self.proxy_cache_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._pending_sequence = self._load_pending_sequence()
 
@@ -728,6 +742,8 @@ class ChatArchiveStore:
         sender = getattr(message_obj, "sender", None)
         created_at = int(getattr(message_obj, "timestamp", 0) or time.time())
         message_id = str(getattr(message_obj, "message_id", "") or getattr(event, "message_id", "") or "")
+        if not message_id:
+            message_id = self._stable_adapter_message_id(raw)
         umo = str(getattr(event, "unified_msg_origin", "") or "")
         sender_id = self._safe_event_call(event, "get_sender_id") or getattr(sender, "user_id", "") or getattr(sender, "id", "") or ""
         sender_name = (
@@ -805,6 +821,23 @@ class ChatArchiveStore:
         if message_id:
             return base
         return base + "|" + uuid.uuid4().hex
+
+    @staticmethod
+    def _stable_adapter_message_id(raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return ""
+        for key in ("message_id", "msgId", "msg_id", "id"):
+            text = str(raw.get(key) or "").strip()
+            if text:
+                return text
+        parts = []
+        for key in ("chatType", "peerUid", "peerUin", "group_id", "user_id", "sender_id", "msgSeq", "message_seq", "seq", "msgRandom", "msgTime", "time"):
+            text = str(raw.get(key) or "").strip()
+            if text:
+                parts.append(f"{key}={text}")
+        if len(parts) >= 3:
+            return "stable:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+        return ""
 
     async def _component_payload(self, component: Any, index: int) -> dict[str, Any]:
         type_value = getattr(component, "type", "")
@@ -923,7 +956,7 @@ class ChatArchiveStore:
         if source.startswith(("http://", "https://")):
             return self._download_remote_media(kind, source, name, created_at)
         if source.startswith(("base64://", "data:")):
-            return None, None, None, None, None
+            return self._copy_embedded_media(kind, source, name, created_at)
         source_path = source
         if source_path.startswith("file:///"):
             try:
@@ -950,12 +983,38 @@ class ChatArchiveStore:
         except Exception:
             return None, None, None, None, None
 
+    def _copy_embedded_media(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+        max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
+        try:
+            mime = None
+            if source.startswith("base64://"):
+                payload = source[len("base64://") :]
+            else:
+                header, payload = source.split(",", 1)
+                if ";base64" not in header.lower():
+                    return None, None, None, None, None
+                mime = header[5:].split(";", 1)[0].strip().lower() or None
+            data = base64.b64decode(payload, validate=True)
+            size = len(data)
+            if size <= 0 or size > max_bytes:
+                return None, None, size, None, mime
+            sha256 = hashlib.sha256(data).hexdigest()
+            suffix = Path(_safe_name(name)).suffix or mimetypes.guess_extension(mime or "") or ".bin"
+            target = self._media_target_path(kind, created_at, sha256, suffix[:16])
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            detected_mime = self._detect_image_mime(target) or mime or mimetypes.guess_type(target.name)[0]
+            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, detected_mime
+        except (ValueError, OSError, binascii.Error):
+            return None, None, None, None, None
+
     def _download_remote_media(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         if kind != "image" or not self.config.download_remote_media:
             return None, None, None, None, None
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
-            final_url, response = self._open_remote_media(source)
+            final_url, response = self._open_remote_media(source, image_only=True)
             with response:
                 content_type = self._normalize_image_mime(response.headers.get("Content-Type"))
                 if response.headers.get("Content-Type") and not content_type:
@@ -1003,20 +1062,25 @@ class ChatArchiveStore:
         except (OSError, HTTPError, TimeoutError, ValueError):
             return None, None, None, None, None
 
-    def _open_remote_media(self, source: str):
+    def _open_remote_media(self, source: str, *, image_only: bool = True, enforce_allowlist: bool = False):
         current_url = source
         opener = build_opener(_NoRedirectHandler)
         timeout = max(1.0, float(self.config.remote_media_timeout_seconds or 10.0))
+        referer_retry = False
         for _ in range(4):
             parsed = urlparse(current_url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("unsupported remote media url")
             self._validate_remote_media_host(parsed.hostname)
+            if enforce_allowlist:
+                self._validate_remote_media_allowed_host(parsed.hostname)
             request = Request(
                 current_url,
                 headers={
-                    "User-Agent": "astrbot-plugin-chat-archive/0.1",
-                    "Accept": "image/*,*/*;q=0.8",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8" if image_only else "*/*",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    **({"Referer": current_url} if referer_retry else {}),
                 },
             )
             try:
@@ -1027,6 +1091,10 @@ class ChatArchiveStore:
                     if not location:
                         raise
                     current_url = urljoin(current_url, location)
+                    referer_retry = False
+                    continue
+                if exc.code == 403 and not referer_retry:
+                    referer_retry = True
                     continue
                 raise
             return current_url, response
@@ -1041,6 +1109,16 @@ class ChatArchiveStore:
             ip = ipaddress.ip_address(address)
             if not ip.is_global:
                 raise ValueError("blocked private remote media address")
+
+    def _validate_remote_media_allowed_host(self, hostname: str) -> None:
+        allowed = tuple(str(host or "").strip().lower() for host in (self.config.remote_media_allowed_hosts or ()) if str(host or "").strip())
+        if not allowed:
+            return
+        clean = hostname.lower().rstrip(".")
+        for host in allowed:
+            if clean == host or clean.endswith("." + host):
+                return
+        raise ValueError("remote media host is not allowed")
 
     @staticmethod
     def _normalize_image_mime(value: Any) -> str | None:
@@ -1890,6 +1968,109 @@ class ChatArchiveStore:
             return None
         item["path"] = path
         return item
+
+    def get_safe_media_path(self, value: str) -> dict[str, Any] | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        candidates = []
+        if text.startswith("media/"):
+            candidates.append(self.data_dir / text)
+        candidates.append(Path(text))
+        media_root = self.media_dir.resolve()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            if resolved != media_root and media_root not in resolved.parents:
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            mime = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            return {"path": resolved, "name": resolved.name, "mime": mime}
+        return None
+
+    def get_remote_proxy_file(self, source: str) -> dict[str, Any] | None:
+        if not self.config.proxy_remote_media:
+            return None
+        url = str(source or "").strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        meta_path = self.proxy_cache_dir / f"{cache_key}.json"
+        cached = self._read_proxy_cache(meta_path)
+        if cached:
+            try:
+                cached_path = (self.proxy_cache_dir / str(cached.get("file") or "")).resolve()
+                proxy_root = self.proxy_cache_dir.resolve()
+            except Exception:
+                cached_path = None
+                proxy_root = None
+            if cached_path and proxy_root and (cached_path == proxy_root or proxy_root in cached_path.parents) and cached_path.exists() and cached_path.is_file():
+                return {
+                    "path": cached_path,
+                    "name": str(cached.get("name") or cached_path.name),
+                    "mime": str(cached.get("mime") or mimetypes.guess_type(cached_path.name)[0] or "application/octet-stream"),
+                }
+        max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
+        try:
+            final_url, response = self._open_remote_media(url, image_only=True, enforce_allowlist=True)
+            with response:
+                content_type = self._normalize_image_mime(response.headers.get("Content-Type"))
+                if response.headers.get("Content-Type") and not content_type:
+                    return None
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None and int(content_length) > max_bytes:
+                    return None
+                temp_path = self.proxy_cache_dir / f"{cache_key}.tmp"
+                size = 0
+                try:
+                    with temp_path.open("wb") as f:
+                        while True:
+                            chunk = response.read(1024 * 256)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > max_bytes:
+                                return None
+                            f.write(chunk)
+                    detected = self._detect_image_mime(temp_path)
+                    if not detected:
+                        return None
+                    suffix = self._remote_media_suffix(final_url, Path(urlparse(final_url).path).name or "remote-image", detected)
+                    file_name = f"{cache_key}{suffix}"
+                    target = self.proxy_cache_dir / file_name
+                    if not target.exists():
+                        temp_path.replace(target)
+                        temp_path = None
+                    meta = {
+                        "file": file_name,
+                        "name": _safe_name(Path(urlparse(final_url).path).name or file_name, file_name),
+                        "mime": detected,
+                        "source": url,
+                        "fetched_at": int(time.time()),
+                        "size": target.stat().st_size,
+                    }
+                    meta_path.write_text(_json_dumps(meta), encoding="utf-8")
+                    return {"path": target, "name": meta["name"], "mime": detected}
+                finally:
+                    if temp_path is not None:
+                        try:
+                            temp_path.unlink()
+                        except FileNotFoundError:
+                            pass
+        except (OSError, HTTPError, TimeoutError, ValueError):
+            return None
+
+    @staticmethod
+    def _read_proxy_cache(path: Path) -> dict[str, Any] | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def _escape_like(value: str) -> str:

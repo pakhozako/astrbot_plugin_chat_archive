@@ -1,6 +1,10 @@
 const PLUGIN = "astrbot_plugin_chat_archive";
 const bridge = window.AstrBotPluginPage;
 const bridgeAvailable = Boolean(bridge && window.parent !== window);
+const MESSAGE_CACHE_DB = "chat-archive-timeline";
+const MESSAGE_CACHE_STORE = "session_messages";
+const MESSAGE_CACHE_VERSION = 1;
+const MESSAGE_CACHE_LIMIT = 150;
 
 const demoTags = [
   { id: 1, name: "重点", color: "#d65064", message_count: 6 },
@@ -106,6 +110,7 @@ const els = {
 };
 
 let loadingOlder = false;
+let messageCacheDb = null;
 
 els.timeline.addEventListener("scroll", () => {
   if (els.timeline.scrollTop < 72 && !loadingOlder && state.hasMore && !state.loading) {
@@ -122,11 +127,15 @@ function endpoint(path) {
 }
 
 function pluginApiUrl(path) {
-  const cleanPath = endpoint(path)
+  const clean = endpoint(path);
+  const queryIndex = clean.indexOf("?");
+  const pathPart = queryIndex >= 0 ? clean.slice(0, queryIndex) : clean;
+  const queryPart = queryIndex >= 0 ? clean.slice(queryIndex) : "";
+  const cleanPath = pathPart
     .split("/")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
-  return `/api/v1/plugins/extensions/${encodeURIComponent(PLUGIN)}/${cleanPath}`;
+  return `/api/v1/plugins/extensions/${encodeURIComponent(PLUGIN)}/${cleanPath}${queryPart}`;
 }
 
 async function apiGet(path, params = {}) {
@@ -185,6 +194,18 @@ function mediaUrl(item) {
   return pluginApiUrl(`media/${item.id}`);
 }
 
+function mediaDisplayUrl(item) {
+  if (item?.inline_url) return String(item.inline_url);
+  if (item?.local_path && item?.id) return mediaUrl(item);
+  const source = String(item?.source || item?.url || item?.path || "").trim();
+  if (!source) return "";
+  if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
+  if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") {
+    return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
+  }
+  return "";
+}
+
 function fmtNumber(value) {
   return new Intl.NumberFormat().format(Number(value || 0));
 }
@@ -221,11 +242,20 @@ function updateStatusStrip(stats) {
 }
 
 async function downloadMedia(item) {
-  if (!bridgeAvailable || !bridge?.download) {
-    window.open(mediaUrl(item), "_blank", "noopener");
+  const url = mediaDisplayUrl(item);
+  if (!url) {
+    toast("没有可下载的媒体文件");
     return;
   }
-  await bridge.download(endpoint(`media/${item.id}`), {}, item.name || "媒体文件.bin");
+  if (!bridgeAvailable || !bridge?.download) {
+    window.open(url, "_blank", "noopener");
+    return;
+  }
+  if (item?.local_path && item?.id) {
+    await bridge.download(endpoint(`media/${item.id}`), {}, item.name || "媒体文件.bin");
+    return;
+  }
+  window.open(url, "_blank", "noopener");
 }
 
 async function loadStats() {
@@ -272,30 +302,48 @@ async function loadSettings() {
 
 async function loadMessages({ append = false, stickToBottom = !append } = {}) {
   if (state.loading) return;
+  const requestView = viewSignature();
+  const requestUmo = state.currentUmo;
+  const requestQuery = state.q;
+  const requestFilters = { ...state.filters };
+  const requestCacheKey = messageCacheKey();
   state.loading = true;
   state.error = "";
   els.loadMoreBtn.disabled = true;
-  if (!append && !state.messages.length) renderTimeline();
+  const anchorKey = append ? firstVisibleMessageKey() : "";
+  if (!append && !state.messages.length) {
+    const cached = await getCachedMessagesForCurrentView(requestCacheKey);
+    if (cached.length) {
+      state.messages = cached;
+      renderTimeline({ stickToBottom });
+      updateHeader();
+    } else {
+      renderTimeline();
+    }
+  }
   try {
+    if (viewSignature() !== requestView) return;
     const before =
       append && state.messages.length
         ? Math.min(...state.messages.map((item) => Number(item.created_at || 0)).filter(Boolean))
         : 0;
     const data = await apiGet("/messages", {
-      umo: state.currentUmo,
-      q: state.q,
+      umo: requestUmo,
+      q: requestQuery,
       before,
       limit: 100,
-      sender: state.filters.sender,
-      message_type: state.filters.messageType,
-      media_kind: state.filters.mediaKind,
-      start_ts: state.filters.startTs || "",
-      end_ts: state.filters.endTs || "",
+      sender: requestFilters.sender,
+      message_type: requestFilters.messageType,
+      media_kind: requestFilters.mediaKind,
+      start_ts: requestFilters.startTs || "",
+      end_ts: requestFilters.endTs || "",
     });
+    if (viewSignature() !== requestView) return;
     state.hasMore = Boolean(data.has_more);
     state.messages = append ? dedupeMessages([...(data.items || []), ...state.messages]) : data.items || [];
+    if (!append) setCachedMessagesForCurrentView(state.messages, requestCacheKey).catch(() => {});
     state.activeMatchIndex = -1;
-    renderTimeline({ preserveTop: append, stickToBottom });
+    renderTimeline({ preserveTop: append, stickToBottom, anchorKey });
     updateHeader();
     if (!append && (state.q || hasActiveFilters())) {
       recordSearchHistory(data.items || []).catch(() => {});
@@ -321,6 +369,82 @@ function dedupeMessages(items) {
     result.push(item);
   }
   return result.sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
+}
+
+function canUseMessageCache() {
+  return !state.q && !hasActiveFilters();
+}
+
+function messageCacheKey() {
+  return state.currentUmo || "__all__";
+}
+
+function viewSignature() {
+  return JSON.stringify({
+    umo: state.currentUmo,
+    q: state.q,
+    sender: state.filters.sender,
+    messageType: state.filters.messageType,
+    mediaKind: state.filters.mediaKind,
+    startTs: state.filters.startTs || "",
+    endTs: state.filters.endTs || "",
+  });
+}
+
+async function openMessageCacheDb() {
+  const dbFactory = window.indexedDB;
+  if (!dbFactory) return null;
+  if (messageCacheDb) return messageCacheDb;
+  return new Promise((resolve) => {
+    const request = dbFactory.open(MESSAGE_CACHE_DB, MESSAGE_CACHE_VERSION);
+    request.onerror = () => resolve(null);
+    request.onsuccess = () => {
+      messageCacheDb = request.result;
+      messageCacheDb.onversionchange = () => {
+        messageCacheDb?.close?.();
+        messageCacheDb = null;
+      };
+      resolve(messageCacheDb);
+    };
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(MESSAGE_CACHE_STORE)) {
+        db.createObjectStore(MESSAGE_CACHE_STORE, { keyPath: "cacheKey" });
+      }
+    };
+  });
+}
+
+async function getCachedMessagesForCurrentView(cacheKey = messageCacheKey()) {
+  if (!canUseMessageCache()) return [];
+  const db = await openMessageCacheDb();
+  if (!db) return [];
+  return new Promise((resolve) => {
+    const tx = db.transaction(MESSAGE_CACHE_STORE, "readonly");
+    const request = tx.objectStore(MESSAGE_CACHE_STORE).get(cacheKey);
+    request.onerror = () => resolve([]);
+    request.onsuccess = () => {
+      const messages = Array.isArray(request.result?.messages) ? request.result.messages : [];
+      resolve(dedupeMessages(messages));
+    };
+  });
+}
+
+async function setCachedMessagesForCurrentView(messages, cacheKey = messageCacheKey()) {
+  if (!canUseMessageCache()) return;
+  const db = await openMessageCacheDb();
+  if (!db) return;
+  const cached = dedupeMessages(messages || []).slice(-MESSAGE_CACHE_LIMIT);
+  await new Promise((resolve) => {
+    const tx = db.transaction(MESSAGE_CACHE_STORE, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+    tx.objectStore(MESSAGE_CACHE_STORE).put({
+      cacheKey,
+      messages: cached,
+      updatedAt: Date.now(),
+    });
+  });
 }
 
 function renderConversations() {
@@ -354,6 +478,8 @@ function renderConversations() {
       `;
       button.addEventListener("click", async () => {
         state.currentUmo = item.umo || "";
+        state.messages = [];
+        state.hasMore = false;
         document.body.classList.remove("sessions-open");
         renderConversations();
         await loadFilters();
@@ -386,17 +512,40 @@ function renderTimeline(options = {}) {
   }
   const oldHeight = els.timeline.scrollHeight;
   const oldTop = els.timeline.scrollTop;
+  const anchor = options.anchorKey ? els.timeline.querySelector(`[data-key="${CSS.escape(options.anchorKey)}"]`) : null;
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
   const fragment = document.createDocumentFragment();
   for (const item of items) {
     fragment.appendChild(renderTimelineItem(item));
   }
   els.timeline.replaceChildren(fragment);
-  if (options.preserveTop) {
+  if (options.anchorKey && anchor) {
+    restoreScrollAnchor(options.anchorKey, anchorTop);
+  } else if (options.preserveTop) {
     els.timeline.scrollTop = oldTop + Math.max(0, els.timeline.scrollHeight - oldHeight);
   } else if (options.stickToBottom) {
     scrollTimelineToBottom();
   }
   updateSearchUi();
+}
+
+function firstVisibleMessageKey() {
+  const timelineTop = els.timeline.getBoundingClientRect().top;
+  const nodes = Array.from(els.timeline.querySelectorAll(".message-row[data-key], .system-tip-row[data-key]"));
+  for (const node of nodes) {
+    if (node.getBoundingClientRect().bottom >= timelineTop + 8) return node.dataset.key || "";
+  }
+  return nodes[0]?.dataset.key || "";
+}
+
+function restoreScrollAnchor(key, previousTop) {
+  if (!key) return;
+  requestAnimationFrame(() => {
+    const target = els.timeline.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (!target) return;
+    const nextTop = target.getBoundingClientRect().top;
+    els.timeline.scrollTop += nextTop - previousTop;
+  });
 }
 
 function buildTimelineItems(messages) {
@@ -453,7 +602,25 @@ function renderTimelineItem(item) {
   return renderMessage(item.message, item.group, item.active);
 }
 
+function renderSystemTip(item, text, active = false) {
+  const node = document.createElement("div");
+  const uid = messageKey(item);
+  node.className = `system-tip-row ${active ? "active-search" : ""}`;
+  node.dataset.uid = uid;
+  node.dataset.key = `msg-${uid}`;
+  node.setAttribute("role", "note");
+  node.innerHTML = `<span class="system-tip">${highlightText(text, state.q)}</span>`;
+  node.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    showContextMenu(event.clientX, event.clientY, item, text);
+  });
+  return node;
+}
+
 function renderMessage(item, group, active = false) {
+  const systemTip = systemTipText(item);
+  if (systemTip) return renderSystemTip(item, systemTip, active);
+
   const node = document.createElement("article");
   const self = isSelf(item);
   const uid = messageKey(item);
@@ -470,21 +637,29 @@ function renderMessage(item, group, active = false) {
   node.dataset.uid = uid;
   node.dataset.key = `msg-${uid}`;
 
-  const text = item.text || textFromComponents(item.components);
-  const sender = item.sender_name || item.sender_id || "未知用户";
+  const text = messagePlainText(item);
+  const bodyHtml = messageBodyHtml(item);
+  const sender = senderDisplayName(item);
   const media = Array.isArray(item.media) ? item.media : [];
   const platform = item.platform || "";
   const tags = Array.isArray(item.tags) ? item.tags : [];
-  const avatar = !self && group.showAvatar ? `<div class="avatar" style="--avatar-bg:${avatarColor(sender)}">${escapeHtml(initials(sender))}</div>` : `<div class="avatar-spacer"></div>`;
-  const name = !self && group.showName ? `<div class="sender">${escapeHtml(sender)}</div>` : "";
+  const reply = replyInfo(item);
+  const replyTargetKey = reply ? replyTargetMessageKey(reply) : "";
+  const recalled = isRecalledMessage(item);
+  const reactions = reactionList(item);
+  const avatar = renderAvatarHtml(item, sender, self, group);
+  const name = !self && group.showName ? renderSenderHtml(item, sender) : "";
   node.innerHTML = `
     ${avatar}
     <div class="bubble-shell">
-      <div class="bubble">
+      <div class="bubble ${recalled ? "is-recalled" : ""}">
         ${name}
-        ${text ? `<div class="message-text">${highlightText(text, state.q)}</div>` : ""}
+        ${reply ? renderReplyPreviewHtml(reply, replyTargetKey) : ""}
+        ${bodyHtml ? `<div class="message-text">${bodyHtml}</div>` : ""}
+        ${recalled ? `<div class="message-recalled">已撤回，归档内容保留</div>` : ""}
         ${tags.length ? `<div class="tag-row">${tags.map(renderTagChipHtml).join("")}</div>` : ""}
         <div class="media-grid"></div>
+        ${reactions.length ? renderReactionRowHtml(reactions) : ""}
         <div class="message-foot">
           <button class="message-action favorite-action ${item.favorite ? "active" : ""}" type="button" data-action="favorite" aria-label="${item.favorite ? "取消收藏" : "收藏消息"}">${item.favorite ? "已收藏" : "收藏"}</button>
           <button class="message-action" type="button" data-action="tag" aria-label="编辑标签">标签</button>
@@ -503,8 +678,27 @@ function renderMessage(item, group, active = false) {
   } else if (grid) {
     grid.remove();
   }
+  node.querySelectorAll(".image-avatar img").forEach((image) => {
+    image.addEventListener("error", () => image.remove(), { once: true });
+  });
+  node.querySelectorAll(".inline-market-face").forEach((image) => {
+    image.addEventListener("error", () => {
+      image.parentElement?.classList.add("no-image");
+      image.remove();
+    }, { once: true });
+  });
 
   node.addEventListener("click", (event) => {
+    const inlineImage = event.target?.closest?.("[data-inline-image]");
+    if (inlineImage?.dataset.inlineImage) {
+      openInlineImageViewer(inlineImage.dataset.inlineImage);
+      return;
+    }
+    const replyTarget = event.target?.closest?.("[data-reply-key]");
+    if (replyTarget?.dataset.replyKey) {
+      scrollTimelineToKey(replyTarget.dataset.replyKey);
+      return;
+    }
     const action = event.target?.closest?.("[data-action]")?.dataset.action;
     if (!action) return;
     if (action === "favorite") toggleFavorite(item);
@@ -519,30 +713,39 @@ function renderMessage(item, group, active = false) {
   return node;
 }
 
+function openInlineImageViewer(url) {
+  const item = { kind: "image", name: "图片", source: url, inline_url: url };
+  state.mediaItems = [item];
+  state.mediaIndex = 0;
+  renderMediaViewer();
+  els.mediaViewer.hidden = false;
+}
+
 function renderMedia(item) {
   const card = document.createElement("div");
   const hasLocal = Boolean(item.local_path);
+  const displayUrl = mediaDisplayUrl(item);
   const kind = normalizeMediaKind(item.kind);
   card.className = `media-card ${kind}`;
-  if (hasLocal && kind === "image") {
+  if (displayUrl && kind === "image") {
     const button = document.createElement("button");
     button.className = "media-thumb";
     button.type = "button";
     button.setAttribute("aria-label", `预览 ${item.name || "图片"}`);
-    button.innerHTML = `<img loading="lazy" src="${escapeAttr(mediaUrl(item))}" alt="${escapeAttr(item.name || "图片")}" />`;
+    button.innerHTML = `<img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(item.name || "图片")}" />`;
     button.addEventListener("click", () => openMediaViewer(item));
     card.appendChild(button);
-  } else if (hasLocal && kind === "video") {
+  } else if (displayUrl && kind === "video") {
     const video = document.createElement("video");
     video.controls = true;
     video.preload = "metadata";
-    video.src = mediaUrl(item);
+    video.src = displayUrl;
     card.appendChild(video);
-  } else if (hasLocal && kind === "audio") {
+  } else if (displayUrl && kind === "audio") {
     const audio = document.createElement("audio");
     audio.controls = true;
     audio.preload = "metadata";
-    audio.src = mediaUrl(item);
+    audio.src = displayUrl;
     card.appendChild(audio);
   }
 
@@ -554,7 +757,7 @@ function renderMedia(item) {
       <div class="media-kind">${escapeHtml(mediaKindLabel(kind))}</div>
       <div class="media-meta">${escapeHtml(item.name || item.source || "未命名媒体")}</div>
     </div>
-    ${hasLocal ? `<button class="media-download" type="button" aria-label="下载媒体">下载</button>` : `<span class="media-meta">仅来源</span>`}
+    ${displayUrl ? `<button class="media-download" type="button" aria-label="下载媒体">下载</button>` : `<span class="media-meta">仅来源</span>`}
   `;
   card.appendChild(meta);
   const downloadBtn = meta.querySelector(".media-download");
@@ -566,13 +769,14 @@ function renderMedia(item) {
 
 function showContextMenu(x, y, item, text) {
   const media = Array.isArray(item.media) ? item.media : [];
+  const displayableMedia = media.filter((mediaItem) => mediaDisplayUrl(mediaItem));
   els.contextMenu.innerHTML = `
     <button type="button" data-action="favorite">${item.favorite ? "取消收藏" : "收藏消息"}</button>
     <button type="button" data-action="tag">编辑标签</button>
     <button type="button" data-action="copy">复制文本</button>
     <button type="button" data-action="raw">查看 JSON</button>
     <button type="button" data-action="copy-json">复制 JSON</button>
-    ${media.length ? `<button type="button" data-action="open-media">打开媒体</button>` : ""}
+    ${displayableMedia.length ? `<button type="button" data-action="open-media">打开媒体</button>` : ""}
   `;
   els.contextMenu.hidden = false;
   const rect = els.contextMenu.getBoundingClientRect();
@@ -586,7 +790,7 @@ function showContextMenu(x, y, item, text) {
     if (action === "raw") showRaw(item);
     if (action === "copy-json") copyText(JSON.stringify(item, null, 2));
     if (action === "open-media") {
-      const first = media.find((mediaItem) => mediaItem.local_path);
+      const first = displayableMedia[0];
       if (first) openMediaViewer(first);
     }
     hideContextMenu();
@@ -603,8 +807,9 @@ function showRaw(item) {
 }
 
 function openMediaViewer(item) {
-  state.mediaItems = state.messages.flatMap((msg) => (Array.isArray(msg.media) ? msg.media : [])).filter((m) => m.local_path);
-  state.mediaIndex = Math.max(0, state.mediaItems.findIndex((m) => String(m.id) === String(item.id)));
+  state.mediaItems = state.messages.flatMap((msg) => (Array.isArray(msg.media) ? msg.media : [])).filter((m) => mediaDisplayUrl(m));
+  const targetUrl = mediaDisplayUrl(item);
+  state.mediaIndex = Math.max(0, state.mediaItems.findIndex((m) => String(m.id || mediaDisplayUrl(m)) === String(item.id || targetUrl)));
   renderMediaViewer();
   els.mediaViewer.hidden = false;
 }
@@ -614,6 +819,7 @@ function renderMediaViewer() {
   if (!item) return;
   els.mediaViewerBody.replaceChildren();
   const kind = normalizeMediaKind(item.kind);
+  const displayUrl = mediaDisplayUrl(item);
   let node;
   if (kind === "image") {
     node = document.createElement("img");
@@ -630,14 +836,14 @@ function renderMediaViewer() {
     node.className = "viewer-file";
     node.innerHTML = `<div class="file-icon">${escapeHtml(fileIcon(kind))}</div><strong>${escapeHtml(item.name || "文件")}</strong><span>${escapeHtml(item.mime || item.source || "可下载文件")}</span>`;
   }
-  if ("src" in node) {
-    node.src = mediaUrl(item);
+  if ("src" in node && displayUrl) {
+    node.src = displayUrl;
   }
   els.mediaViewerBody.appendChild(node);
   els.mediaViewerCaption.textContent = `${item.name || mediaKindLabel(kind)} / ${state.mediaIndex + 1}/${state.mediaItems.length}`;
   els.prevMediaBtn.disabled = state.mediaIndex <= 0;
   els.nextMediaBtn.disabled = state.mediaIndex >= state.mediaItems.length - 1;
-  els.downloadViewerBtn.disabled = !item.local_path;
+  els.downloadViewerBtn.disabled = !displayUrl;
 }
 
 function closeMediaViewer() {
@@ -855,7 +1061,7 @@ function searchMatches() {
   if (!state.q) return [];
   const needle = state.q.toLocaleLowerCase();
   return state.messages
-    .map((item, index) => ({ item, index, text: `${item.text || textFromComponents(item.components)} ${item.sender_name || ""}`.toLocaleLowerCase() }))
+    .map((item, index) => ({ item, index, text: `${messagePlainText(item)} ${systemTipText(item)} ${item.sender_name || ""}`.toLocaleLowerCase() }))
     .filter((entry) => entry.text.includes(needle));
 }
 
@@ -898,9 +1104,394 @@ function scrollTimelineToBottom() {
 function textFromComponents(components) {
   if (!Array.isArray(components)) return "";
   return components
-    .map((item) => item?.data?.data?.text || item?.data?.text || "")
+    .map((item) => componentText(item))
     .filter(Boolean)
     .join("");
+}
+
+function messagePlainText(item) {
+  const text = String(item?.text || "");
+  const componentTextValue = textFromComponents(item?.components);
+  const rawText = textFromRawElements(item?.raw);
+  return text || componentTextValue || rawText;
+}
+
+function messageBodyHtml(item) {
+  const rendered = messageElementObjects(item).map((component) => renderComponentInlineHtml(component)).filter(Boolean).join("");
+  if (rendered) return rendered;
+  return highlightText(messagePlainText(item), state.q);
+}
+
+function messageElementObjects(item) {
+  const components = Array.isArray(item?.components) ? item.components : [];
+  const rawObjects = rawElements(item?.raw).map((element, index) => ({ index: components.length + index, kind: "raw", data: element }));
+  return [...components, ...rawObjects];
+}
+
+function componentText(component) {
+  if (!component || typeof component !== "object") return "";
+  const data = component.data || {};
+  const raw = data.data && typeof data.data === "object" ? data.data : data;
+  if (!raw || typeof raw !== "object") return "";
+  return String(
+      raw.text ??
+      raw.content ??
+      raw.message ??
+      raw.faceText ??
+      raw.fileElement?.fileName ??
+      raw.pttElement?.text ??
+      raw.videoElement?.fileName ??
+      raw.picElement?.summary ??
+      raw.fileName ??
+      raw.name ??
+      "",
+  );
+}
+
+function renderComponentInlineHtml(component) {
+  if (!component || typeof component !== "object") return "";
+  const data = component.data || {};
+  const raw = data.data && typeof data.data === "object" ? data.data : data;
+  const kind = String(component.kind || raw.type || "").toLowerCase();
+  const typeHint = Number(raw.type ?? component.type);
+  const elementTypeHint = Number(raw.elementType ?? component.elementType);
+  if (raw.picElement || raw.imageElement) return renderPicElementHtml(raw.picElement || raw.imageElement);
+  if (raw.faceElement) return renderFaceHtml(raw.faceElement);
+  if (raw.marketFaceElement) return renderMarketFaceHtml(raw.marketFaceElement);
+  if (raw.fileElement) return renderFileElementHtml(raw.fileElement);
+  if (raw.pttElement || raw.voiceElement) return renderPttElementHtml(raw.pttElement || raw.voiceElement);
+  if (raw.videoElement) return renderVideoElementHtml(raw.videoElement);
+  if (raw.multiForwardMsgElement) return renderForwardElementHtml(raw.multiForwardMsgElement);
+  if (raw.arkElement) return renderArkElementHtml(raw.arkElement);
+  if (raw.replyElement || raw.grayTipElement) return "";
+  if (raw.textElement?.content) return highlightText(raw.textElement.content, state.q);
+  if (raw.text) return highlightText(raw.text, state.q);
+  if (raw.content) return highlightText(raw.content, state.q);
+  if (typeHint === 2 || elementTypeHint === 2) return renderPicElementHtml(raw);
+  if (typeHint === 3 || elementTypeHint === 6) return renderFaceHtml(raw);
+  if (typeHint === 6 || elementTypeHint === 3) return renderFileElementHtml(raw);
+  if (elementTypeHint === 4) return renderPttElementHtml(raw);
+  if (elementTypeHint === 5) return renderVideoElementHtml(raw);
+  if (elementTypeHint === 16) return renderForwardElementHtml(raw);
+  if (elementTypeHint === 10) return renderArkElementHtml(raw);
+  if (kind.includes("image") || kind.includes("pic")) return renderPicElementHtml(raw);
+  if (kind.includes("face")) return renderFaceHtml(raw);
+  if (kind.includes("file")) return renderFileElementHtml(raw);
+  if (kind.includes("record") || kind.includes("audio") || kind.includes("ptt")) return renderPttElementHtml(raw);
+  if (kind.includes("video")) return renderVideoElementHtml(raw);
+  if (kind.includes("text") || kind.includes("plain")) return highlightText(componentText(component), state.q);
+  return "";
+}
+
+function renderFaceHtml(face) {
+  const id = face?.faceIndex ?? face?.faceId ?? face?.id ?? "";
+  const label = face?.faceText || face?.name || (id !== "" ? `[表情${id}]` : "[表情]");
+  return `<span class="inline-face" title="${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+}
+
+function renderMarketFaceHtml(face) {
+  const emojiId = String(face?.emojiId || "").trim();
+  const faceName = face?.faceName || face?.name || "表情包";
+  if (!emojiId) return `<span class="inline-face market">${escapeHtml(`[${faceName}]`)}</span>`;
+  const sizes = Array.isArray(face?.supportSize) ? face.supportSize : [];
+  const size = sizes[0] || {};
+  const width = Math.min(Number(size.width || 120), 180);
+  const height = Math.min(Number(size.height || 120), 180);
+  const dir = emojiId.slice(0, 2);
+  const rawUrl = `https://gxh.vip.qq.com/club/item/parcel/item/${dir}/${emojiId}/raw${Math.min(width || 120, 300)}.gif`;
+  const proxyUrl = pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
+  return `<span class="market-face-shell"><img class="inline-market-face" loading="lazy" src="${escapeAttr(proxyUrl)}" alt="${escapeAttr(faceName)}" title="${escapeAttr(faceName)}" style="max-width:${width}px;max-height:${height}px" /><em>${escapeHtml(`[${faceName}]`)}</em></span>`;
+}
+
+function renderPicElementHtml(pic) {
+  const source = normalizeQpicSource(pic?.source || pic?.url || pic?.picUrl || pic?.originImageUrl || pic?.thumbUrl || pic?.filePath || pic?.path || "");
+  const displayUrl = mediaSourceDisplayUrl({ kind: "image", source });
+  const label = pic?.summary || pic?.fileName || pic?.name || "图片";
+  if (!displayUrl) return `<span class="inline-face">${escapeHtml(`[${label}]`)}</span>`;
+  return `<button class="inline-image-preview" type="button" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片"><img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" /></button>`;
+}
+
+function renderFileElementHtml(file) {
+  const name = file?.fileName || file?.name || file?.file_name || "文件";
+  const size = file?.fileSize ?? file?.size ?? file?.file_size;
+  return `
+    <span class="inline-rich-card file-element">
+      <span class="rich-card-icon">文</span>
+      <span class="rich-card-main">
+        <strong>${escapeHtml(name)}</strong>
+        <small>${size ? escapeHtml(fmtBytes(size)) : "文件消息"}</small>
+      </span>
+    </span>
+  `;
+}
+
+function renderPttElementHtml(ptt) {
+  const duration = Number(ptt?.duration || ptt?.fileTime || 0);
+  const width = Math.min(220, Math.max(96, 96 + duration * 4));
+  const text = ptt?.text || ptt?.transcribedText || "";
+  return `
+    <span class="voice-element">
+      <span class="voice-bar" style="width:${width}px">
+        <span class="voice-play">音</span>
+        <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+        <span class="voice-duration">${escapeHtml(formatDuration(duration))}</span>
+      </span>
+      ${text ? `<span class="voice-text">${highlightText(text, state.q)}</span>` : ""}
+    </span>
+  `;
+}
+
+function renderVideoElementHtml(video) {
+  const thumb = firstMapValue(video?.thumbPath) || video?.thumbUrl || video?.thumb || video?.coverUrl || "";
+  const duration = Number(video?.fileTime || video?.duration || 0);
+  const name = video?.fileName || video?.name || "视频";
+  const thumbUrl = thumb ? mediaSourceDisplayUrl({ kind: "image", source: thumb }) : "";
+  return `
+    <span class="inline-rich-card video-element">
+      <span class="video-cover">${thumbUrl ? `<img loading="lazy" src="${escapeAttr(thumbUrl)}" alt="${escapeAttr(name)}" />` : `<span>影</span>`}<b>▶</b></span>
+      <span class="rich-card-main">
+        <strong>${escapeHtml(name)}</strong>
+        <small>${escapeHtml(duration ? formatDuration(duration) : "视频消息")}</small>
+      </span>
+    </span>
+  `;
+}
+
+function renderForwardElementHtml(forward) {
+  const parsed = parseForwardXml(forward?.xmlContent || forward?.xml || "");
+  const title = parsed.title || forward?.title || "[聊天记录]";
+  const previews = parsed.previews.slice(0, 3);
+  const summary = parsed.summary || forward?.summary || "合并转发";
+  return renderForwardCardHtml(title, previews, summary);
+}
+
+function renderArkElementHtml(ark) {
+  let data = ark?.data || ark?.arkData || null;
+  if (!data && ark?.bytesData) {
+    try {
+      data = JSON.parse(ark.bytesData);
+    } catch {
+      data = null;
+    }
+  }
+  if (data?.app === "com.tencent.multimsg" && data?.meta?.detail) {
+    const detail = data.meta.detail;
+    return renderForwardCardHtml(
+      detail.source || "[聊天记录]",
+      (detail.news || []).map((item) => item.text || "").filter(Boolean).slice(0, 3),
+      detail.summary || "合并转发",
+    );
+  }
+  const prompt = data?.prompt || ark?.prompt || "[卡片消息]";
+  return `<span class="inline-rich-card ark-element"><span class="rich-card-icon">卡</span><span class="rich-card-main"><strong>${escapeHtml(prompt)}</strong><small>Ark 卡片</small></span></span>`;
+}
+
+function renderForwardCardHtml(title, previews, summary) {
+  return `
+    <span class="forward-card">
+      <strong>${escapeHtml(title || "[聊天记录]")}</strong>
+      ${previews.map((preview) => `<span>${escapeHtml(preview)}</span>`).join("")}
+      <small>${escapeHtml(summary || "合并转发")}</small>
+    </span>
+  `;
+}
+
+function parseForwardXml(xml) {
+  const text = String(xml || "");
+  if (!text) return { title: "", previews: [], summary: "" };
+  const title = stripHtml(matchFirst(text, /<title[^>]*color=["']#000000["'][^>]*>(.*?)<\/title>/i) || matchFirst(text, /brief=["']([^"']+)["']/i) || "[聊天记录]");
+  const previews = [...text.matchAll(/<title[^>]*color=["']#777777["'][^>]*>(.*?)<\/title>/gi)].map((match) => stripHtml(match[1])).filter(Boolean);
+  const summary = stripHtml(matchFirst(text, /<summary[^>]*>(.*?)<\/summary>/i) || "");
+  return { title, previews, summary };
+}
+
+function matchFirst(value, pattern) {
+  return String(value || "").match(pattern)?.[1] || "";
+}
+
+function firstMapValue(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value[0] || "";
+  if (typeof value === "object") return Object.values(value)[0] || "";
+  return "";
+}
+
+function formatDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (!value) return '0"';
+  const minutes = Math.floor(value / 60);
+  const rest = Math.floor(value % 60);
+  return minutes ? `${minutes}:${String(rest).padStart(2, "0")}` : `${rest}"`;
+}
+
+function mediaSourceDisplayUrl(item) {
+  const source = String(item?.source || item?.url || item?.path || "").trim();
+  if (!source) return "";
+  if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
+  if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
+  return "";
+}
+
+function normalizeQpicSource(source) {
+  const value = String(source || "").trim();
+  if (!value) return "";
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `https://gchat.qpic.cn${value}`;
+  return value;
+}
+
+function textFromRawElements(raw) {
+  return rawElements(raw).map((element) => rawElementText(element)).filter(Boolean).join("");
+}
+
+function rawElementText(element) {
+  if (!element || typeof element !== "object") return "";
+  if (element.textElement?.content) return String(element.textElement.content);
+  if (element.textElement?.text) return String(element.textElement.text);
+  if (element.text) return String(element.text);
+  if (element.picElement || element.imageElement) return (element.picElement || element.imageElement).summary || "[图片]";
+  if (element.faceElement) return element.faceElement.faceText || `[表情${element.faceElement.faceIndex || ""}]`;
+  if (element.marketFaceElement) return `[${element.marketFaceElement.faceName || "表情包"}]`;
+  if (element.fileElement?.fileName) return `[文件: ${element.fileElement.fileName}]`;
+  if (element.pttElement || element.voiceElement) return (element.pttElement || element.voiceElement).text || "[语音]";
+  if (element.videoElement) return "[视频]";
+  if (element.multiForwardMsgElement) return parseForwardXml(element.multiForwardMsgElement.xmlContent).title || "[聊天记录]";
+  if (element.arkElement) return "[卡片消息]";
+  const typeHint = Number(element.type);
+  const elementTypeHint = Number(element.elementType);
+  if (typeHint === 2 || elementTypeHint === 2) return "[图片]";
+  if (typeHint === 3 || elementTypeHint === 6) return "[表情]";
+  if (typeHint === 6 || elementTypeHint === 3) return "[文件]";
+  if (elementTypeHint === 4) return "[语音]";
+  if (elementTypeHint === 5) return "[视频]";
+  if (elementTypeHint === 16) return "[聊天记录]";
+  if (elementTypeHint === 10) return "[卡片消息]";
+  return "";
+}
+
+function rawElements(raw) {
+  if (!raw || typeof raw !== "object") return [];
+  if (Array.isArray(raw.elements)) return raw.elements;
+  if (Array.isArray(raw.message)) return raw.message;
+  if (Array.isArray(raw.msgElements)) return raw.msgElements;
+  return [];
+}
+
+function systemTipText(item) {
+  const elements = [...rawElements(item?.raw), ...componentRawObjects(item?.components)];
+  const tips = elements.map((element) => grayTipText(element?.grayTipElement || element)).filter(Boolean);
+  if (!tips.length) return "";
+  const hasNonTip = elements.some((element) => !element?.grayTipElement && !element?.replyElement && !grayTipText(element));
+  return hasNonTip ? "" : tips.join(" ");
+}
+
+function grayTipText(grayTip) {
+  if (!grayTip || typeof grayTip !== "object") return "";
+  const jsonStr = grayTip.jsonGrayTipElement?.jsonStr || grayTip.jsonStr;
+  if (jsonStr) {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      const text = Array.isArray(parsed.items) ? parsed.items.map((item) => item.txt || item.text || "").join("") : "";
+      if (text) return stripHtml(text);
+    } catch {
+      return "";
+    }
+  }
+  const xml = grayTip.xmlElement?.content || grayTip.content || grayTip.text || grayTip.recentAbstract;
+  if (xml) return stripHtml(String(xml));
+  return "";
+}
+
+function stripHtml(value) {
+  return String(value || "").replace(/<[^>]+>/g, "").trim();
+}
+
+function componentRawObjects(components) {
+  if (!Array.isArray(components)) return [];
+  return components
+    .map((component) => {
+      const data = component?.data || {};
+      return data.data && typeof data.data === "object" ? data.data : data;
+    })
+    .filter((item) => item && typeof item === "object");
+}
+
+function isRecalledMessage(item) {
+  const raw = item?.raw || {};
+  if (raw.recallTime && String(raw.recallTime) !== "0") return true;
+  if (raw.msgStatus === "recalled" || raw.status === "recalled") return true;
+  return [...rawElements(raw), ...componentRawObjects(item?.components)].some((element) => Boolean(element?.grayTipElement?.revokeElement || element?.revokeElement));
+}
+
+function replyInfo(item) {
+  const all = [...rawElements(item?.raw), ...componentRawObjects(item?.components)];
+  const reply = all.find((element) => element?.replyElement)?.replyElement || item?.raw?.replyElement;
+  if (!reply || typeof reply !== "object") return null;
+  return {
+    msgId: reply.replayMsgId || reply.replyMsgId || reply.msgId || "",
+    msgSeq: reply.replayMsgSeq || reply.replyMsgSeq || reply.msgSeq || "",
+    sender: reply.senderNick || reply.senderName || reply.sourceMsgSender || "",
+    text: reply.sourceMsgText || reply.text || reply.summary || "[消息]",
+  };
+}
+
+function replyTargetMessageKey(reply) {
+  if (!reply) return "";
+  const target = state.messages.find((message) => {
+    const raw = message.raw || {};
+    return (
+      (reply.msgId && String(raw.msgId || raw.message_id || message.message_id || "") === String(reply.msgId)) ||
+      (reply.msgSeq && String(raw.msgSeq || raw.message_seq || "") === String(reply.msgSeq))
+    );
+  });
+  return target ? `msg-${messageKey(target)}` : "";
+}
+
+function renderReplyPreviewHtml(reply, targetKey) {
+  const attrs = targetKey ? ` data-reply-key="${escapeAttr(targetKey)}" title="跳转到引用消息"` : "";
+  const sender = reply.sender ? `<strong>${escapeHtml(reply.sender)}</strong>` : "<strong>回复</strong>";
+  return `<button class="reply-preview" type="button"${attrs}>${sender}<span>${highlightText(reply.text || "[消息]", state.q)}</span></button>`;
+}
+
+function reactionList(item) {
+  const raw = item?.raw || {};
+  const values = Array.isArray(raw.emojiLikesList)
+    ? raw.emojiLikesList
+    : Array.isArray(raw.reactions)
+      ? raw.reactions
+      : Array.isArray(item?.reactions)
+        ? item.reactions
+        : [];
+  return values
+    .map((reaction) => ({
+      id: String(reaction.emojiId || reaction.id || reaction.emoji || ""),
+      type: String(reaction.emojiType || reaction.type || ""),
+      count: Number(reaction.likesCnt || reaction.count || reaction.total || 0),
+      clicked: Boolean(reaction.isClicked || reaction.self),
+    }))
+    .filter((reaction) => reaction.id || reaction.count);
+}
+
+function renderReactionRowHtml(reactions) {
+  return `<div class="reaction-row">${reactions.map(renderReactionChipHtml).join("")}</div>`;
+}
+
+function renderReactionChipHtml(reaction) {
+  const label = reactionLabel(reaction);
+  const count = reaction.count ? fmtNumber(reaction.count) : "";
+  return `<span class="reaction-chip ${reaction.clicked ? "active" : ""}" title="表情回应">${escapeHtml(label)}${count ? `<b>${escapeHtml(count)}</b>` : ""}</span>`;
+}
+
+function reactionLabel(reaction) {
+  if (reaction.type === "2" && /^\d+$/.test(reaction.id)) {
+    try {
+      return String.fromCodePoint(Number(reaction.id));
+    } catch {
+      return "表情";
+    }
+  }
+  return reaction.id ? `[${reaction.id}]` : "表情";
 }
 
 function messageGroup(item, previous, next) {
@@ -931,6 +1522,47 @@ function messageKey(item) {
 
 function isSelf(item) {
   return Boolean(item.self_id && String(item.sender_id || "") === String(item.self_id || ""));
+}
+
+function senderDisplayName(item) {
+  const raw = item?.raw || {};
+  return item?.sender_name || raw.sendMemberName || raw.sendNickName || raw.senderNick || item?.sender_id || raw.senderUin || "未知用户";
+}
+
+function renderSenderHtml(item, sender) {
+  const badges = senderBadges(item).map((badge) => `<span class="sender-badge ${escapeAttr(badge.tone)}">${escapeHtml(badge.label)}</span>`).join("");
+  return `<div class="sender"><span>${escapeHtml(sender)}</span>${badges}</div>`;
+}
+
+function renderAvatarHtml(item, sender, self, group) {
+  if (self || !group.showAvatar) return `<div class="avatar-spacer"></div>`;
+  const avatarUrl = qqAvatarUrl(item);
+  if (avatarUrl) {
+    return `<div class="avatar image-avatar" style="--avatar-bg:${avatarColor(sender)}"><img loading="lazy" src="${escapeAttr(avatarUrl)}" alt="${escapeAttr(sender)}" /><span>${escapeHtml(initials(sender))}</span></div>`;
+  }
+  return `<div class="avatar" style="--avatar-bg:${avatarColor(sender)}">${escapeHtml(initials(sender))}</div>`;
+}
+
+function qqAvatarUrl(item) {
+  const raw = item?.raw || {};
+  const uin = String(raw.senderUin || raw.sender_uin || raw.uin || "").trim();
+  if (!uin || !/^\d{5,}$/.test(uin)) return "";
+  const rawUrl = `https://q1.qlogo.cn/g?b=qq&nk=${encodeURIComponent(uin)}&s=100`;
+  return pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
+}
+
+function senderBadges(item) {
+  const raw = item?.raw || {};
+  const badges = [];
+  const attrs = raw.msgAttrs || raw.msg_attrs || {};
+  const honor = attrs?.["2"]?.groupHonor || attrs?.[2]?.groupHonor || raw.groupHonor || {};
+  if (honor.level) badges.push({ label: `Lv.${honor.level}`, tone: "level" });
+  const title = honor.uniqueTitle || raw.memberTitle || raw.specialTitle;
+  if (title) badges.push({ label: title, tone: "title" });
+  const role = String(raw.memberRole || raw.role || "").toLowerCase();
+  if (role === "owner") badges.push({ label: "群主", tone: "owner" });
+  if (role === "admin" || role === "administrator") badges.push({ label: "管理员", tone: "admin" });
+  return badges.slice(0, 3);
 }
 
 function initials(value) {
@@ -1324,7 +1956,7 @@ async function demoApiGet(path, params = {}) {
     let items = params.umo ? demoMessages.filter((item) => item.umo === params.umo) : demoMessages;
     if (params.q) {
       const q = String(params.q).toLocaleLowerCase();
-      items = items.filter((item) => `${item.text} ${item.sender_name}`.toLocaleLowerCase().includes(q));
+      items = items.filter((item) => `${messagePlainText(item)} ${systemTipText(item)} ${item.sender_name}`.toLocaleLowerCase().includes(q));
     }
     if (params.before) items = items.filter((item) => Number(item.created_at) < Number(params.before));
     if (params.sender) {
@@ -1369,12 +2001,12 @@ function buildDemoMessages() {
     "右键消息可以复制文本、打开媒体或查看 JSON。",
   ];
   return Array.from({ length: 64 }, (_, index) => {
-    const sender = senders[index % senders.length];
-    const hasMedia = index === 18 || index === 33;
-    return {
-      id: index + 1,
-      message_uid: `demo-${index + 1}`,
-      umo: `demo:${["ops", "media", "archive"][index % 3]}`,
+      const sender = senders[index % senders.length];
+      const hasMedia = index === 18 || index === 33;
+      const message = {
+        id: index + 1,
+        message_uid: `demo-${index + 1}`,
+        umo: `demo:${["ops", "media", "archive"][index % 3]}`,
       sender_id: sender.toLowerCase(),
       sender_name: sender,
       self_id: sender === "Claude" ? "claude" : "bot",
@@ -1393,8 +2025,107 @@ function buildDemoMessages() {
         : [],
       favorite: index === 4,
       tags: index % 9 === 0 ? [demoTags[0]] : index % 13 === 0 ? [demoTags[1]] : [],
-      raw: { demo: true, index },
-      components: [],
-    };
-  });
+        raw: { demo: true, index },
+        components: [],
+      };
+      if (index === 7) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            {
+              grayTipElement: {
+                jsonGrayTipElement: {
+                  jsonStr: JSON.stringify({ items: [{ txt: "Elaina 邀请 Ops 加入归档测试群" }] }),
+                },
+              },
+            },
+          ],
+        };
+      }
+      if (index === 12) {
+        message.raw = {
+          demo: true,
+          index,
+          msgId: `demo-${index + 1}`,
+          senderUin: "100010001",
+          msgAttrs: { 2: { groupHonor: { level: 7, uniqueTitle: "档案员" } } },
+          elements: [{ textElement: { content: message.text } }],
+          emojiLikesList: [
+            { emojiId: "128077", emojiType: "2", likesCnt: "3", isClicked: true },
+            { emojiId: "66", emojiType: "1", likesCnt: "2" },
+          ],
+        };
+      }
+      if (index === 21) {
+        message.components = [
+          {
+            index: 0,
+            kind: "reply",
+            data: {
+              replyElement: {
+                replayMsgId: "demo-13",
+                sourceMsgSender: "Elaina",
+                sourceMsgText: "带有表情回应的消息",
+              },
+            },
+          },
+          { index: 1, kind: "plain", data: { text: "这里引用上一条归档消息，并附带 QQ 表情 " } },
+          { index: 2, kind: "face", data: { faceIndex: 14, faceText: "[微笑]" } },
+        ];
+      }
+      if (index === 27) {
+        message.raw = {
+          demo: true,
+          index,
+          recallTime: String(now - 100),
+          elements: [{ textElement: { content: message.text } }],
+        };
+      }
+      if (index === 36) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            { pttElement: { duration: 12, text: "语音转文字归档示例" } },
+            { fileElement: { fileName: "archive-report.zip", fileSize: 246810 } },
+          ],
+        };
+      }
+      if (index === 45) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            {
+              multiForwardMsgElement: {
+                xmlContent:
+                  '<msg><item><title color="#000000">群聊记录</title><title color="#777777">Alice: 第一条摘要</title><title color="#777777">Bob: 第二条摘要</title><summary>查看 12 条转发消息</summary></item></msg>',
+              },
+            },
+          ],
+        };
+      }
+      if (index === 50) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            {
+              arkElement: {
+                bytesData: JSON.stringify({
+                  app: "com.tencent.multimsg",
+                  meta: { detail: { source: "收藏转发", news: [{ text: "素材 A" }, { text: "素材 B" }], summary: "2 条消息", resid: "demo" } },
+                }),
+              },
+            },
+          ],
+        };
+      }
+      return message;
+    });
 }

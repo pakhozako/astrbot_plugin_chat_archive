@@ -32,6 +32,8 @@ class ChatArchiveWeb:
             ("/seen", self.seen, ["POST"], "Mark chat archive conversation seen"),
             ("/settings", self.settings, ["GET", "POST"], "Manage chat archive UI settings"),
             ("/media/<media_id>", self.media_file, ["GET"], "Chat archive media file"),
+            ("/file-proxy", self.file_proxy, ["GET"], "Chat archive safe local media proxy"),
+            ("/image-proxy", self.image_proxy, ["GET"], "Chat archive remote image proxy"),
             ("/export", self.export_archive, ["POST"], "Export chat archive"),
         ]
         for path, handler, methods, desc in routes:
@@ -93,7 +95,11 @@ class ChatArchiveWeb:
         body = await request.json(default={})
         if not isinstance(body, dict):
             body = {}
-        result = self.store.set_favorite(str(body.get("message_uid") or ""), self._optional_bool(body.get("favorite", True)))
+        try:
+            result = self.store.set_favorite(str(body.get("message_uid") or ""), self._optional_bool(body.get("favorite", True)))
+        except ValueError as exc:
+            status_code = 404 if "not found" in str(exc).lower() else 400
+            return json_response({"ok": False, "message": str(exc)}, status_code=status_code)
         return json_response({"ok": True, "data": result})
 
     async def tags(self):
@@ -118,11 +124,15 @@ class ChatArchiveWeb:
         tag_id = self._optional_int(body.get("tag_id"))
         if tag_id is None:
             return json_response({"ok": False, "message": "tag_id is required"}, status_code=400)
-        result = self.store.set_message_tag(
-            str(body.get("message_uid") or ""),
-            tag_id,
-            self._optional_bool(body.get("enabled", True)),
-        )
+        try:
+            result = self.store.set_message_tag(
+                str(body.get("message_uid") or ""),
+                tag_id,
+                self._optional_bool(body.get("enabled", True)),
+            )
+        except ValueError as exc:
+            status_code = 404 if "not found" in str(exc).lower() else 400
+            return json_response({"ok": False, "message": str(exc)}, status_code=status_code)
         return json_response({"ok": True, "data": result})
 
     async def search_history(self):
@@ -169,6 +179,20 @@ class ChatArchiveWeb:
         path = Path(row["path"])
         if not path.exists() or not path.is_file():
             return json_response({"ok": False, "message": "media file missing"}, status_code=404)
+        return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
+
+    async def file_proxy(self):
+        row = self.store.get_safe_media_path(str(request.query.get("path", "") or ""))
+        if not row:
+            return json_response({"ok": False, "message": "file not found"}, status_code=404)
+        path = Path(row["path"])
+        return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
+
+    async def image_proxy(self):
+        row = self.store.get_remote_proxy_file(str(request.query.get("url", "") or ""))
+        if not row:
+            return json_response({"ok": False, "message": "image proxy blocked or unavailable"}, status_code=404)
+        path = Path(row["path"])
         return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
 
     async def export_archive(self):
