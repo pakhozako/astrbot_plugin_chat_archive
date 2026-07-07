@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -32,8 +33,11 @@ class ChatArchiveWeb:
             ("/seen", self.seen, ["POST"], "Mark chat archive conversation seen"),
             ("/settings", self.settings, ["GET", "POST"], "Manage chat archive UI settings"),
             ("/media/<media_id>", self.media_file, ["GET"], "Chat archive media file"),
+            ("/media-data/<media_id>", self.media_data, ["GET"], "Chat archive inline media data"),
             ("/file-proxy", self.file_proxy, ["GET"], "Chat archive safe local media proxy"),
+            ("/file-data", self.file_data, ["GET"], "Chat archive inline local media data"),
             ("/image-proxy", self.image_proxy, ["GET"], "Chat archive remote image proxy"),
+            ("/image-data", self.image_data, ["GET"], "Chat archive inline remote image data"),
             ("/media-proxy", self.media_proxy, ["GET"], "Chat archive remote media proxy"),
             ("/export", self.export_archive, ["POST"], "Export chat archive"),
         ]
@@ -182,6 +186,12 @@ class ChatArchiveWeb:
             return json_response({"ok": False, "message": "media file missing"}, status_code=404)
         return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
 
+    async def media_data(self):
+        row = self.store.get_media_file(request.path_params.get("media_id") or "")
+        if not row:
+            return json_response({"ok": False, "message": "media not found"}, status_code=404)
+        return self._image_data_response(row)
+
     async def file_proxy(self):
         row = self.store.get_safe_media_path(str(request.query.get("path", "") or ""))
         if not row:
@@ -189,12 +199,24 @@ class ChatArchiveWeb:
         path = Path(row["path"])
         return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
 
+    async def file_data(self):
+        row = self.store.get_safe_media_path(str(request.query.get("path", "") or ""))
+        if not row:
+            return json_response({"ok": False, "message": "file not found"}, status_code=404)
+        return self._image_data_response(row)
+
     async def image_proxy(self):
         row = self.store.get_remote_proxy_file(str(request.query.get("url", "") or ""))
         if not row:
             return json_response({"ok": False, "message": "image proxy blocked or unavailable"}, status_code=404)
         path = Path(row["path"])
         return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
+
+    async def image_data(self):
+        row = self.store.get_remote_proxy_file(str(request.query.get("url", "") or ""), kind="image")
+        if not row:
+            return json_response({"ok": False, "message": "image proxy blocked or unavailable"}, status_code=404)
+        return self._image_data_response(row)
 
     async def media_proxy(self):
         row = self.store.get_remote_proxy_file(
@@ -205,6 +227,25 @@ class ChatArchiveWeb:
             return json_response({"ok": False, "message": "media proxy blocked or unavailable"}, status_code=404)
         path = Path(row["path"])
         return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
+
+    def _image_data_response(self, row: dict[str, Any]):
+        path = Path(row["path"])
+        if not path.exists() or not path.is_file():
+            return json_response({"ok": False, "message": "image file missing"}, status_code=404)
+        mime = self.store.detect_image_mime(path) or str(row.get("mime") or "").split(";", 1)[0].strip().lower()
+        if not mime.startswith("image/"):
+            return json_response({"ok": False, "message": "media is not an image"}, status_code=415)
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        return json_response(
+            {
+                "ok": True,
+                "data": {
+                    "name": row.get("name") or path.name,
+                    "mime": mime,
+                    "data_url": f"data:{mime};base64,{data}",
+                },
+            }
+        )
 
     async def export_archive(self):
         body = await request.json(default={})

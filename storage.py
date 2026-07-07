@@ -1194,8 +1194,9 @@ class ChatArchiveStore:
         try:
             final_url, response = self._open_remote_media(source, image_only=True)
             with response:
-                content_type = self._normalize_image_mime(response.headers.get("Content-Type"))
-                if response.headers.get("Content-Type") and not content_type:
+                raw_content_type = response.headers.get("Content-Type")
+                content_type = self._normalize_image_mime(raw_content_type)
+                if raw_content_type and not content_type and not self._content_type_allows_sniffing(raw_content_type):
                     return None, None, None, None, None
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None and int(content_length) > max_bytes:
@@ -1221,7 +1222,9 @@ class ChatArchiveStore:
                         return None, None, 0, None, content_type or None
                     detected_type = self._detect_image_mime(temp_path)
                     if not detected_type:
-                        return None, None, size, None, content_type or None
+                        if not content_type:
+                            return None, None, size, None, None
+                        detected_type = content_type
                     content_type = detected_type
                     sha256 = digest.hexdigest()
                     suffix = self._remote_media_suffix(final_url, name, content_type)
@@ -1303,9 +1306,28 @@ class ChatArchiveStore:
         content_type = str(value or "").split(";", 1)[0].strip().lower()
         if not content_type:
             return None
-        aliases = {"image/jpg": "image/jpeg", "image/x-png": "image/png"}
+        aliases = {
+            "image/jpg": "image/jpeg",
+            "image/pjpeg": "image/jpeg",
+            "image/x-png": "image/png",
+            "image/apng": "image/png",
+            "image/svg": "image/svg+xml",
+            "image/x-svg": "image/svg+xml",
+            "image/ico": "image/vnd.microsoft.icon",
+            "image/icon": "image/vnd.microsoft.icon",
+            "image/x-icon": "image/vnd.microsoft.icon",
+        }
         content_type = aliases.get(content_type, content_type)
-        if content_type in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/avif"}:
+        if content_type in {
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+            "image/avif",
+            "image/svg+xml",
+            "image/vnd.microsoft.icon",
+        }:
             return content_type
         return None
 
@@ -1313,7 +1335,7 @@ class ChatArchiveStore:
     def _detect_image_mime(path: Path) -> str | None:
         try:
             with path.open("rb") as f:
-                header = f.read(32)
+                header = f.read(512)
         except OSError:
             return None
         if header.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -1328,7 +1350,26 @@ class ChatArchiveStore:
             return "image/webp"
         if len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12] in {b"avif", b"avis"}:
             return "image/avif"
+        if header.startswith(b"\x00\x00\x01\x00"):
+            return "image/vnd.microsoft.icon"
+        compact = header.lstrip().lower()
+        if compact.startswith((b"<svg", b"<?xml")) and b"<svg" in compact:
+            return "image/svg+xml"
         return None
+
+    def detect_image_mime(self, path: Path) -> str | None:
+        return self._detect_image_mime(path)
+
+    @staticmethod
+    def _content_type_allows_sniffing(value: Any) -> bool:
+        content_type = str(value or "").split(";", 1)[0].strip().lower()
+        return content_type in {
+            "application/octet-stream",
+            "binary/octet-stream",
+            "application/x-octet-stream",
+            "application/download",
+            "application/force-download",
+        }
 
     def _remote_media_suffix(self, url: str, name: str, content_type: str) -> str:
         suffix = Path(_safe_name(name)).suffix or Path(urlparse(url).path).suffix
@@ -2165,7 +2206,7 @@ class ChatArchiveStore:
                 continue
             if not resolved.exists() or not resolved.is_file():
                 continue
-            mime = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            mime = self._detect_image_mime(resolved) or mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
             return {"path": resolved, "name": resolved.name, "mime": mime}
         return None
 
@@ -2188,17 +2229,19 @@ class ChatArchiveStore:
                 cached_path = None
                 proxy_root = None
             if cached_path and proxy_root and (cached_path == proxy_root or proxy_root in cached_path.parents) and cached_path.exists() and cached_path.is_file():
+                cached_mime = self._detect_remote_media_mime(media_kind, cached_path) or str(cached.get("mime") or mimetypes.guess_type(cached_path.name)[0] or "application/octet-stream")
                 return {
                     "path": cached_path,
                     "name": str(cached.get("name") or cached_path.name),
-                    "mime": str(cached.get("mime") or mimetypes.guess_type(cached_path.name)[0] or "application/octet-stream"),
+                    "mime": cached_mime,
                 }
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
             final_url, response = self._open_remote_media(url, image_only=media_kind == "image", enforce_allowlist=True)
             with response:
-                content_type = self._normalize_remote_media_mime(media_kind, response.headers.get("Content-Type"))
-                if response.headers.get("Content-Type") and not content_type:
+                raw_content_type = response.headers.get("Content-Type")
+                content_type = self._normalize_remote_media_mime(media_kind, raw_content_type)
+                if raw_content_type and not content_type and not self._content_type_allows_sniffing(raw_content_type):
                     return None
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None and int(content_length) > max_bytes:

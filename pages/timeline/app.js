@@ -58,6 +58,8 @@ const state = {
 };
 
 const demoMessages = buildDemoMessages();
+const imageDataCache = new Map();
+const imageDataInFlight = new Map();
 
 const els = {
   statLine: document.getElementById("statLine"),
@@ -222,6 +224,97 @@ function mediaDisplayUrl(item) {
   return mediaSourceDisplayUrl(item);
 }
 
+function protectedImageDataRequest(src) {
+  const value = String(src || "");
+  if (!value || /^(data:|blob:)/i.test(value)) return null;
+  let url;
+  try {
+    url = new URL(value, window.location.href);
+  } catch {
+    return null;
+  }
+  const marker = `/api/v1/plugins/extensions/${encodeURIComponent(PLUGIN)}/`;
+  const markerIndex = url.pathname.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const route = url.pathname
+    .slice(markerIndex + marker.length)
+    .split("/")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
+  if (/^media\/[^/]+$/.test(route)) {
+    return { path: `media-data/${route.slice("media/".length)}`, params: {} };
+  }
+  if (route === "file-proxy") {
+    return { path: "file-data", params: { path: url.searchParams.get("path") || "" } };
+  }
+  if (route === "image-proxy") {
+    return { path: "image-data", params: { url: url.searchParams.get("url") || "" } };
+  }
+  return null;
+}
+
+function imageProxyDirectFallback(src) {
+  try {
+    const url = new URL(String(src || ""), window.location.href);
+    if (!url.pathname.includes(`/api/v1/plugins/extensions/${encodeURIComponent(PLUGIN)}/image-proxy`)) return "";
+    const raw = url.searchParams.get("url") || "";
+    return /^https?:\/\//i.test(raw) ? raw : "";
+  } catch {
+    return "";
+  }
+}
+
+async function protectedImageDataUrl(src) {
+  const request = protectedImageDataRequest(src);
+  if (!request || !bridgeAvailable || !bridge?.apiGet) return "";
+  const key = `${request.path}?${JSON.stringify(request.params || {})}`;
+  if (imageDataCache.has(key)) return imageDataCache.get(key);
+  if (!imageDataInFlight.has(key)) {
+    imageDataInFlight.set(
+      key,
+      apiGet(request.path, request.params || {})
+        .then((data) => {
+          const dataUrl = data?.data_url || "";
+          if (dataUrl) imageDataCache.set(key, dataUrl);
+          return dataUrl;
+        })
+        .finally(() => imageDataInFlight.delete(key)),
+    );
+  }
+  return imageDataInFlight.get(key);
+}
+
+async function recoverImageSource(image) {
+  if (!image || image.dataset.recovering === "1") return false;
+  const source = image.getAttribute("src") || image.currentSrc || "";
+  image.dataset.recovering = "1";
+  try {
+    if (image.dataset.dataUrlTried !== "1") {
+      image.dataset.dataUrlTried = "1";
+      const dataUrl = await protectedImageDataUrl(source);
+      if (dataUrl) {
+        image.src = dataUrl;
+        return true;
+      }
+    }
+    const fallback = imageProxyDirectFallback(source);
+    if (fallback && image.dataset.directFallbackTried !== "1") {
+      image.dataset.directFallbackTried = "1";
+      image.src = fallback;
+      return true;
+    }
+    return false;
+  } finally {
+    delete image.dataset.recovering;
+  }
+}
+
 function fmtNumber(value) {
   return new Intl.NumberFormat().format(Number(value || 0));
 }
@@ -353,6 +446,7 @@ function renderInspectorMedia() {
       if (item) openMediaViewer(item);
     });
   });
+  bindRecoverableImages(els.inspectorContent);
 }
 
 function renderInspectorMediaThumbHtml(item, index) {
@@ -958,9 +1052,7 @@ function renderMessage(item, group, active = false) {
   } else if (grid) {
     grid.remove();
   }
-  node.querySelectorAll(".image-avatar img").forEach((image) => {
-    image.addEventListener("error", () => image.remove(), { once: true });
-  });
+  bindRecoverableImages(node, { selector: ".image-avatar img", removeOnFinalError: false });
   node.querySelectorAll("[data-profile]").forEach((trigger) => {
     trigger.addEventListener("click", (event) => {
       event.preventDefault();
@@ -974,22 +1066,25 @@ function renderMessage(item, group, active = false) {
     });
   });
   node.querySelectorAll(".inline-market-face").forEach((image) => {
-    image.addEventListener("error", () => {
+    image.addEventListener("error", async () => {
+      if (await recoverImageSource(image)) return;
       image.parentElement?.classList.add("no-image");
       image.remove();
-    }, { once: true });
+    });
   });
   node.querySelectorAll(".inline-face-img").forEach((image) => {
-    image.addEventListener("error", () => {
+    image.addEventListener("error", async () => {
+      if (await recoverImageSource(image)) return;
       image.parentElement?.classList.add("no-image");
       image.remove();
-    }, { once: true });
+    });
   });
   node.querySelectorAll(".reaction-chip img").forEach((image) => {
-    image.addEventListener("error", () => {
+    image.addEventListener("error", async () => {
+      if (await recoverImageSource(image)) return;
       image.parentElement?.classList.add("no-image");
       image.remove();
-    }, { once: true });
+    });
   });
   node.querySelectorAll(".inline-image-preview img").forEach((image) => {
     bindImageLoadState(image, image.closest(".inline-image-preview"));
@@ -1058,16 +1153,30 @@ function bindImageLoadState(image, container) {
     container.classList.remove("load-error");
     container.classList.add("loaded");
   };
-  const markError = () => {
+  const markError = async () => {
+    if (await recoverImageSource(image)) return;
     container.classList.remove("loaded");
     container.classList.add("load-error");
   };
-  image.addEventListener("load", markLoaded, { once: true });
-  image.addEventListener("error", markError, { once: true });
+  image.addEventListener("load", markLoaded);
+  image.addEventListener("error", markError);
   if (image.complete) {
     if (image.naturalWidth > 0) markLoaded();
     else markError();
   }
+}
+
+function bindRecoverableImages(root, options = {}) {
+  const removeOnFinalError = Boolean(options.removeOnFinalError);
+  const selector = options.selector || "img";
+  root?.querySelectorAll?.(selector).forEach((image) => {
+    if (image.dataset.recoverableBound === "1") return;
+    image.dataset.recoverableBound = "1";
+    image.addEventListener("error", async () => {
+      if (await recoverImageSource(image)) return;
+      if (removeOnFinalError) image.remove();
+    });
+  });
 }
 
 function renderMedia(item) {
@@ -1213,9 +1322,7 @@ function showProfilePopover(item, x, y) {
       await loadMessages({ stickToBottom: true });
     }
   };
-  els.profilePopover.querySelectorAll("img").forEach((image) => {
-    image.addEventListener("error", () => image.remove(), { once: true });
-  });
+  bindRecoverableImages(els.profilePopover, { removeOnFinalError: true });
 }
 
 function hideProfilePopover() {
@@ -1258,10 +1365,21 @@ function renderMediaViewer() {
     node.className = "viewer-file";
     node.innerHTML = `<div class="file-icon">${escapeHtml(fileIcon(kind))}</div><strong>${escapeHtml(item.name || "文件")}</strong><span>${escapeHtml(item.mime || item.source || "可下载文件")}</span>`;
   }
-  if ("src" in node && displayUrl) {
-    node.src = displayUrl;
-  }
   els.mediaViewerBody.appendChild(node);
+  if ("src" in node && displayUrl) {
+    if (kind === "image") {
+      protectedImageDataUrl(displayUrl)
+        .then((dataUrl) => {
+          node.src = dataUrl || displayUrl;
+        })
+        .catch(() => {
+          node.src = displayUrl;
+        });
+      bindRecoverableImages(els.mediaViewerBody);
+    } else {
+      node.src = displayUrl;
+    }
+  }
   els.mediaViewerCaption.textContent = `${item.name || mediaKindLabel(kind)} / ${state.mediaIndex + 1}/${state.mediaItems.length}`;
   els.prevMediaBtn.disabled = state.mediaIndex <= 0;
   els.nextMediaBtn.disabled = state.mediaIndex >= state.mediaItems.length - 1;
@@ -2014,10 +2132,11 @@ function bindForwardViewerInteractions() {
     bindImageLoadState(image, image.closest(".video-element"));
   });
   els.forwardViewerBody.querySelectorAll(".inline-market-face, .inline-face-img").forEach((image) => {
-    image.addEventListener("error", () => {
+    image.addEventListener("error", async () => {
+      if (await recoverImageSource(image)) return;
       image.parentElement?.classList.add("no-image");
       image.remove();
-    }, { once: true });
+    });
   });
   els.forwardViewerBody.onclick = handleForwardViewerClick;
 }
