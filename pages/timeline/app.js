@@ -51,7 +51,7 @@ const state = {
   mediaIndex: -1,
   profileItem: null,
   inspectorTab: "summary",
-  forwardPreview: null,
+  forwardPreview: new Map(),
   timelineItems: [],
   latestPollInFlight: false,
   pollTimer: null,
@@ -985,6 +985,12 @@ function renderMessage(item, group, active = false) {
       image.remove();
     }, { once: true });
   });
+  node.querySelectorAll(".reaction-chip img").forEach((image) => {
+    image.addEventListener("error", () => {
+      image.parentElement?.classList.add("no-image");
+      image.remove();
+    }, { once: true });
+  });
   node.querySelectorAll(".inline-image-preview img").forEach((image) => {
     bindImageLoadState(image, image.closest(".inline-image-preview"));
   });
@@ -1018,8 +1024,7 @@ function renderMessage(item, group, active = false) {
     }
     const forwardTarget = event.target?.closest?.("[data-forward-preview]");
     if (forwardTarget) {
-      const index = Number(forwardTarget.dataset.forwardPreview || 0);
-      const forward = Array.isArray(state.forwardPreview) ? state.forwardPreview[index] : null;
+      const forward = getForwardPreview(forwardTarget.dataset.forwardPreview || "");
       if (forward) openForwardViewer(forward);
       return;
     }
@@ -1630,6 +1635,7 @@ function renderComponentInlineHtml(component) {
   if (raw.videoElement) return renderVideoElementHtml(raw.videoElement, raw);
   if (raw.multiForwardMsgElement) return renderForwardElementHtml(raw.multiForwardMsgElement);
   if (raw.arkElement) return renderArkElementHtml(raw.arkElement);
+  if (raw.atElement || raw.mentionElement) return renderMentionHtml(raw.atElement || raw.mentionElement);
   if (raw.replyElement || raw.grayTipElement) return "";
   if (raw.textElement?.content) return highlightText(raw.textElement.content, state.q);
   if (raw.textElement?.text) return highlightText(raw.textElement.text, state.q);
@@ -1648,8 +1654,14 @@ function renderComponentInlineHtml(component) {
   if (kind === "file") return renderFileElementHtml(raw);
   if (kind === "audio") return renderPttElementHtml(raw, raw);
   if (kind === "video") return renderVideoElementHtml(raw, raw);
+  if (kind === "mention" || kind === "at") return renderMentionHtml(raw);
   if (kind === "text") return highlightText(componentText(component), state.q);
   return "";
+}
+
+function renderMentionHtml(mention) {
+  const name = mention?.name || mention?.nick || mention?.uin || mention?.uid || mention?.target || mention?.text || "成员";
+  return `<span class="inline-mention">@${escapeHtml(name)}</span>`;
 }
 
 function renderFaceHtml(face) {
@@ -1799,9 +1811,9 @@ function renderArkElementHtml(ark) {
 }
 
 function renderForwardCardHtml(title, previews, summary, parsed = null) {
-  const previewIndex = registerForwardPreview(parsed || { title, previews, summary, messages: [] });
+  const previewKey = registerForwardPreview(parsed || { title, previews, summary, messages: [] });
   return `
-    <button class="forward-card" type="button" data-forward-preview="${previewIndex}" aria-label="预览合并转发">
+    <button class="forward-card" type="button" data-forward-preview="${escapeAttr(previewKey)}" aria-label="预览合并转发">
       <strong>${escapeHtml(title || "[聊天记录]")}</strong>
       ${previews.map((preview) => `<span>${escapeHtml(preview)}</span>`).join("")}
       <small>${escapeHtml(summary || "合并转发")}</small>
@@ -1810,9 +1822,36 @@ function renderForwardCardHtml(title, previews, summary, parsed = null) {
 }
 
 function registerForwardPreview(parsed) {
-  if (!Array.isArray(state.forwardPreview)) state.forwardPreview = [];
-  state.forwardPreview.push(parsed);
-  return state.forwardPreview.length - 1;
+  if (!(state.forwardPreview instanceof Map)) state.forwardPreview = new Map();
+  const key = stableForwardPreviewKey(parsed);
+  state.forwardPreview.set(key, parsed);
+  return key;
+}
+
+function getForwardPreview(key) {
+  if (!(state.forwardPreview instanceof Map)) return null;
+  return state.forwardPreview.get(String(key || "")) || null;
+}
+
+function stableForwardPreviewKey(parsed) {
+  const raw = JSON.stringify({
+    title: parsed?.title || "",
+    summary: parsed?.summary || "",
+    resId: parsed?.resId || "",
+    previews: parsed?.previews || [],
+    messages: (parsed?.messages || []).map((item) => ({
+      id: item.id || "",
+      sender: item.sender || "",
+      time: item.time || "",
+      text: item.text || "",
+    })),
+  });
+  let hash = 2166136261;
+  for (let index = 0; index < raw.length; index += 1) {
+    hash ^= raw.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fw-${(hash >>> 0).toString(36)}`;
 }
 
 function forwardPreviewsFromMessage(item) {
@@ -1874,22 +1913,38 @@ function normalizeForwardMessages(items) {
   if (!Array.isArray(items)) return [];
   return items
     .map((item, index) => {
-      if (typeof item === "string") return { id: `line-${index}`, sender: "消息", text: item, time: "" };
+      if (typeof item === "string") return { id: `line-${index}`, sender: "消息", text: item, time: "", segments: [{ type: "text", data: { text: item } }] };
       if (!item || typeof item !== "object") return null;
-      const segments = Array.isArray(item.segments)
-        ? item.segments
-        : Array.isArray(item.elements)
-          ? item.elements.map((segment) => ({ type: inferElementKind(segment), data: segment }))
-          : [];
+      const segments = normalizeForwardSegments(item);
       const text = item.text || item.summary || item.content || segments.map((segment) => forwardSegmentText(segment)).join("");
       return {
         id: item.msgId || item.msgSeq || item.id || `line-${index}`,
         sender: item.sender || item.senderName || item.nickname || item.userName || item.nick || "未知用户",
         text: text || "[消息]",
         time: item.time || item.timestamp || item.msgTime || "",
+        segments,
       };
     })
     .filter(Boolean);
+}
+
+function normalizeForwardSegments(item) {
+  const rawSegments = Array.isArray(item?.segments)
+    ? item.segments
+    : Array.isArray(item?.elements)
+      ? item.elements
+      : Array.isArray(item?.message)
+        ? item.message
+        : [];
+  if (!rawSegments.length && (item?.text || item?.content || item?.summary)) {
+    return [{ type: "text", data: { text: item.text || item.content || item.summary } }];
+  }
+  return rawSegments
+    .map((segment) => {
+      const data = unwrapMessageElement(segment?.data || segment);
+      return { type: inferElementKind(data, segment?.type || segment?.kind), data };
+    })
+    .filter((segment) => segment.data && typeof segment.data === "object");
 }
 
 function forwardSegmentText(segment) {
@@ -1906,6 +1961,22 @@ function forwardSegmentText(segment) {
   return rawElementText(data);
 }
 
+function renderForwardSegmentHtml(segment) {
+  if (!segment) return "";
+  const data = segment.data || segment;
+  const type = String(segment.type || inferElementKind(data)).toLowerCase();
+  if (type === "text") return highlightText(data.text || data.content || data.textElement?.content || "", state.q);
+  if (type === "image") return renderPicElementHtml(data.picElement || data.imageElement || data, data);
+  if (type === "face") return renderFaceHtml(data.faceElement || data);
+  if (type === "mention" || type === "at") return renderMentionHtml(data.atElement || data.mentionElement || data);
+  if (type === "audio") return renderPttElementHtml(data.pttElement || data.voiceElement || data.recordElement || data.audioElement || data, data);
+  if (type === "video") return renderVideoElementHtml(data.videoElement || data, data);
+  if (type === "file") return renderFileElementHtml(data.fileElement || data);
+  if (type === "forward") return renderForwardElementHtml(data.multiForwardMsgElement || data);
+  if (type === "ark") return renderArkElementHtml(data.arkElement || data);
+  return highlightText(forwardSegmentText(segment), state.q);
+}
+
 function openForwardViewer(parsed) {
   if (!els.forwardViewer || !els.forwardViewerBody) return;
   els.forwardViewerTitle.textContent = parsed.title || "合并转发";
@@ -1915,7 +1986,13 @@ function openForwardViewer(parsed) {
         .map((item) => `
           <article class="forward-message">
             <header><strong>${escapeHtml(item.sender || "未知用户")}</strong>${item.time ? `<span>${escapeHtml(formatForwardTime(item.time))}</span>` : ""}</header>
-            <p>${highlightText(item.text || "[消息]", state.q)}</p>
+            <div class="forward-segments">
+              ${
+                Array.isArray(item.segments) && item.segments.length
+                  ? item.segments.map(renderForwardSegmentHtml).filter(Boolean).join("")
+                  : highlightText(item.text || "[消息]", state.q)
+              }
+            </div>
           </article>
         `)
         .join("")
@@ -1924,7 +2001,51 @@ function openForwardViewer(parsed) {
         ${(parsed.previews || []).map((preview) => `<p>${escapeHtml(preview)}</p>`).join("") || `<p>${escapeHtml(parsed.summary || "该合并转发只有摘要，原始消息正文未随归档保存。")}</p>`}
       </div>
     `;
+  bindForwardViewerInteractions();
   els.forwardViewer.hidden = false;
+}
+
+function bindForwardViewerInteractions() {
+  if (!els.forwardViewerBody) return;
+  els.forwardViewerBody.querySelectorAll(".inline-image-preview img").forEach((image) => {
+    bindImageLoadState(image, image.closest(".inline-image-preview"));
+  });
+  els.forwardViewerBody.querySelectorAll(".video-element img").forEach((image) => {
+    bindImageLoadState(image, image.closest(".video-element"));
+  });
+  els.forwardViewerBody.querySelectorAll(".inline-market-face, .inline-face-img").forEach((image) => {
+    image.addEventListener("error", () => {
+      image.parentElement?.classList.add("no-image");
+      image.remove();
+    }, { once: true });
+  });
+  els.forwardViewerBody.onclick = handleForwardViewerClick;
+}
+
+function handleForwardViewerClick(event) {
+  const inlineImage = event.target?.closest?.("[data-inline-image]");
+  if (inlineImage?.dataset.inlineImage) {
+    openInlineMediaViewer({
+      kind: "image",
+      name: inlineImage.dataset.inlineMediaName || "图片",
+      inline_url: inlineImage.dataset.inlineImage,
+    });
+    return;
+  }
+  const inlineVideo = event.target?.closest?.("[data-inline-video]");
+  if (inlineVideo?.dataset.inlineVideo) {
+    openInlineMediaViewer({
+      kind: "video",
+      name: inlineVideo.dataset.inlineMediaName || "视频",
+      inline_url: inlineVideo.dataset.inlineVideo,
+    });
+    return;
+  }
+  const forwardTarget = event.target?.closest?.("[data-forward-preview]");
+  if (forwardTarget?.dataset.forwardPreview) {
+    const forward = getForwardPreview(forwardTarget.dataset.forwardPreview);
+    if (forward) openForwardViewer(forward);
+  }
 }
 
 function closeForwardViewer() {
@@ -2073,6 +2194,7 @@ function inferElementKind(raw, fallbackKind = "") {
   if (raw.faceElement || raw.marketFaceElement || typeHint === 3 || elementTypeHint === 6 || kind.includes("face") || kind.includes("emoji")) return "face";
   if (raw.multiForwardMsgElement || elementTypeHint === 16) return "forward";
   if (raw.arkElement || elementTypeHint === 10) return "ark";
+  if (raw.atElement || raw.mentionElement || kind === "at" || kind.includes("mention")) return "mention";
   if (raw.textElement || raw.text || raw.content || raw.data?.text || kind === "plain" || kind === "text") return "text";
   return kind || fallback;
 }
@@ -2162,7 +2284,9 @@ function mediaSourceDisplayUrl(item) {
   if (/^(data:|blob:)/i.test(source)) return source;
   if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
-  if (/^https?:\/\//i.test(source) && ["video", "audio", "file"].includes(normalizeMediaKind(item.kind))) return source;
+  if (/^https?:\/\//i.test(source) && ["video", "audio", "file"].includes(normalizeMediaKind(item.kind))) {
+    return pluginApiUrl(`media-proxy?kind=${encodeURIComponent(normalizeMediaKind(item.kind))}&url=${encodeURIComponent(source)}`);
+  }
   if (/^file:\/\//i.test(source) || /^[a-z]:[\\/]/i.test(source) || source.startsWith("/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   return "";
 }
@@ -2372,7 +2496,12 @@ function renderReactionRowHtml(reactions) {
 function renderReactionChipHtml(reaction) {
   const label = reactionLabel(reaction);
   const count = reaction.count ? fmtNumber(reaction.count) : "";
-  return `<span class="reaction-chip ${reaction.clicked ? "active" : ""}" title="表情回应">${escapeHtml(label)}${count ? `<b>${escapeHtml(count)}</b>` : ""}</span>`;
+  const imageUrl = reactionImageUrl(reaction);
+  return `<span class="reaction-chip ${reaction.clicked ? "active" : ""}" title="表情回应">${
+    imageUrl
+      ? `<img loading="lazy" src="${escapeAttr(imageUrl)}" alt="${escapeAttr(label)}" /><em>${escapeHtml(label)}</em>`
+      : escapeHtml(label)
+  }${count ? `<b>${escapeHtml(count)}</b>` : ""}</span>`;
 }
 
 function reactionLabel(reaction) {
@@ -2384,6 +2513,20 @@ function reactionLabel(reaction) {
     }
   }
   return reaction.id ? `[${reaction.id}]` : "表情";
+}
+
+function reactionImageUrl(reaction) {
+  if (!reaction?.id || !/^\d+$/.test(String(reaction.id))) return "";
+  if (String(reaction.type) === "2") {
+    try {
+      const hex = Number(reaction.id).toString(16);
+      return pluginApiUrl(`image-proxy?url=${encodeURIComponent(`https://gxh.vip.qq.com/club/item/parcel/item/emoji/${hex}/100x100.png`)}`);
+    } catch {
+      return "";
+    }
+  }
+  const rawUrl = `https://gxh.vip.qq.com/club/item/parcel/item/${String(reaction.id).slice(0, 2)}/${reaction.id}/100x100.png`;
+  return pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
 }
 
 function messageGroup(item, previous, next) {
@@ -3021,6 +3164,7 @@ function buildDemoMessages() {
           },
           { index: 1, kind: "plain", data: { text: "这里引用上一条归档消息，并附带 QQ 表情 " } },
           { index: 2, kind: "face", data: { faceIndex: 14, faceText: "[微笑]" } },
+          { index: 3, kind: "mention", data: { name: "Ops" } },
         ];
       }
       if (index === 27) {

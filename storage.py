@@ -946,19 +946,53 @@ class ChatArchiveStore:
 
     def _raw_message_elements(self, raw: Any) -> list[dict[str, Any]]:
         if isinstance(raw, list):
-            return [item for item in raw if isinstance(item, dict)]
+            elements: list[dict[str, Any]] = []
+            for item in raw:
+                nested = self._raw_message_elements(item)
+                if nested:
+                    elements.extend(nested)
+                elif isinstance(item, dict):
+                    elements.append(item)
+            return elements
         if not isinstance(raw, dict):
             return []
+        if self._has_known_message_shape(raw):
+            return [raw]
         for key in ("elements", "msgElements", "message", "messageChain", "message_chain", "segments"):
             value = raw.get(key)
             if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
+                return self._raw_message_elements(value)
         for key in ("payload", "data", "message_obj", "raw_message"):
             value = raw.get(key)
             nested = self._raw_message_elements(value)
             if nested:
                 return nested
         return []
+
+    @staticmethod
+    def _has_known_message_shape(value: dict[str, Any]) -> bool:
+        known_keys = {
+            "picElement",
+            "imageElement",
+            "videoElement",
+            "pttElement",
+            "voiceElement",
+            "recordElement",
+            "audioElement",
+            "fileElement",
+            "faceElement",
+            "marketFaceElement",
+            "grayTipElement",
+            "replyElement",
+            "arkElement",
+            "multiForwardMsgElement",
+            "elementType",
+            "type",
+            "kind",
+            "segment_type",
+            "typeName",
+        }
+        return any(key in value for key in known_keys)
 
     def _media_kind_and_data(self, data: dict[str, Any], fallback_kind: str = "") -> tuple[str, dict[str, Any]]:
         if not isinstance(data, dict):
@@ -992,7 +1026,7 @@ class ChatArchiveStore:
     @staticmethod
     def _media_source_keys(kind: str) -> tuple[str, ...]:
         normalized = ChatArchiveStore._normalize_media_kind(kind)
-        common_tail = ("source", "path", "filePath", "file", "file_id", "fileId", "file_", "fileUuid", "fileUUID", "fileSubId")
+        common_tail = ("source", "path", "filePath", "file", "file_id", "fileId", "file_", "fileUuid", "fileUUID", "fileSubId", "md5HexStr")
         if normalized == "image":
             return (
                 "originImageUrl",
@@ -1003,14 +1037,16 @@ class ChatArchiveStore:
                 "fileUrl",
                 "imageUrl",
                 "faceUrl",
+                "rawUrl",
+                "downloadUrl",
                 "sourcePath",
                 "thumbPath",
                 *common_tail,
             )
         if normalized == "video":
-            return ("videoUrl", "url", "fileUrl", "thumbPath", "thumbUrl", "coverUrl", "previewUrl", *common_tail)
+            return ("videoUrl", "url", "fileUrl", "downloadUrl", "thumbPath", "thumbUrl", "coverUrl", "previewUrl", *common_tail)
         if normalized == "record":
-            return ("audioUrl", "recordUrl", "url", "fileUrl", "audioPath", "filePath", *common_tail)
+            return ("audioUrl", "recordUrl", "url", "fileUrl", "downloadUrl", "audioPath", "filePath", *common_tail)
         return ("url", "fileUrl", *common_tail)
 
     @staticmethod
@@ -2133,14 +2169,15 @@ class ChatArchiveStore:
             return {"path": resolved, "name": resolved.name, "mime": mime}
         return None
 
-    def get_remote_proxy_file(self, source: str) -> dict[str, Any] | None:
+    def get_remote_proxy_file(self, source: str, *, kind: str = "image") -> dict[str, Any] | None:
         if not self.config.proxy_remote_media:
             return None
         url = str(source or "").strip()
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return None
-        cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        media_kind = self._normalize_media_kind(kind) or "image"
+        cache_key = hashlib.sha256(f"{media_kind}:{url}".encode("utf-8")).hexdigest()
         meta_path = self.proxy_cache_dir / f"{cache_key}.json"
         cached = self._read_proxy_cache(meta_path)
         if cached:
@@ -2158,9 +2195,9 @@ class ChatArchiveStore:
                 }
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
-            final_url, response = self._open_remote_media(url, image_only=True, enforce_allowlist=True)
+            final_url, response = self._open_remote_media(url, image_only=media_kind == "image", enforce_allowlist=True)
             with response:
-                content_type = self._normalize_image_mime(response.headers.get("Content-Type"))
+                content_type = self._normalize_remote_media_mime(media_kind, response.headers.get("Content-Type"))
                 if response.headers.get("Content-Type") and not content_type:
                     return None
                 content_length = response.headers.get("Content-Length")
@@ -2178,10 +2215,12 @@ class ChatArchiveStore:
                             if size > max_bytes:
                                 return None
                             f.write(chunk)
-                    detected = self._detect_image_mime(temp_path)
+                    detected = self._detect_remote_media_mime(media_kind, temp_path) or content_type
                     if not detected:
+                        detected = mimetypes.guess_type(Path(urlparse(final_url).path).name)[0]
+                    if not self._remote_media_mime_allowed(media_kind, detected):
                         return None
-                    suffix = self._remote_media_suffix(final_url, Path(urlparse(final_url).path).name or "remote-image", detected)
+                    suffix = self._remote_media_suffix(final_url, Path(urlparse(final_url).path).name or f"remote-{media_kind}", detected or "application/octet-stream")
                     file_name = f"{cache_key}{suffix}"
                     target = self.proxy_cache_dir / file_name
                     if not target.exists():
@@ -2190,13 +2229,14 @@ class ChatArchiveStore:
                     meta = {
                         "file": file_name,
                         "name": _safe_name(Path(urlparse(final_url).path).name or file_name, file_name),
-                        "mime": detected,
+                        "mime": detected or "application/octet-stream",
                         "source": url,
+                        "kind": media_kind,
                         "fetched_at": int(time.time()),
                         "size": target.stat().st_size,
                     }
                     meta_path.write_text(_json_dumps(meta), encoding="utf-8")
-                    return {"path": target, "name": meta["name"], "mime": detected}
+                    return {"path": target, "name": meta["name"], "mime": meta["mime"]}
                 finally:
                     if temp_path is not None:
                         try:
@@ -2205,6 +2245,47 @@ class ChatArchiveStore:
                             pass
         except (OSError, HTTPError, TimeoutError, ValueError):
             return None
+
+    def _detect_remote_media_mime(self, kind: str, path: Path) -> str | None:
+        media_kind = self._normalize_media_kind(kind) or "file"
+        if media_kind == "image":
+            return self._detect_image_mime(path)
+        guessed = mimetypes.guess_type(path.name)[0]
+        if self._remote_media_mime_allowed(media_kind, guessed):
+            return guessed
+        return None
+
+    @staticmethod
+    def _normalize_remote_media_mime(kind: str, value: Any) -> str | None:
+        content_type = str(value or "").split(";", 1)[0].strip().lower()
+        if not content_type:
+            return None
+        media_kind = ChatArchiveStore._normalize_media_kind(kind) or "file"
+        if media_kind == "image":
+            return ChatArchiveStore._normalize_image_mime(content_type)
+        if ChatArchiveStore._remote_media_mime_allowed(media_kind, content_type):
+            return content_type
+        return None
+
+    @staticmethod
+    def _remote_media_mime_allowed(kind: str, mime: Any) -> bool:
+        content_type = str(mime or "").split(";", 1)[0].strip().lower()
+        if not content_type:
+            return False
+        media_kind = ChatArchiveStore._normalize_media_kind(kind) or "file"
+        if media_kind == "image":
+            return ChatArchiveStore._normalize_image_mime(content_type) is not None
+        if media_kind == "video":
+            return content_type.startswith("video/") or content_type in {"application/octet-stream", "binary/octet-stream"}
+        if media_kind == "record":
+            return content_type.startswith("audio/") or content_type in {"application/octet-stream", "binary/octet-stream"}
+        return (
+            content_type.startswith("application/")
+            or content_type.startswith("text/")
+            or content_type.startswith("image/")
+            or content_type.startswith("video/")
+            or content_type.startswith("audio/")
+        )
 
     @staticmethod
     def _read_proxy_cache(path: Path) -> dict[str, Any] | None:

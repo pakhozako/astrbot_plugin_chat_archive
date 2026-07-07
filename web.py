@@ -34,6 +34,7 @@ class ChatArchiveWeb:
             ("/media/<media_id>", self.media_file, ["GET"], "Chat archive media file"),
             ("/file-proxy", self.file_proxy, ["GET"], "Chat archive safe local media proxy"),
             ("/image-proxy", self.image_proxy, ["GET"], "Chat archive remote image proxy"),
+            ("/media-proxy", self.media_proxy, ["GET"], "Chat archive remote media proxy"),
             ("/export", self.export_archive, ["POST"], "Export chat archive"),
         ]
         for path, handler, methods, desc in routes:
@@ -192,6 +193,16 @@ class ChatArchiveWeb:
         row = self.store.get_remote_proxy_file(str(request.query.get("url", "") or ""))
         if not row:
             return json_response({"ok": False, "message": "image proxy blocked or unavailable"}, status_code=404)
+        path = Path(row["path"])
+        return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
+
+    async def media_proxy(self):
+        row = self.store.get_remote_proxy_file(
+            str(request.query.get("url", "") or ""),
+            kind=str(request.query.get("kind", "") or "file"),
+        )
+        if not row:
+            return json_response({"ok": False, "message": "media proxy blocked or unavailable"}, status_code=404)
         path = Path(row["path"])
         return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
 

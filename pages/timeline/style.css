@@ -1054,6 +1054,20 @@ h2 {
   vertical-align: baseline;
 }
 
+.inline-mention {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 1px 7px;
+  font-size: 13px;
+  font-weight: 720;
+  line-height: 1.35;
+  vertical-align: baseline;
+}
+
 .market-face-shell,
 .inline-face-shell {
   display: inline-grid;
@@ -1497,6 +1511,31 @@ mark {
   border-color: color-mix(in srgb, var(--accent), transparent 48%);
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.reaction-chip img {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+}
+
+.reaction-chip img + em {
+  display: none;
+  font-style: normal;
+}
+
+.reaction-chip img:not([src]),
+.reaction-chip img[src=""] {
+  display: none;
+}
+
+.reaction-chip img:not([src]) + em,
+.reaction-chip img[src=""] + em {
+  display: inline;
+}
+
+.reaction-chip.no-image em {
+  display: inline;
 }
 
 .reaction-chip b {
@@ -2014,6 +2053,25 @@ mark {
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.forward-segments {
+  display: grid;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.forward-segments .inline-image-preview,
+.forward-segments .video-element,
+.forward-segments .inline-rich-card,
+.forward-segments .voice-element,
+.forward-segments .forward-card {
+  display: inline-grid;
+  max-width: min(260px, 100%);
 }
 
 .forward-preview-list {

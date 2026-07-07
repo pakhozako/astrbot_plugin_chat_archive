@@ -43,13 +43,13 @@
     "hint": "默认关闭以降低 SSRF 风险；只有适配器明确使用可信本机/内网媒体代理时再开启。"
   },
   "proxy_remote_media": {
-    "description": "WebUI 允许通过受控代理加载远程图片",
+    "description": "WebUI 允许通过受控代理加载远程媒体",
     "type": "bool",
     "default": true,
-    "hint": "仅作为图片未能归档落盘时的显示兜底；代理域名受 remote_media_allowed_hosts 限制。"
+    "hint": "作为图片、视频、语音和文件未能归档落盘时的显示兜底；代理域名受 remote_media_allowed_hosts 限制。"
   },
   "remote_media_allowed_hosts": {
-    "description": "允许 WebUI 代理访问的远程图片域名",
+    "description": "允许 WebUI 代理访问的远程媒体域名",
     "type": "list",
     "default": [
       "gchat.qpic.cn",
@@ -59,7 +59,7 @@
       "q1.qlogo.cn",
       "gxh.vip.qq.com"
     ],
-    "hint": "用于 QQ 图片、头像、表情等跨域/Referer 兜底。普通远程图片归档仍由 download_remote_media 控制。"
+    "hint": "用于 QQ 图片、头像、表情、视频封面和语音等跨域/Referer 兜底。普通远程图片归档仍由 download_remote_media 控制。"
   },
   "max_storage_mb": {
     "description": "归档总存储上限 MB，留空或 0 表示不限制",
