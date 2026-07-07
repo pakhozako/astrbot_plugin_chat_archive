@@ -60,6 +60,7 @@ const state = {
 const demoMessages = buildDemoMessages();
 const imageDataCache = new Map();
 const imageDataInFlight = new Map();
+const IMAGE_LOAD_TIMEOUT_MS = 12000;
 
 const els = {
   statLine: document.getElementById("statLine"),
@@ -292,7 +293,7 @@ async function protectedImageDataUrl(src) {
 
 async function recoverImageSource(image) {
   if (!image || image.dataset.recovering === "1") return false;
-  const source = image.getAttribute("src") || image.currentSrc || "";
+  const source = image.dataset.originalSrc || image.getAttribute("src") || image.currentSrc || "";
   image.dataset.recovering = "1";
   try {
     if (image.dataset.dataUrlTried !== "1") {
@@ -783,12 +784,14 @@ function renderConversations() {
       const count = Number(item.message_count || 0);
       const mediaCount = Number(item.media_count || 0);
       const unreadCount = Number(item.unread_count || 0);
+      const avatarUrl = conversationAvatarUrl(item);
+      const avatarText = escapeHtml(initials(item.sample_sender || item.umo || "All"));
       button.className = `conversation ${active ? "active" : ""}`;
       button.type = "button";
       button.setAttribute("aria-pressed", String(active));
       button.title = item.umo || "全部会话";
       button.innerHTML = `
-        <div class="conversation-avatar" style="--avatar-bg:${avatarColor(item.umo || "all")}">${escapeHtml(initials(item.sample_sender || item.umo || "All"))}</div>
+        <div class="conversation-avatar ${avatarUrl ? "image-avatar" : ""}" style="--avatar-bg:${avatarColor(item.umo || "all")}">${avatarUrl ? `<img loading="lazy" src="${escapeAttr(avatarUrl)}" alt="${escapeAttr(title)}" /><span>${avatarText}</span>` : avatarText}</div>
         <div class="conversation-main">
           <div class="conversation-title-row">
             <span class="conversation-title">${escapeHtml(title)}</span>
@@ -810,6 +813,7 @@ function renderConversations() {
         await loadMessages({ stickToBottom: true });
         await markCurrentConversationSeen();
       });
+      bindRecoverableImages(button, { selector: ".conversation-avatar img", removeOnFinalError: true });
       return button;
     }),
   );
@@ -1149,17 +1153,42 @@ function openInlineMediaViewer(item) {
 
 function bindImageLoadState(image, container) {
   if (!image || !container) return;
+  if (image.dataset.loadStateBound === "1") return;
+  image.dataset.loadStateBound = "1";
+  image.dataset.originalSrc = image.dataset.originalSrc || image.getAttribute("src") || image.currentSrc || "";
+  if (image.loading === "lazy") image.loading = "eager";
+  let finished = false;
+  let timeout = null;
   const markLoaded = () => {
+    finished = true;
+    if (timeout) clearTimeout(timeout);
     container.classList.remove("load-error");
     container.classList.add("loaded");
   };
   const markError = async () => {
+    if (finished) return;
     if (await recoverImageSource(image)) return;
+    finished = true;
+    if (timeout) clearTimeout(timeout);
     container.classList.remove("loaded");
     container.classList.add("load-error");
   };
   image.addEventListener("load", markLoaded);
   image.addEventListener("error", markError);
+  const originalSrc = image.dataset.originalSrc;
+  if (originalSrc && bridgeAvailable) {
+    protectedImageDataUrl(originalSrc)
+      .then((dataUrl) => {
+        if (!dataUrl || finished || image.src === dataUrl) return;
+        image.src = dataUrl;
+      })
+      .catch(() => {
+        // Direct image loading remains the fallback; error/timeout will set UI state.
+      });
+  }
+  timeout = setTimeout(() => {
+    if (!finished && !image.complete) markError();
+  }, IMAGE_LOAD_TIMEOUT_MS);
   if (image.complete) {
     if (image.naturalWidth > 0) markLoaded();
     else markError();
@@ -1746,8 +1775,9 @@ function renderComponentInlineHtml(component) {
   const typeHint = Number(raw.type ?? component.type);
   const elementTypeHint = Number(raw.elementType ?? component.elementType);
   if (raw.picElement || raw.imageElement) return renderPicElementHtml(raw.picElement || raw.imageElement, raw);
+  if (raw.mfaceElement) return renderMarketFaceHtml(raw.mfaceElement);
   if (raw.faceElement) return renderFaceHtml(raw.faceElement);
-  if (raw.marketFaceElement) return renderMarketFaceHtml(raw.marketFaceElement);
+  if (raw.marketFaceElement || raw.market_face) return renderMarketFaceHtml(raw.marketFaceElement || raw.market_face);
   if (raw.fileElement) return renderFileElementHtml(raw.fileElement);
   if (raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement) return renderPttElementHtml(raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement, raw);
   if (raw.videoElement) return renderVideoElementHtml(raw.videoElement, raw);
@@ -1785,7 +1815,7 @@ function renderMentionHtml(mention) {
 function renderFaceHtml(face) {
   const id = face?.faceIndex ?? face?.faceId ?? face?.id ?? "";
   const label = face?.faceText || face?.name || (id !== "" ? `[表情${id}]` : "[表情]");
-  const source = firstMediaSource(face, ["url", "faceUrl", "imageUrl", "fileUrl", "filePath", "path"]);
+  const source = firstMediaSource(face, ["url", "faceUrl", "face_url", "imageUrl", "image_url", "fileUrl", "file_url", "filePath", "file_path", "path"]);
   const displayUrl = source
     ? mediaSourceDisplayUrl({ kind: "image", source })
     : id !== "" && /^\d+$/.test(String(id))
@@ -1796,15 +1826,21 @@ function renderFaceHtml(face) {
 }
 
 function renderMarketFaceHtml(face) {
-  const emojiId = String(face?.emojiId || "").trim();
-  const faceName = face?.faceName || face?.name || "表情包";
-  if (!emojiId) return `<span class="inline-face market">${escapeHtml(`[${faceName}]`)}</span>`;
+  const emojiId = String(face?.emojiId || face?.emoji_id || face?.id || "").trim();
+  const faceName = face?.faceName || face?.face_name || face?.summary || face?.name || "表情包";
+  const directSource = firstMediaSource(face, ["url", "faceUrl", "face_url", "imageUrl", "image_url", "emojiWebUrl", "emojiUrl", "emoji_url", "fileUrl", "file_url", "path", "filePath", "file_path"]);
   const sizes = Array.isArray(face?.supportSize) ? face.supportSize : [];
   const size = sizes[0] || {};
   const width = Math.min(Number(size.width || 120), 180);
   const height = Math.min(Number(size.height || 120), 180);
-  const dir = emojiId.slice(0, 2);
-  const rawUrl = `https://gxh.vip.qq.com/club/item/parcel/item/${dir}/${emojiId}/raw${Math.min(width || 120, 300)}.gif`;
+  if (directSource) {
+    const displayUrl = mediaSourceDisplayUrl({ kind: "image", source: directSource });
+    if (displayUrl) {
+      return `<span class="market-face-shell"><img class="inline-market-face" loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(faceName)}" title="${escapeAttr(faceName)}" style="max-width:${width}px;max-height:${height}px" /><em>${escapeHtml(`[${faceName}]`)}</em></span>`;
+    }
+  }
+  if (!emojiId) return `<span class="inline-face market">${escapeHtml(`[${faceName}]`)}</span>`;
+  const rawUrl = marketFaceSource(face);
   const proxyUrl = pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
   return `<span class="market-face-shell"><img class="inline-market-face" loading="lazy" src="${escapeAttr(proxyUrl)}" alt="${escapeAttr(faceName)}" title="${escapeAttr(faceName)}" style="max-width:${width}px;max-height:${height}px" /><em>${escapeHtml(`[${faceName}]`)}</em></span>`;
 }
@@ -1812,10 +1848,17 @@ function renderMarketFaceHtml(face) {
 function renderPicElementHtml(pic, wrapper = {}) {
   const source = normalizeQpicSource(firstMediaSource(pic, [
     "originImageUrl",
+    "origin_image_url",
     "picUrl",
+    "pic_url",
     "thumbUrl",
+    "thumb_url",
     "previewUrl",
+    "preview_url",
     "fileUrl",
+    "file_url",
+    "imageUrl",
+    "image_url",
     "url",
     "source",
     "file",
@@ -1823,8 +1866,12 @@ function renderPicElementHtml(pic, wrapper = {}) {
     "fileId",
     "path",
     "filePath",
+    "file_path",
+    "localPath",
     "sourcePath",
+    "source_path",
     "thumbPath",
+    "thumb_path",
     "md5HexStr",
   ]));
   const displayUrl = mediaSourceDisplayUrl({ kind: "image", source });
@@ -1877,7 +1924,7 @@ function renderPttElementHtml(ptt, wrapper = {}) {
 }
 
 function renderVideoElementHtml(video, wrapper = {}) {
-  const thumb = firstMediaSource(video, ["thumbPath", "thumbUrl", "thumb", "coverUrl", "cover", "previewUrl", "originImageUrl"]);
+  const thumb = firstMediaSource(video, ["thumbPath", "thumb_path", "thumbUrl", "thumb_url", "thumb", "coverUrl", "cover_url", "cover", "previewUrl", "preview_url", "originImageUrl", "origin_image_url"]);
   const source = firstMediaSource(video, mediaSourceKeys("video"));
   const duration = Number(video?.fileTime || video?.duration || 0);
   const name = video?.fileName || video?.name || "视频";
@@ -2336,15 +2383,16 @@ function inlineMediaItemsFromMessage(item) {
 function mediaItemFromElement(raw, index = 0) {
   const element = unwrapMessageElement(raw);
   if (!element || typeof element !== "object") return null;
-  if (element.picElement || element.imageElement || inferElementKind(element) === "image") {
-    const pic = element.picElement || element.imageElement || element;
+  if (element.picElement || element.imageElement || element.mfaceElement || element.marketFaceElement || element.market_face || inferElementKind(element) === "image") {
+    const pic = element.picElement || element.imageElement || element.mfaceElement || element.marketFaceElement || element.market_face || element;
     const source = normalizeQpicSource(firstMediaSource(pic, mediaSourceKeys("image")));
-    if (!source) return null;
+    if (!source && !(pic.emojiId || pic.emoji_id)) return null;
+    const derivedSource = source || marketFaceSource(pic);
     return {
-      id: `inline-image-${index}-${source}`,
+      id: `inline-image-${index}-${derivedSource}`,
       kind: "image",
-      name: pic.fileName || pic.file || pic.name || pic.summary || "图片",
-      source,
+      name: pic.fileName || pic.file || pic.name || pic.faceName || pic.face_name || pic.summary || "图片",
+      source: derivedSource,
       width: pic.picWidth || pic.width || pic.originWidth || pic.thumbWidth,
       height: pic.picHeight || pic.height || pic.originHeight || pic.thumbHeight,
     };
@@ -2412,17 +2460,17 @@ function mediaSourceDisplayUrl(item) {
 
 function mediaSourceKeys(kind) {
   const normalized = normalizeMediaKind(kind);
-  const tail = ["source", "path", "filePath", "file", "file_id", "fileId", "file_"];
+  const tail = ["source", "path", "filePath", "file_path", "localPath", "file", "file_id", "fileId", "file_", "md5HexStr", "md5"];
   if (normalized === "image") {
-    return ["originImageUrl", "picUrl", "thumbUrl", "previewUrl", "url", "fileUrl", "sourcePath", "thumbPath", ...tail];
+    return ["originImageUrl", "origin_image_url", "picUrl", "pic_url", "thumbUrl", "thumb_url", "previewUrl", "preview_url", "url", "fileUrl", "file_url", "imageUrl", "image_url", "faceUrl", "face_url", "emojiWebUrl", "emojiUrl", "emoji_url", "sourcePath", "source_path", "thumbPath", "thumb_path", ...tail];
   }
   if (normalized === "video") {
-    return ["videoUrl", "url", "fileUrl", "thumbPath", "previewUrl", ...tail];
+    return ["videoUrl", "video_url", "url", "fileUrl", "file_url", "thumbPath", "thumb_path", "thumbUrl", "thumb_url", "previewUrl", "preview_url", "coverUrl", "cover_url", ...tail];
   }
   if (normalized === "audio") {
-    return ["audioUrl", "recordUrl", "url", "fileUrl", ...tail];
+    return ["audioUrl", "audio_url", "recordUrl", "record_url", "pttUrl", "ptt_url", "url", "fileUrl", "file_url", ...tail];
   }
-  return ["url", "fileUrl", ...tail];
+  return ["url", "fileUrl", "file_url", "downloadUrl", "download_url", ...tail];
 }
 
 function applyMediaPreviewSize(node, item) {
@@ -2448,8 +2496,18 @@ function normalizeQpicSource(source) {
   const value = String(source || "").trim();
   if (!value) return "";
   if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("http://gchat.qpic.cn/")) return `https://${value.slice("http://".length)}`;
   if (value.startsWith("/")) return `https://gchat.qpic.cn${value}`;
   return value;
+}
+
+function marketFaceSource(face) {
+  const emojiId = String(face?.emojiId || face?.emoji_id || face?.id || "").trim();
+  if (!emojiId) return "";
+  const sizes = Array.isArray(face?.supportSize) ? face.supportSize : [];
+  const size = sizes[0] || {};
+  const width = Math.min(Number(size.width || 120), 300);
+  return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw${width}.gif`;
 }
 
 function firstMediaSource(value, keys = []) {
@@ -2533,7 +2591,7 @@ function grayTipText(grayTip) {
   if (jsonStr) {
     try {
       const parsed = JSON.parse(jsonStr);
-      const text = Array.isArray(parsed.items) ? parsed.items.map((item) => item.txt || item.text || "").join("") : "";
+      const text = Array.isArray(parsed.items) ? parsed.items.map(grayTipItemText).join("") : "";
       if (text) return stripHtml(text);
     } catch {
       return "";
@@ -2541,6 +2599,14 @@ function grayTipText(grayTip) {
   }
   const xml = grayTip.xmlElement?.content || grayTip.content || grayTip.text || grayTip.recentAbstract;
   if (xml) return stripHtml(String(xml));
+  return "";
+}
+
+function grayTipItemText(item) {
+  if (!item || typeof item !== "object") return "";
+  if (item.txt || item.text || item.content) return String(item.txt || item.text || item.content);
+  if (item.name || item.nick || item.nickname) return String(item.name || item.nick || item.nickname);
+  if (item.uid || item.uin) return String(item.uid || item.uin);
   return "";
 }
 
@@ -2733,9 +2799,27 @@ function renderAvatarHtml(item, sender, self, group) {
 
 function qqAvatarUrl(item) {
   const raw = item?.raw || {};
-  const uin = String(raw.senderUin || raw.sender_uin || raw.uin || "").trim();
+  const uin = String(raw.senderUin || raw.sender_uin || raw.senderUIN || raw.uin || raw.senderUinStr || raw.senderUinString || "").trim();
   if (!uin || !/^\d{5,}$/.test(uin)) return "";
   const rawUrl = `https://q1.qlogo.cn/g?b=qq&nk=${encodeURIComponent(uin)}&s=100`;
+  return pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
+}
+
+function conversationAvatarUrl(item) {
+  if (!item?.umo) return "";
+  const value = String(item.umo || "");
+  const groupMatch = value.match(/(?:group|guild|channel)[!:/:|]+(\d{5,})/i);
+  if (!groupMatch) return "";
+  const groupCode = groupMatch[1];
+  const rawUrl = `https://p.qlogo.cn/gh/${encodeURIComponent(groupCode)}/${encodeURIComponent(groupCode)}/100/`;
+  return pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
+}
+
+function qqGroupAvatarUrl(item) {
+  const raw = item?.raw || {};
+  const groupCode = String(raw.peerUin || raw.groupCode || raw.group_code || raw.group_id || item?.group_id || "").trim();
+  if (!groupCode || !/^\d{5,}$/.test(groupCode)) return "";
+  const rawUrl = `https://p.qlogo.cn/gh/${encodeURIComponent(groupCode)}/${encodeURIComponent(groupCode)}/100/`;
   return pluginApiUrl(`image-proxy?url=${encodeURIComponent(rawUrl)}`);
 }
 

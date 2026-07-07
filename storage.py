@@ -29,11 +29,20 @@ DEFAULT_BATCH_SIZE = 20
 DEFAULT_FLUSH_INTERVAL_SECONDS = 3.0
 REMOTE_MEDIA_ALLOWED_HOSTS = {
     "gchat.qpic.cn",
+    "gdynamic.qpic.cn",
     "multimedia.nt.qq.com.cn",
+    "multimedia.qfile.qq.com",
     "c2cpicdw.qpic.cn",
+    "c2cpicdw.qpic.com",
     "p.qlogo.cn",
     "q1.qlogo.cn",
     "gxh.vip.qq.com",
+    "q.qlogo.cn",
+    "thirdqq.qlogo.cn",
+    "gxh.vip.qq.com.cn",
+    "i.gtimg.cn",
+    "i.gtimg.com",
+    "qqface.gtimg.com",
 }
 
 
@@ -889,10 +898,14 @@ class ChatArchiveStore:
                 self._media_source_keys(kind),
             )
             source = self._normalize_qpic_source(source)
+            if not source and kind == "image":
+                source = self._market_face_source(raw_data)
             name = (
                 raw_data.get("name")
                 or raw_data.get("fileName")
                 or raw_data.get("file_name")
+                or raw_data.get("faceName")
+                or raw_data.get("face_name")
                 or raw_data.get("file")
                 or raw_data.get("summary")
                 or _safe_name(str(source or kind), fallback=kind)
@@ -921,8 +934,8 @@ class ChatArchiveStore:
                     "relative_path": relative_path,
                     "mime": detected_mime or raw_data.get("mime") or raw_data.get("content_type") or raw_data.get("contentType"),
                     "size": size,
-                    "width": raw_data.get("width") or raw_data.get("picWidth") or raw_data.get("thumbWidth"),
-                    "height": raw_data.get("height") or raw_data.get("picHeight") or raw_data.get("thumbHeight"),
+                    "width": raw_data.get("width") or raw_data.get("picWidth") or raw_data.get("pic_width") or raw_data.get("thumbWidth") or raw_data.get("thumb_width"),
+                    "height": raw_data.get("height") or raw_data.get("picHeight") or raw_data.get("pic_height") or raw_data.get("thumbHeight") or raw_data.get("thumb_height"),
                     "meta": raw_data,
                 }
             )
@@ -974,6 +987,7 @@ class ChatArchiveStore:
         known_keys = {
             "picElement",
             "imageElement",
+            "mfaceElement",
             "videoElement",
             "pttElement",
             "voiceElement",
@@ -982,6 +996,7 @@ class ChatArchiveStore:
             "fileElement",
             "faceElement",
             "marketFaceElement",
+            "market_face",
             "grayTipElement",
             "replyElement",
             "arkElement",
@@ -1001,6 +1016,12 @@ class ChatArchiveStore:
             return "image", data["picElement"]
         if isinstance(data.get("imageElement"), dict):
             return "image", data["imageElement"]
+        if isinstance(data.get("mfaceElement"), dict):
+            return "image", data["mfaceElement"]
+        if isinstance(data.get("marketFaceElement"), dict):
+            return "image", data["marketFaceElement"]
+        if isinstance(data.get("market_face"), dict):
+            return "image", data["market_face"]
         if isinstance(data.get("videoElement"), dict):
             return "video", data["videoElement"]
         for key in ("pttElement", "voiceElement", "recordElement", "audioElement"):
@@ -1026,28 +1047,55 @@ class ChatArchiveStore:
     @staticmethod
     def _media_source_keys(kind: str) -> tuple[str, ...]:
         normalized = ChatArchiveStore._normalize_media_kind(kind)
-        common_tail = ("source", "path", "filePath", "file", "file_id", "fileId", "file_", "fileUuid", "fileUUID", "fileSubId", "md5HexStr")
+        common_tail = (
+            "source",
+            "path",
+            "filePath",
+            "file_path",
+            "localPath",
+            "file",
+            "file_id",
+            "fileId",
+            "file_",
+            "fileUuid",
+            "fileUUID",
+            "fileSubId",
+            "md5HexStr",
+            "md5",
+        )
         if normalized == "image":
             return (
                 "originImageUrl",
+                "origin_image_url",
                 "picUrl",
+                "pic_url",
                 "thumbUrl",
+                "thumb_url",
                 "previewUrl",
+                "preview_url",
                 "url",
                 "fileUrl",
+                "file_url",
                 "imageUrl",
+                "image_url",
                 "faceUrl",
+                "face_url",
+                "emojiWebUrl",
+                "emojiUrl",
+                "emoji_url",
                 "rawUrl",
                 "downloadUrl",
+                "download_url",
                 "sourcePath",
                 "thumbPath",
+                "thumb_path",
                 *common_tail,
             )
         if normalized == "video":
-            return ("videoUrl", "url", "fileUrl", "downloadUrl", "thumbPath", "thumbUrl", "coverUrl", "previewUrl", *common_tail)
+            return ("videoUrl", "video_url", "url", "fileUrl", "file_url", "downloadUrl", "download_url", "thumbPath", "thumb_path", "thumbUrl", "thumb_url", "coverUrl", "cover_url", "previewUrl", "preview_url", *common_tail)
         if normalized == "record":
-            return ("audioUrl", "recordUrl", "url", "fileUrl", "downloadUrl", "audioPath", "filePath", *common_tail)
-        return ("url", "fileUrl", *common_tail)
+            return ("audioUrl", "audio_url", "recordUrl", "record_url", "pttUrl", "ptt_url", "url", "fileUrl", "file_url", "downloadUrl", "download_url", "audioPath", "audio_path", "filePath", *common_tail)
+        return ("url", "fileUrl", "file_url", "downloadUrl", "download_url", *common_tail)
 
     @staticmethod
     def _normalize_media_kind(kind: Any) -> str:
@@ -1092,9 +1140,21 @@ class ChatArchiveStore:
         value = str(source or "").strip()
         if value.startswith("//"):
             return "https:" + value
+        if value.startswith("http://gchat.qpic.cn/"):
+            return "https://" + value[len("http://") :]
         if value.startswith("/"):
             return "https://gchat.qpic.cn" + value
         return value
+
+    @staticmethod
+    def _market_face_source(data: dict[str, Any]) -> str:
+        emoji_id = str(data.get("emojiId") or data.get("emoji_id") or data.get("id") or "").strip()
+        if not emoji_id:
+            return ""
+        sizes = data.get("supportSize")
+        size = sizes[0] if isinstance(sizes, list) and sizes and isinstance(sizes[0], dict) else {}
+        width = min(int(size.get("width") or 120), 300)
+        return f"https://gxh.vip.qq.com/club/item/parcel/item/{emoji_id[:2]}/{emoji_id}/raw{width}.gif"
 
     def _prepare_media_for_write(self, entries: list[dict[str, Any]]) -> None:
         for entry in entries:
@@ -1307,10 +1367,22 @@ class ChatArchiveStore:
         if not content_type:
             return None
         aliases = {
+            "application/jpg": "image/jpeg",
+            "application/jpeg": "image/jpeg",
+            "application/x-jpg": "image/jpeg",
+            "application/x-jpeg": "image/jpeg",
+            "application/png": "image/png",
+            "application/x-png": "image/png",
             "image/jpg": "image/jpeg",
             "image/pjpeg": "image/jpeg",
+            "image/x-jpg": "image/jpeg",
+            "image/x-jpeg": "image/jpeg",
             "image/x-png": "image/png",
-            "image/apng": "image/png",
+            "image/apng": "image/apng",
+            "image/x-gif": "image/gif",
+            "image/x-webp": "image/webp",
+            "image/x-bmp": "image/bmp",
+            "image/x-ms-bmp": "image/bmp",
             "image/svg": "image/svg+xml",
             "image/x-svg": "image/svg+xml",
             "image/ico": "image/vnd.microsoft.icon",
@@ -1320,11 +1392,14 @@ class ChatArchiveStore:
         content_type = aliases.get(content_type, content_type)
         if content_type in {
             "image/png",
+            "image/apng",
             "image/jpeg",
             "image/gif",
             "image/webp",
             "image/bmp",
             "image/avif",
+            "image/heic",
+            "image/heif",
             "image/svg+xml",
             "image/vnd.microsoft.icon",
         }:
@@ -1339,6 +1414,8 @@ class ChatArchiveStore:
         except OSError:
             return None
         if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            if b"acTL" in header:
+                return "image/apng"
             return "image/png"
         if header.startswith(b"\xff\xd8\xff"):
             return "image/jpeg"
@@ -1348,8 +1425,12 @@ class ChatArchiveStore:
             return "image/bmp"
         if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
             return "image/webp"
-        if len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12] in {b"avif", b"avis"}:
-            return "image/avif"
+        if len(header) >= 12 and header[4:8] == b"ftyp":
+            brand = header[8:12]
+            if brand in {b"avif", b"avis"}:
+                return "image/avif"
+            if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+                return "image/heic"
         if header.startswith(b"\x00\x00\x01\x00"):
             return "image/vnd.microsoft.icon"
         compact = header.lstrip().lower()
@@ -1375,6 +1456,12 @@ class ChatArchiveStore:
         suffix = Path(_safe_name(name)).suffix or Path(urlparse(url).path).suffix
         if suffix:
             return suffix[:16]
+        if content_type == "image/apng":
+            return ".png"
+        if content_type == "audio/silk":
+            return ".silk"
+        if content_type == "audio/amr":
+            return ".amr"
         guessed = mimetypes.guess_extension(content_type or "")
         return guessed or ".bin"
 
@@ -2293,9 +2380,51 @@ class ChatArchiveStore:
         media_kind = self._normalize_media_kind(kind) or "file"
         if media_kind == "image":
             return self._detect_image_mime(path)
+        if media_kind == "video":
+            return self._detect_video_mime(path)
+        if media_kind == "record":
+            return self._detect_audio_mime(path)
         guessed = mimetypes.guess_type(path.name)[0]
         if self._remote_media_mime_allowed(media_kind, guessed):
             return guessed
+        return None
+
+    @staticmethod
+    def _detect_video_mime(path: Path) -> str | None:
+        try:
+            with path.open("rb") as f:
+                header = f.read(64)
+        except OSError:
+            return None
+        if len(header) >= 12 and header[4:8] == b"ftyp":
+            brand = header[8:12]
+            if brand in {b"isom", b"iso2", b"mp41", b"mp42", b"avc1", b"dash", b"M4V "}:
+                return "video/mp4"
+        if header.startswith(b"\x1a\x45\xdf\xa3"):
+            return "video/webm"
+        if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
+            return "video/x-msvideo"
+        return None
+
+    @staticmethod
+    def _detect_audio_mime(path: Path) -> str | None:
+        try:
+            with path.open("rb") as f:
+                header = f.read(64)
+        except OSError:
+            return None
+        if header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"\xff\xf3") or header.startswith(b"\xff\xf2"):
+            return "audio/mpeg"
+        if header.startswith(b"OggS"):
+            return "audio/ogg"
+        if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
+            return "audio/wav"
+        if len(header) >= 12 and header[4:8] == b"ftyp":
+            return "audio/mp4"
+        if header.startswith(b"#!SILK"):
+            return "audio/silk"
+        if header.startswith(b"AMR"):
+            return "audio/amr"
         return None
 
     @staticmethod
@@ -2319,9 +2448,9 @@ class ChatArchiveStore:
         if media_kind == "image":
             return ChatArchiveStore._normalize_image_mime(content_type) is not None
         if media_kind == "video":
-            return content_type.startswith("video/") or content_type in {"application/octet-stream", "binary/octet-stream"}
+            return content_type.startswith("video/") or content_type in {"application/octet-stream", "binary/octet-stream", "application/octet-stream; charset=binary"}
         if media_kind == "record":
-            return content_type.startswith("audio/") or content_type in {"application/octet-stream", "binary/octet-stream"}
+            return content_type.startswith("audio/") or content_type in {"application/octet-stream", "binary/octet-stream", "audio/silk", "audio/amr"}
         return (
             content_type.startswith("application/")
             or content_type.startswith("text/")
