@@ -1,6 +1,8 @@
-# AstrBot Chat Archive / 聊天档案馆
+# 📚 AstrBot Chat Archive / 聊天档案馆
 
 > **Language:** 中文 | English summary included
+
+![:name](https://count.getloli.com/@astrbot_plugin_chat_archive?name=astrbot_plugin_chat_archive&theme=minecraft&padding=6&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
 > AstrBot 聊天记录归档插件。面向长期留存、检索和导出聊天内容，提供 Pending WAL 可靠队列、SQLite 批量写入、媒体去重、全文搜索、Telegram 风格时间线 WebUI 和多格式导出。
 
@@ -12,7 +14,7 @@ English: **AstrBot Chat Archive** captures text and media metadata from AstrBot 
 
 ---
 
-## 项目命名
+## 🏷️ 项目命名
 
 我建议使用：
 
@@ -28,7 +30,7 @@ English: **AstrBot Chat Archive** captures text and media metadata from AstrBot 
 
 ---
 
-## 项目结构
+## 🏗️ 项目结构
 
 ```text
 main.py                  ← 插件入口、生命周期、消息捕获和 /chatlog 命令
@@ -54,7 +56,7 @@ tests/
 
 ---
 
-## 核心功能
+## ✨ 核心功能
 
 | 功能 | 说明 |
 |------|------|
@@ -74,7 +76,7 @@ tests/
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
 ### 通过插件市场安装
 
@@ -91,7 +93,7 @@ git clone <your-repo-url> astrbot_plugin_chat_archive
 
 ---
 
-## 数据位置
+## 🗃️ 数据位置
 
 插件数据目录由 AstrBot 分配：
 
@@ -112,7 +114,7 @@ exports/                    导出文件
 
 ---
 
-## 配置说明
+## ⚙️ 配置说明
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -129,7 +131,7 @@ exports/                    导出文件
 
 ---
 
-## 命令列表
+## 🎮 命令列表
 
 | 命令 | 说明 |
 |------|------|
@@ -143,7 +145,7 @@ exports/                    导出文件
 
 ---
 
-## WebUI
+## 🖥️ WebUI
 
 安装后在 AstrBot 插件详情页打开：
 
@@ -165,7 +167,7 @@ timeline
 
 ---
 
-## 可靠性与恢复
+## 🛡️ 可靠性与恢复
 
 | 场景 | 行为 |
 |------|------|
@@ -188,7 +190,7 @@ Chat Archive fallback replay
 
 ---
 
-## 检索与导出
+## 🔍 检索与导出
 
 - 文本搜索优先使用 SQLite FTS5。
 - 无法规范化为 FTS 查询时，回退到带 `ESCAPE '\\'` 的安全 LIKE 查询。
@@ -198,7 +200,7 @@ Chat Archive fallback replay
 
 ---
 
-## 性能与安全说明
+## ⚡ 性能与安全说明
 
 - SQLite 使用 WAL 和增量索引：`sessions(session_id)`、`messages(session_id, timestamp)`、`messages(platform)`。
 - 媒体文件以 `sha256` 文件名保存，相同内容只保存一份实体文件。
@@ -208,7 +210,7 @@ Chat Archive fallback replay
 
 ---
 
-## 维护建议
+## 🧰 维护建议
 
 | 周期 | 建议 |
 |------|------|
@@ -220,7 +222,7 @@ Chat Archive fallback replay
 
 ---
 
-## 测试
+## ✅ 测试
 
 ```bash
 python -m py_compile main.py storage.py web.py
@@ -236,13 +238,12 @@ python tests/test_experience_stage4.py
 
 ---
 
-## 致谢
+## 🙏 致谢
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) — Agentic AI 助手框架
-- [astrbot_plugin_nas](https://github.com/pakhozako/astrbot_plugin_nas) — README 结构参考
 
 ---
 
-## 许可证
+## 📄 许可证
 
 请按你的仓库实际许可证补充。如果准备发布到插件市场，建议在仓库根目录添加 `LICENSE`。
