@@ -49,6 +49,9 @@ const state = {
   lastKnownCount: 0,
   mediaItems: [],
   mediaIndex: -1,
+  profileItem: null,
+  inspectorTab: "summary",
+  forwardPreview: null,
   timelineItems: [],
   latestPollInFlight: false,
   pollTimer: null,
@@ -84,6 +87,7 @@ const els = {
   closeDetailBtn: document.getElementById("closeDetailBtn"),
   toastLayer: document.getElementById("toastLayer"),
   contextMenu: document.getElementById("contextMenu"),
+  profilePopover: document.getElementById("profilePopover"),
   mediaViewer: document.getElementById("mediaViewer"),
   mediaViewerBody: document.getElementById("mediaViewerBody"),
   mediaViewerCaption: document.getElementById("mediaViewerCaption"),
@@ -93,6 +97,13 @@ const els = {
   nextMediaBtn: document.getElementById("nextMediaBtn"),
   statusStrip: document.getElementById("statusStrip"),
   sessionToggleBtn: document.getElementById("sessionToggleBtn"),
+  inspectorPane: document.getElementById("inspectorPane"),
+  inspectorMeta: document.getElementById("inspectorMeta"),
+  inspectorContent: document.getElementById("inspectorContent"),
+  forwardViewer: document.getElementById("forwardViewer"),
+  forwardViewerTitle: document.getElementById("forwardViewerTitle"),
+  forwardViewerBody: document.getElementById("forwardViewerBody"),
+  closeForwardBtn: document.getElementById("closeForwardBtn"),
   tagDialog: document.getElementById("tagDialog"),
   tagDialogList: document.getElementById("tagDialogList"),
   newTagName: document.getElementById("newTagName"),
@@ -112,6 +123,16 @@ const els = {
 let loadingOlder = false;
 let messageCacheDb = null;
 let messageCacheUnavailable = false;
+
+function disableMessageCache() {
+  messageCacheUnavailable = true;
+  try {
+    messageCacheDb?.close?.();
+  } catch {
+    // Ignore cache close failures; cache is an optional UI acceleration layer.
+  }
+  messageCacheDb = null;
+}
 
 els.timeline.addEventListener("scroll", () => {
   if (els.timeline.scrollTop < 72 && !loadingOlder && state.hasMore && !state.loading) {
@@ -198,13 +219,7 @@ function mediaUrl(item) {
 function mediaDisplayUrl(item) {
   if (item?.inline_url) return String(item.inline_url);
   if (item?.local_path && item?.id) return mediaUrl(item);
-  const source = String(item?.source || item?.url || item?.path || "").trim();
-  if (!source) return "";
-  if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
-  if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") {
-    return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
-  }
-  return "";
+  return mediaSourceDisplayUrl(item);
 }
 
 function fmtNumber(value) {
@@ -242,6 +257,192 @@ function updateStatusStrip(stats) {
   );
 }
 
+function renderInspector() {
+  if (!els.inspectorContent) return;
+  const current = state.conversations.find((item) => item.umo === state.currentUmo);
+  const messages = state.messages || [];
+  const stats = conversationStats(messages);
+  const title = state.currentUmo ? shortUmo(state.currentUmo) : "全部会话";
+  els.inspectorMeta.textContent = `${title} / ${fmtNumber(messages.length)} 条已载入`;
+  els.inspectorPane?.querySelectorAll("[data-inspector-tab]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.inspectorTab === state.inspectorTab);
+  });
+  if (state.inspectorTab === "media") {
+    renderInspectorMedia();
+    return;
+  }
+  if (state.inspectorTab === "people") {
+    renderInspectorPeople();
+    return;
+  }
+  if (state.inspectorTab === "files") {
+    renderInspectorFiles();
+    return;
+  }
+  const latest = messages[messages.length - 1];
+  els.inspectorContent.innerHTML = `
+    <section class="inspector-card session-card">
+      <div class="session-avatar" style="--avatar-bg:${avatarColor(state.currentUmo || "archive")}">${escapeHtml(initials(current?.sample_sender || state.currentUmo || "归档"))}</div>
+      <div>
+        <strong>${escapeHtml(title)}</strong>
+        <span>${escapeHtml(state.currentUmo || "跨会话总览")}</span>
+      </div>
+    </section>
+    <section class="inspector-card metric-grid">
+      ${renderMetric("消息", stats.messages)}
+      ${renderMetric("发送者", stats.people)}
+      ${renderMetric("媒体", stats.media)}
+      ${renderMetric("文件", stats.files)}
+    </section>
+    <section class="inspector-card">
+      <h4>最近消息</h4>
+      ${
+        latest
+          ? `<button class="inspector-message" type="button" data-jump-message="${escapeAttr(messageKey(latest))}">
+              <strong>${escapeHtml(senderDisplayName(latest))}</strong>
+              <span>${escapeHtml(messagePlainText(latest) || systemTipText(latest) || "[消息]")}</span>
+              <small>${escapeHtml(fmtFullTime(latest.created_at))}</small>
+            </button>`
+          : `<div class="empty-inline">暂无已载入消息。</div>`
+      }
+    </section>
+    <section class="inspector-card">
+      <h4>可靠性状态</h4>
+      <div class="inspector-kv"><span>Pending</span><strong>${escapeHtml(fmtNumber(state.stats?.pending || 0))}</strong></div>
+      <div class="inspector-kv"><span>DB</span><strong>${escapeHtml(fmtBytes(state.stats?.db_bytes || 0))}</strong></div>
+      <div class="inspector-kv"><span>媒体目录</span><strong>${escapeHtml(fmtBytes(state.stats?.media_bytes || 0))}</strong></div>
+    </section>
+  `;
+  bindInspectorJumpActions();
+}
+
+function renderMetric(label, value) {
+  return `<div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(fmtNumber(value))}</strong></div>`;
+}
+
+function conversationStats(messages) {
+  const people = new Set();
+  let media = 0;
+  let files = 0;
+  for (const message of messages || []) {
+    people.add(String(message.sender_id || message.sender_name || "unknown"));
+    const items = mediaForMessage(message);
+    media += items.filter((item) => ["image", "video", "audio"].includes(normalizeMediaKind(item.kind))).length;
+    files += items.filter((item) => normalizeMediaKind(item.kind) === "file").length;
+  }
+  return { messages: messages.length, people: people.size, media, files };
+}
+
+function renderInspectorMedia() {
+  const items = allDisplayableMediaItems().filter((item) => ["image", "video", "audio"].includes(normalizeMediaKind(item.kind))).slice(-36).reverse();
+  if (!items.length) {
+    els.inspectorContent.innerHTML = `<div class="empty-inline">当前载入范围内没有可预览媒体。</div>`;
+    return;
+  }
+  els.inspectorContent.innerHTML = `
+    <section class="inspector-card">
+      <h4>媒体墙</h4>
+      <div class="inspector-media-grid">
+        ${items.map(renderInspectorMediaThumbHtml).join("")}
+      </div>
+    </section>
+  `;
+  els.inspectorContent.querySelectorAll("[data-open-media-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = items[Number(button.dataset.openMediaIndex || 0)];
+      if (item) openMediaViewer(item);
+    });
+  });
+}
+
+function renderInspectorMediaThumbHtml(item, index) {
+  const kind = normalizeMediaKind(item.kind);
+  const url = mediaDisplayUrl(item);
+  if (kind === "image") {
+    return `<button class="inspector-media-thumb" type="button" data-open-media-index="${index}" title="${escapeAttr(item.name || "图片")}"><img loading="lazy" src="${escapeAttr(url)}" alt="${escapeAttr(item.name || "图片")}" /></button>`;
+  }
+  return `<button class="inspector-media-thumb ${escapeAttr(kind)}" type="button" data-open-media-index="${index}" title="${escapeAttr(item.name || mediaKindLabel(kind))}"><span>${escapeHtml(fileIcon(kind))}</span><small>${escapeHtml(mediaKindLabel(kind))}</small></button>`;
+}
+
+function renderInspectorPeople() {
+  const rows = peopleSummary(state.messages).slice(0, 24);
+  if (!rows.length) {
+    els.inspectorContent.innerHTML = `<div class="empty-inline">当前载入范围内没有发送者。</div>`;
+    return;
+  }
+  els.inspectorContent.innerHTML = `
+    <section class="inspector-card">
+      <h4>发送者</h4>
+      <div class="people-list">
+        ${rows.map(renderPersonRowHtml).join("")}
+      </div>
+    </section>
+  `;
+  els.inspectorContent.querySelectorAll("[data-filter-person]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      state.filters.sender = button.dataset.filterPerson || "";
+      syncFilterForm();
+      await loadMessages({ stickToBottom: true });
+    });
+  });
+}
+
+function peopleSummary(messages) {
+  const byKey = new Map();
+  for (const message of messages || []) {
+    const key = String(message.sender_id || message.sender_name || "unknown");
+    const existing = byKey.get(key) || { key, name: senderDisplayName(message), count: 0, last: 0, avatar: qqAvatarUrl(message) };
+    existing.count += 1;
+    existing.last = Math.max(existing.last, Number(message.created_at || 0));
+    if (!existing.avatar) existing.avatar = qqAvatarUrl(message);
+    byKey.set(key, existing);
+  }
+  return [...byKey.values()].sort((a, b) => b.count - a.count || b.last - a.last);
+}
+
+function renderPersonRowHtml(person) {
+  return `
+    <button class="person-row" type="button" data-filter-person="${escapeAttr(person.name || person.key)}">
+      <span class="person-avatar" style="--avatar-bg:${avatarColor(person.key)}">${person.avatar ? `<img loading="lazy" src="${escapeAttr(person.avatar)}" alt="${escapeAttr(person.name)}" />` : escapeHtml(initials(person.name))}</span>
+      <span><strong>${escapeHtml(person.name)}</strong><small>${escapeHtml(fmtFullTime(person.last))}</small></span>
+      <b>${escapeHtml(fmtNumber(person.count))}</b>
+    </button>
+  `;
+}
+
+function renderInspectorFiles() {
+  const files = state.messages.flatMap((message) => mediaForMessage(message)).filter((item) => normalizeMediaKind(item.kind) === "file").slice(-30).reverse();
+  if (!files.length) {
+    els.inspectorContent.innerHTML = `<div class="empty-inline">当前载入范围内没有文件。</div>`;
+    return;
+  }
+  els.inspectorContent.innerHTML = `
+    <section class="inspector-card">
+      <h4>文件</h4>
+      <div class="file-list">
+        ${files.map((item, index) => `
+          <button class="file-row" type="button" data-download-file="${index}">
+            <span class="file-icon">${escapeHtml(fileIcon(item.kind))}</span>
+            <span><strong>${escapeHtml(item.name || "文件")}</strong><small>${escapeHtml(item.size ? fmtBytes(item.size) : mediaDisplayUrl(item) || "来源记录")}</small></span>
+          </button>
+        `).join("")}
+      </div>
+    </section>
+  `;
+  els.inspectorContent.querySelectorAll("[data-download-file]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = files[Number(button.dataset.downloadFile || 0)];
+      if (item) downloadMedia(item).catch((error) => toast(error.message || "下载失败"));
+    });
+  });
+}
+
+function bindInspectorJumpActions() {
+  els.inspectorContent.querySelectorAll("[data-jump-message]").forEach((button) => {
+    button.addEventListener("click", () => scrollTimelineToKey(`msg-${button.dataset.jumpMessage}`));
+  });
+}
+
 async function downloadMedia(item) {
   const url = mediaDisplayUrl(item);
   if (!url) {
@@ -266,6 +467,7 @@ async function loadStats() {
   state.lastKnownCount = Number(stats.messages || 0);
   els.statLine.textContent = `${fmtNumber(stats.messages)} 条消息 / ${fmtNumber(stats.conversations)} 个会话 / ${fmtNumber(stats.media)} 个媒体`;
   updateStatusStrip(stats);
+  renderInspector();
   if (state.lastKnownCount > previous && !isNearBottom()) {
     els.jumpLatestBtn.hidden = false;
     els.jumpLatestBtn.textContent = `${fmtNumber(state.lastKnownCount - previous)} 条新消息`;
@@ -373,7 +575,7 @@ function dedupeMessages(items) {
 }
 
 function canUseMessageCache() {
-  return !state.q && !hasActiveFilters();
+  return bridgeAvailable && !state.q && !hasActiveFilters();
 }
 
 function messageCacheKey() {
@@ -396,7 +598,7 @@ async function openMessageCacheDb() {
   if (messageCacheUnavailable) return null;
   const dbFactory = window.indexedDB;
   if (!dbFactory) {
-    messageCacheUnavailable = true;
+    disableMessageCache();
     return null;
   }
   if (messageCacheDb) return messageCacheDb;
@@ -405,16 +607,22 @@ async function openMessageCacheDb() {
     try {
       request = dbFactory.open(MESSAGE_CACHE_DB, MESSAGE_CACHE_VERSION);
     } catch {
-      messageCacheUnavailable = true;
+      disableMessageCache();
       resolve(null);
       return;
     }
-    request.onerror = () => resolve(null);
+    request.onerror = () => {
+      disableMessageCache();
+      resolve(null);
+    };
+    request.onblocked = () => {
+      disableMessageCache();
+      resolve(null);
+    };
     request.onsuccess = () => {
       messageCacheDb = request.result;
       messageCacheDb.onversionchange = () => {
-        messageCacheDb?.close?.();
-        messageCacheDb = null;
+        disableMessageCache();
       };
       resolve(messageCacheDb);
     };
@@ -441,7 +649,7 @@ async function getCachedMessagesForCurrentView(cacheKey = messageCacheKey()) {
         resolve(dedupeMessages(messages));
       };
     } catch {
-      messageCacheUnavailable = true;
+      disableMessageCache();
       resolve([]);
     }
   });
@@ -463,7 +671,7 @@ async function setCachedMessagesForCurrentView(messages, cacheKey = messageCache
         updatedAt: Date.now(),
       });
     } catch {
-      messageCacheUnavailable = true;
+      disableMessageCache();
       resolve();
     }
   });
@@ -712,7 +920,7 @@ function renderMessage(item, group, active = false) {
   const text = messagePlainText(item);
   const bodyHtml = messageBodyHtml(item);
   const sender = senderDisplayName(item);
-  const media = Array.isArray(item.media) ? item.media : [];
+  const media = mediaForGrid(item);
   const platform = item.platform || "";
   const tags = Array.isArray(item.tags) ? item.tags : [];
   const reply = replyInfo(item);
@@ -753,7 +961,25 @@ function renderMessage(item, group, active = false) {
   node.querySelectorAll(".image-avatar img").forEach((image) => {
     image.addEventListener("error", () => image.remove(), { once: true });
   });
+  node.querySelectorAll("[data-profile]").forEach((trigger) => {
+    trigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showProfilePopover(item, event.clientX, event.clientY);
+    });
+    trigger.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showProfilePopover(item, event.clientX, event.clientY);
+    });
+  });
   node.querySelectorAll(".inline-market-face").forEach((image) => {
+    image.addEventListener("error", () => {
+      image.parentElement?.classList.add("no-image");
+      image.remove();
+    }, { once: true });
+  });
+  node.querySelectorAll(".inline-face-img").forEach((image) => {
     image.addEventListener("error", () => {
       image.parentElement?.classList.add("no-image");
       image.remove();
@@ -762,16 +988,39 @@ function renderMessage(item, group, active = false) {
   node.querySelectorAll(".inline-image-preview img").forEach((image) => {
     bindImageLoadState(image, image.closest(".inline-image-preview"));
   });
+  node.querySelectorAll(".video-element img").forEach((image) => {
+    bindImageLoadState(image, image.closest(".video-element"));
+  });
 
   node.addEventListener("click", (event) => {
     const inlineImage = event.target?.closest?.("[data-inline-image]");
     if (inlineImage?.dataset.inlineImage) {
-      openInlineImageViewer(inlineImage.dataset.inlineImage);
+      openInlineMediaViewer({
+        kind: "image",
+        name: inlineImage.dataset.inlineMediaName || "图片",
+        inline_url: inlineImage.dataset.inlineImage,
+      });
+      return;
+    }
+    const inlineVideo = event.target?.closest?.("[data-inline-video]");
+    if (inlineVideo?.dataset.inlineVideo) {
+      openInlineMediaViewer({
+        kind: "video",
+        name: inlineVideo.dataset.inlineMediaName || "视频",
+        inline_url: inlineVideo.dataset.inlineVideo,
+      });
       return;
     }
     const replyTarget = event.target?.closest?.("[data-reply-key]");
     if (replyTarget?.dataset.replyKey) {
       scrollTimelineToKey(replyTarget.dataset.replyKey);
+      return;
+    }
+    const forwardTarget = event.target?.closest?.("[data-forward-preview]");
+    if (forwardTarget) {
+      const index = Number(forwardTarget.dataset.forwardPreview || 0);
+      const forward = Array.isArray(state.forwardPreview) ? state.forwardPreview[index] : null;
+      if (forward) openForwardViewer(forward);
       return;
     }
     const action = event.target?.closest?.("[data-action]")?.dataset.action;
@@ -780,6 +1029,7 @@ function renderMessage(item, group, active = false) {
     if (action === "tag") openTagDialog(item);
     if (action === "copy") copyText(text || JSON.stringify(item.raw || item.components || ""));
     if (action === "raw") showRaw(item);
+    if (action === "profile") showProfilePopover(item, event.clientX, event.clientY);
   });
   node.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -788,10 +1038,11 @@ function renderMessage(item, group, active = false) {
   return node;
 }
 
-function openInlineImageViewer(url) {
-  const item = { kind: "image", name: "图片", source: url, inline_url: url };
-  state.mediaItems = [item];
-  state.mediaIndex = 0;
+function openInlineMediaViewer(item) {
+  const displayable = allDisplayableMediaItems();
+  const targetUrl = mediaDisplayUrl(item);
+  state.mediaItems = displayable.length ? displayable : [item];
+  state.mediaIndex = Math.max(0, state.mediaItems.findIndex((media) => mediaDisplayUrl(media) === targetUrl));
   renderMediaViewer();
   els.mediaViewer.hidden = false;
 }
@@ -868,23 +1119,27 @@ function renderMedia(item) {
 }
 
 function showContextMenu(x, y, item, text) {
-  const media = Array.isArray(item.media) ? item.media : [];
+  const media = mediaForMessage(item);
   const displayableMedia = media.filter((mediaItem) => mediaDisplayUrl(mediaItem));
   els.contextMenu.innerHTML = `
     <button type="button" data-action="favorite">${item.favorite ? "取消收藏" : "收藏消息"}</button>
+    <button type="button" data-action="profile">查看发送者</button>
     <button type="button" data-action="tag">编辑标签</button>
     <button type="button" data-action="copy">复制文本</button>
     <button type="button" data-action="raw">查看 JSON</button>
     <button type="button" data-action="copy-json">复制 JSON</button>
     ${displayableMedia.length ? `<button type="button" data-action="open-media">打开媒体</button>` : ""}
+    ${displayableMedia.length ? `<button type="button" data-action="copy-media-url">复制媒体链接</button>` : ""}
   `;
   els.contextMenu.hidden = false;
   const rect = els.contextMenu.getBoundingClientRect();
   els.contextMenu.style.left = `${Math.min(x, window.innerWidth - rect.width - 12)}px`;
   els.contextMenu.style.top = `${Math.min(y, window.innerHeight - rect.height - 12)}px`;
   els.contextMenu.onclick = (event) => {
+    event.stopPropagation();
     const action = event.target?.closest?.("button")?.dataset.action;
     if (action === "favorite") toggleFavorite(item);
+    if (action === "profile") showProfilePopover(item, x, y);
     if (action === "tag") openTagDialog(item);
     if (action === "copy") copyText(text || "");
     if (action === "raw") showRaw(item);
@@ -892,6 +1147,10 @@ function showContextMenu(x, y, item, text) {
     if (action === "open-media") {
       const first = displayableMedia[0];
       if (first) openMediaViewer(first);
+    }
+    if (action === "copy-media-url") {
+      const first = displayableMedia[0];
+      if (first) copyText(mediaDisplayUrl(first));
     }
     hideContextMenu();
   };
@@ -901,13 +1160,71 @@ function hideContextMenu() {
   els.contextMenu.hidden = true;
 }
 
+function showProfilePopover(item, x, y) {
+  if (!els.profilePopover) return;
+  const profile = profileFromMessage(item);
+  state.profileItem = item;
+  els.profilePopover.innerHTML = `
+    <div class="profile-cover" style="--avatar-bg:${avatarColor(profile.name)}">
+      <div class="profile-avatar">
+        ${profile.avatarUrl ? `<img loading="lazy" src="${escapeAttr(profile.avatarUrl)}" alt="${escapeAttr(profile.name)}" />` : `<span>${escapeHtml(initials(profile.name))}</span>`}
+      </div>
+      <div class="profile-main">
+        <strong>${escapeHtml(profile.name)}</strong>
+        <span>${escapeHtml(profile.primaryId || "未知账号")}</span>
+      </div>
+      <button class="profile-close" type="button" aria-label="关闭资料卡">关闭</button>
+    </div>
+    <div class="profile-body">
+      ${profile.remark ? `<div class="profile-row"><span>备注</span><strong>${escapeHtml(profile.remark)}</strong></div>` : ""}
+      ${profile.uid ? `<div class="profile-row"><span>UID</span><strong>${escapeHtml(profile.uid)}</strong></div>` : ""}
+      ${profile.uin ? `<div class="profile-row"><span>QQ</span><strong>${escapeHtml(profile.uin)}</strong></div>` : ""}
+      ${profile.role ? `<div class="profile-row"><span>群身份</span><strong>${escapeHtml(profile.role)}</strong></div>` : ""}
+      ${profile.level ? `<div class="profile-row"><span>等级</span><strong>${escapeHtml(profile.level)}</strong></div>` : ""}
+      ${profile.title ? `<div class="profile-row"><span>头衔</span><strong>${escapeHtml(profile.title)}</strong></div>` : ""}
+      <div class="profile-row"><span>会话</span><strong>${escapeHtml(shortUmo(item.umo || ""))}</strong></div>
+      <div class="profile-row"><span>时间</span><strong>${escapeHtml(fmtFullTime(item.created_at))}</strong></div>
+    </div>
+    <footer>
+      <button type="button" data-action="copy-sender">复制账号</button>
+      <button type="button" data-action="filter-sender">筛选此人</button>
+    </footer>
+  `;
+  els.profilePopover.hidden = false;
+  const rect = els.profilePopover.getBoundingClientRect();
+  els.profilePopover.style.left = `${Math.min(Math.max(12, x), window.innerWidth - rect.width - 12)}px`;
+  els.profilePopover.style.top = `${Math.min(Math.max(12, y), window.innerHeight - rect.height - 12)}px`;
+  els.profilePopover.querySelector(".profile-close")?.addEventListener("click", hideProfilePopover);
+  els.profilePopover.onclick = async (event) => {
+    const action = event.target?.closest?.("button")?.dataset.action;
+    if (action === "copy-sender") {
+      await copyText(profile.primaryId || profile.name);
+      hideProfilePopover();
+    }
+    if (action === "filter-sender") {
+      state.filters.sender = profile.name || profile.primaryId || "";
+      syncFilterForm();
+      hideProfilePopover();
+      await loadMessages({ stickToBottom: true });
+    }
+  };
+  els.profilePopover.querySelectorAll("img").forEach((image) => {
+    image.addEventListener("error", () => image.remove(), { once: true });
+  });
+}
+
+function hideProfilePopover() {
+  if (els.profilePopover) els.profilePopover.hidden = true;
+  state.profileItem = null;
+}
+
 function showRaw(item) {
   els.detailPane.hidden = false;
   els.rawJson.textContent = JSON.stringify(item, null, 2);
 }
 
 function openMediaViewer(item) {
-  state.mediaItems = state.messages.flatMap((msg) => (Array.isArray(msg.media) ? msg.media : [])).filter((m) => mediaDisplayUrl(m));
+  state.mediaItems = allDisplayableMediaItems();
   const targetUrl = mediaDisplayUrl(item);
   state.mediaIndex = Math.max(0, state.mediaItems.findIndex((m) => String(m.id || mediaDisplayUrl(m)) === String(item.id || targetUrl)));
   renderMediaViewer();
@@ -1056,6 +1373,7 @@ function dedupeTags(tags) {
 function updateMessageLocal(uid, patch) {
   state.messages = state.messages.map((message) => (messageKey(message) === uid ? { ...message, ...patch } : message));
   renderTimeline({ preserveTop: true });
+  renderInspector();
 }
 
 function hasActiveFilters() {
@@ -1141,6 +1459,7 @@ function updateHeader() {
     ? `${fmtNumber(current?.message_count || state.messages.length)} 条消息 / ${current?.latest_at ? fmtFullTime(current.latest_at) : "暂无最新时间"}`
     : `已载入 ${fmtNumber(state.messages.length)} 条 / ${state.hasMore ? "还有更早消息" : "已到最早消息"}`;
   updateSearchUi();
+  renderInspector();
 }
 
 function updateSearchUi() {
@@ -1204,7 +1523,8 @@ function scrollTimelineToBottom() {
 function textFromComponents(components) {
   if (!Array.isArray(components)) return "";
   return components
-    .map((item) => componentText(item))
+    .flatMap((item) => normalizedElementsFromComponent(item))
+    .map((item) => componentText(item.raw || item))
     .filter(Boolean)
     .join("");
 }
@@ -1223,20 +1543,68 @@ function messageBodyHtml(item) {
 }
 
 function messageElementObjects(item) {
-  const components = Array.isArray(item?.components) ? item.components : [];
-  const rawObjects = rawElements(item?.raw).map((element, index) => ({ index: components.length + index, kind: "raw", data: element }));
-  return [...components, ...rawObjects];
+  const elements = [];
+  for (const component of Array.isArray(item?.components) ? item.components : []) {
+    elements.push(...normalizedElementsFromComponent(component));
+  }
+  for (const element of rawElements(item?.raw)) {
+    elements.push(normalizeMessageElement(element, "raw"));
+  }
+  return dedupeNormalizedElements(elements);
+}
+
+function mediaForMessage(item) {
+  return dedupeMediaItems([
+    ...(Array.isArray(item?.media) ? item.media : []),
+    ...inlineMediaItemsFromMessage(item),
+  ]);
+}
+
+function mediaForGrid(item) {
+  const dbMedia = Array.isArray(item?.media) ? item.media : [];
+  const inlineMedia = inlineMediaItemsFromMessage(item);
+  if (!dbMedia.length) return dedupeMediaItems(inlineMedia);
+  const dbSources = new Set(
+    dbMedia
+      .map((media) => canonicalMediaSource(media))
+      .filter(Boolean),
+  );
+  return dedupeMediaItems([
+    ...dbMedia,
+    ...inlineMedia.filter((media) => !dbSources.has(canonicalMediaSource(media))),
+  ]);
+}
+
+function dedupeMediaItems(items) {
+  const result = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    if (!item || typeof item !== "object") continue;
+    const key = `${normalizeMediaKind(item.kind)}:${canonicalMediaSource(item) || item.id || item.name || result.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+function canonicalMediaSource(item) {
+  const source = firstMediaSource(item, ["inline_url", "source", "url", "path", "relative_path", "relativePath", "filePath", "localPath"]);
+  return normalizeQpicSource(source);
 }
 
 function componentText(component) {
   if (!component || typeof component !== "object") return "";
-  const data = component.data || {};
-  const raw = data.data && typeof data.data === "object" ? data.data : data;
+  const raw = unwrapMessageElement(component.raw || component.data || component);
   if (!raw || typeof raw !== "object") return "";
   return String(
       raw.text ??
       raw.content ??
       raw.message ??
+      raw.data?.text ??
+      raw.data?.content ??
+      raw.textElement?.content ??
+      raw.textElement?.text ??
       raw.faceText ??
       raw.fileElement?.fileName ??
       raw.pttElement?.text ??
@@ -1250,43 +1618,51 @@ function componentText(component) {
 
 function renderComponentInlineHtml(component) {
   if (!component || typeof component !== "object") return "";
-  const data = component.data || {};
-  const raw = data.data && typeof data.data === "object" ? data.data : data;
-  const kind = String(component.kind || raw.type || "").toLowerCase();
+  const raw = unwrapMessageElement(component.raw || component.data || component);
+  const kind = inferElementKind(raw, component.kind);
   const typeHint = Number(raw.type ?? component.type);
   const elementTypeHint = Number(raw.elementType ?? component.elementType);
-  if (raw.picElement || raw.imageElement) return renderPicElementHtml(raw.picElement || raw.imageElement);
+  if (raw.picElement || raw.imageElement) return renderPicElementHtml(raw.picElement || raw.imageElement, raw);
   if (raw.faceElement) return renderFaceHtml(raw.faceElement);
   if (raw.marketFaceElement) return renderMarketFaceHtml(raw.marketFaceElement);
   if (raw.fileElement) return renderFileElementHtml(raw.fileElement);
-  if (raw.pttElement || raw.voiceElement) return renderPttElementHtml(raw.pttElement || raw.voiceElement);
-  if (raw.videoElement) return renderVideoElementHtml(raw.videoElement);
+  if (raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement) return renderPttElementHtml(raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement, raw);
+  if (raw.videoElement) return renderVideoElementHtml(raw.videoElement, raw);
   if (raw.multiForwardMsgElement) return renderForwardElementHtml(raw.multiForwardMsgElement);
   if (raw.arkElement) return renderArkElementHtml(raw.arkElement);
   if (raw.replyElement || raw.grayTipElement) return "";
   if (raw.textElement?.content) return highlightText(raw.textElement.content, state.q);
+  if (raw.textElement?.text) return highlightText(raw.textElement.text, state.q);
   if (raw.text) return highlightText(raw.text, state.q);
+  if (raw.data?.text) return highlightText(raw.data.text, state.q);
   if (raw.content) return highlightText(raw.content, state.q);
-  if (typeHint === 2 || elementTypeHint === 2) return renderPicElementHtml(raw);
+  if (typeHint === 2 || elementTypeHint === 2) return renderPicElementHtml(raw, raw);
   if (typeHint === 3 || elementTypeHint === 6) return renderFaceHtml(raw);
   if (typeHint === 6 || elementTypeHint === 3) return renderFileElementHtml(raw);
-  if (elementTypeHint === 4) return renderPttElementHtml(raw);
-  if (elementTypeHint === 5) return renderVideoElementHtml(raw);
+  if (elementTypeHint === 4) return renderPttElementHtml(raw, raw);
+  if (elementTypeHint === 5) return renderVideoElementHtml(raw, raw);
   if (elementTypeHint === 16) return renderForwardElementHtml(raw);
   if (elementTypeHint === 10) return renderArkElementHtml(raw);
-  if (kind.includes("image") || kind.includes("pic")) return renderPicElementHtml(raw);
-  if (kind.includes("face")) return renderFaceHtml(raw);
-  if (kind.includes("file")) return renderFileElementHtml(raw);
-  if (kind.includes("record") || kind.includes("audio") || kind.includes("ptt")) return renderPttElementHtml(raw);
-  if (kind.includes("video")) return renderVideoElementHtml(raw);
-  if (kind.includes("text") || kind.includes("plain")) return highlightText(componentText(component), state.q);
+  if (kind === "image") return renderPicElementHtml(raw, raw);
+  if (kind === "face") return renderFaceHtml(raw);
+  if (kind === "file") return renderFileElementHtml(raw);
+  if (kind === "audio") return renderPttElementHtml(raw, raw);
+  if (kind === "video") return renderVideoElementHtml(raw, raw);
+  if (kind === "text") return highlightText(componentText(component), state.q);
   return "";
 }
 
 function renderFaceHtml(face) {
   const id = face?.faceIndex ?? face?.faceId ?? face?.id ?? "";
   const label = face?.faceText || face?.name || (id !== "" ? `[表情${id}]` : "[表情]");
-  return `<span class="inline-face" title="${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+  const source = firstMediaSource(face, ["url", "faceUrl", "imageUrl", "fileUrl", "filePath", "path"]);
+  const displayUrl = source
+    ? mediaSourceDisplayUrl({ kind: "image", source })
+    : id !== "" && /^\d+$/.test(String(id))
+      ? pluginApiUrl(`image-proxy?url=${encodeURIComponent(`https://gxh.vip.qq.com/club/item/parcel/item/${String(id).slice(0, 2)}/${id}/100x100.png`)}`)
+      : "";
+  if (!displayUrl) return `<span class="inline-face" title="${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+  return `<span class="inline-face-shell"><img class="inline-face-img" loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" title="${escapeAttr(label)}" /><em>${escapeHtml(label)}</em></span>`;
 }
 
 function renderMarketFaceHtml(face) {
@@ -1303,14 +1679,30 @@ function renderMarketFaceHtml(face) {
   return `<span class="market-face-shell"><img class="inline-market-face" loading="lazy" src="${escapeAttr(proxyUrl)}" alt="${escapeAttr(faceName)}" title="${escapeAttr(faceName)}" style="max-width:${width}px;max-height:${height}px" /><em>${escapeHtml(`[${faceName}]`)}</em></span>`;
 }
 
-function renderPicElementHtml(pic) {
-  const source = normalizeQpicSource(pic?.source || pic?.url || pic?.picUrl || pic?.originImageUrl || pic?.thumbUrl || pic?.filePath || pic?.path || "");
+function renderPicElementHtml(pic, wrapper = {}) {
+  const source = normalizeQpicSource(firstMediaSource(pic, [
+    "originImageUrl",
+    "picUrl",
+    "thumbUrl",
+    "previewUrl",
+    "fileUrl",
+    "url",
+    "source",
+    "file",
+    "file_id",
+    "fileId",
+    "path",
+    "filePath",
+    "sourcePath",
+    "thumbPath",
+    "md5HexStr",
+  ]));
   const displayUrl = mediaSourceDisplayUrl({ kind: "image", source });
-  const label = pic?.summary || pic?.fileName || pic?.name || "图片";
+  const label = pic?.summary || pic?.fileName || pic?.file || pic?.name || wrapper?.summary || "图片";
   if (!displayUrl) return `<span class="inline-face">${escapeHtml(`[${label}]`)}</span>`;
   const size = previewSize(pic?.picWidth || pic?.width || pic?.originWidth || pic?.thumbWidth, pic?.picHeight || pic?.height || pic?.originHeight || pic?.thumbHeight, 260, 220, 120, 92);
   return `
-    <button class="inline-image-preview" type="button" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片" style="width:${size.width}px;height:${size.height}px">
+    <button class="inline-image-preview" type="button" data-inline-media-kind="image" data-inline-media-name="${escapeAttr(label)}" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片" style="width:${size.width}px;height:${size.height}px">
       <span class="media-loading">图片加载中</span>
       <span class="media-error">图片不可用</span>
       <img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" />
@@ -1319,8 +1711,10 @@ function renderPicElementHtml(pic) {
 }
 
 function renderFileElementHtml(file) {
-  const name = file?.fileName || file?.name || file?.file_name || "文件";
+  const name = file?.fileName || file?.name || file?.file_name || file?.file || firstMediaSource(file, ["filePath", "path", "url"]) || "文件";
   const size = file?.fileSize ?? file?.size ?? file?.file_size;
+  const source = firstMediaSource(file, mediaSourceKeys("file"));
+  const displayUrl = mediaSourceDisplayUrl({ kind: "file", source });
   return `
     <span class="inline-rich-card file-element">
       <span class="rich-card-icon">文</span>
@@ -1328,48 +1722,58 @@ function renderFileElementHtml(file) {
         <strong>${escapeHtml(name)}</strong>
         <small>${size ? escapeHtml(fmtBytes(size)) : "文件消息"}</small>
       </span>
+      ${displayUrl ? `<a class="inline-card-action" href="${escapeAttr(displayUrl)}" target="_blank" rel="noopener" download>下载</a>` : ""}
     </span>
   `;
 }
 
-function renderPttElementHtml(ptt) {
-  const duration = Number(ptt?.duration || ptt?.fileTime || 0);
+function renderPttElementHtml(ptt, wrapper = {}) {
+  const duration = Number(ptt?.duration || ptt?.fileTime || ptt?.time || wrapper?.duration || 0);
   const width = Math.min(220, Math.max(96, 96 + duration * 4));
   const text = ptt?.text || ptt?.transcribedText || "";
+  const source = firstMediaSource(ptt, mediaSourceKeys("audio"));
+  const displayUrl = mediaSourceDisplayUrl({ kind: "audio", source });
   return `
     <span class="voice-element">
       <span class="voice-bar" style="width:${width}px">
-        <span class="voice-play">音</span>
+        <span class="voice-play">▶</span>
         <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
         <span class="voice-duration">${escapeHtml(formatDuration(duration))}</span>
       </span>
+      ${displayUrl ? `<audio class="voice-audio" controls preload="metadata" src="${escapeAttr(displayUrl)}"></audio>` : ""}
       ${text ? `<span class="voice-text">${highlightText(text, state.q)}</span>` : ""}
     </span>
   `;
 }
 
-function renderVideoElementHtml(video) {
-  const thumb = firstMapValue(video?.thumbPath) || video?.thumbUrl || video?.thumb || video?.coverUrl || "";
+function renderVideoElementHtml(video, wrapper = {}) {
+  const thumb = firstMediaSource(video, ["thumbPath", "thumbUrl", "thumb", "coverUrl", "cover", "previewUrl", "originImageUrl"]);
+  const source = firstMediaSource(video, mediaSourceKeys("video"));
   const duration = Number(video?.fileTime || video?.duration || 0);
   const name = video?.fileName || video?.name || "视频";
   const thumbUrl = thumb ? mediaSourceDisplayUrl({ kind: "image", source: thumb }) : "";
+  const displayUrl = mediaSourceDisplayUrl({ kind: "video", source });
+  const size = previewSize(video?.thumbWidth || video?.width || wrapper?.width, video?.thumbHeight || video?.height || wrapper?.height, 300, 220, 220, 150);
   return `
-    <span class="inline-rich-card video-element">
-      <span class="video-cover">${thumbUrl ? `<img loading="lazy" src="${escapeAttr(thumbUrl)}" alt="${escapeAttr(name)}" />` : `<span>影</span>`}<b>▶</b></span>
-      <span class="rich-card-main">
-        <strong>${escapeHtml(name)}</strong>
-        <small>${escapeHtml(duration ? formatDuration(duration) : "视频消息")}</small>
+    <button class="video-element" type="button" data-inline-media-kind="video" data-inline-media-name="${escapeAttr(name)}" ${displayUrl ? `data-inline-video="${escapeAttr(displayUrl)}"` : ""} aria-label="预览视频" style="width:${size.width}px;height:${size.height}px">
+      <span class="video-cover">
+        ${thumbUrl ? `<img loading="lazy" src="${escapeAttr(thumbUrl)}" alt="${escapeAttr(name)}" />` : `<span>视频</span>`}
+        <b>▶</b>
       </span>
-    </span>
+      <span class="video-caption">
+        <strong>${escapeHtml(name)}</strong>
+        <small>${escapeHtml(duration ? formatDuration(duration) : (displayUrl ? "点击播放" : "视频消息"))}</small>
+      </span>
+    </button>
   `;
 }
 
 function renderForwardElementHtml(forward) {
-  const parsed = parseForwardXml(forward?.xmlContent || forward?.xml || "");
+  const parsed = parseForwardData(forward);
   const title = parsed.title || forward?.title || "[聊天记录]";
   const previews = parsed.previews.slice(0, 3);
   const summary = parsed.summary || forward?.summary || "合并转发";
-  return renderForwardCardHtml(title, previews, summary);
+  return renderForwardCardHtml(title, previews, summary, parsed);
 }
 
 function renderArkElementHtml(ark) {
@@ -1387,20 +1791,151 @@ function renderArkElementHtml(ark) {
       detail.source || "[聊天记录]",
       (detail.news || []).map((item) => item.text || "").filter(Boolean).slice(0, 3),
       detail.summary || "合并转发",
+      parseArkForwardData(data),
     );
   }
   const prompt = data?.prompt || ark?.prompt || "[卡片消息]";
   return `<span class="inline-rich-card ark-element"><span class="rich-card-icon">卡</span><span class="rich-card-main"><strong>${escapeHtml(prompt)}</strong><small>Ark 卡片</small></span></span>`;
 }
 
-function renderForwardCardHtml(title, previews, summary) {
+function renderForwardCardHtml(title, previews, summary, parsed = null) {
+  const previewIndex = registerForwardPreview(parsed || { title, previews, summary, messages: [] });
   return `
-    <span class="forward-card">
+    <button class="forward-card" type="button" data-forward-preview="${previewIndex}" aria-label="预览合并转发">
       <strong>${escapeHtml(title || "[聊天记录]")}</strong>
       ${previews.map((preview) => `<span>${escapeHtml(preview)}</span>`).join("")}
       <small>${escapeHtml(summary || "合并转发")}</small>
-    </span>
+    </button>
   `;
+}
+
+function registerForwardPreview(parsed) {
+  if (!Array.isArray(state.forwardPreview)) state.forwardPreview = [];
+  state.forwardPreview.push(parsed);
+  return state.forwardPreview.length - 1;
+}
+
+function forwardPreviewsFromMessage(item) {
+  const result = [];
+  for (const element of messageElementObjects(item)) {
+    const raw = unwrapMessageElement(element.raw || element);
+    if (raw?.multiForwardMsgElement) result.push(parseForwardData(raw.multiForwardMsgElement));
+    if (raw?.arkElement) {
+      const parsed = parseArkForwardFromElement(raw.arkElement);
+      if (parsed) result.push(parsed);
+    }
+  }
+  return result;
+}
+
+function parseForwardData(forward) {
+  const parsed = parseForwardXml(forward?.xmlContent || forward?.xml || "");
+  const messages = normalizeForwardMessages(
+    forward?.messages ||
+      forward?.items ||
+      forward?.previewList ||
+      forward?.data?.messages ||
+      forward?.data?.items ||
+      [],
+  );
+  return {
+    title: parsed.title || forward?.title || "[聊天记录]",
+    previews: parsed.previews.length ? parsed.previews : messages.map((item) => `${item.sender}: ${item.text}`).slice(0, 5),
+    summary: parsed.summary || forward?.summary || (messages.length ? `${messages.length} 条消息` : "合并转发"),
+    messages,
+  };
+}
+
+function parseArkForwardFromElement(ark) {
+  let data = ark?.data || ark?.arkData || null;
+  if (!data && ark?.bytesData) {
+    try {
+      data = JSON.parse(ark.bytesData);
+    } catch {
+      data = null;
+    }
+  }
+  return parseArkForwardData(data);
+}
+
+function parseArkForwardData(data) {
+  const detail = data?.meta?.detail;
+  if (!detail) return null;
+  return {
+    title: detail.source || "[聊天记录]",
+    previews: (detail.news || []).map((item) => item.text || "").filter(Boolean).slice(0, 5),
+    summary: detail.summary || "合并转发",
+    messages: normalizeForwardMessages(detail.news || []),
+    resId: detail.resid || "",
+  };
+}
+
+function normalizeForwardMessages(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item, index) => {
+      if (typeof item === "string") return { id: `line-${index}`, sender: "消息", text: item, time: "" };
+      if (!item || typeof item !== "object") return null;
+      const segments = Array.isArray(item.segments)
+        ? item.segments
+        : Array.isArray(item.elements)
+          ? item.elements.map((segment) => ({ type: inferElementKind(segment), data: segment }))
+          : [];
+      const text = item.text || item.summary || item.content || segments.map((segment) => forwardSegmentText(segment)).join("");
+      return {
+        id: item.msgId || item.msgSeq || item.id || `line-${index}`,
+        sender: item.sender || item.senderName || item.nickname || item.userName || item.nick || "未知用户",
+        text: text || "[消息]",
+        time: item.time || item.timestamp || item.msgTime || "",
+      };
+    })
+    .filter(Boolean);
+}
+
+function forwardSegmentText(segment) {
+  if (!segment) return "";
+  const data = segment.data || segment;
+  const type = String(segment.type || inferElementKind(data)).toLowerCase();
+  if (type === "text") return data.text || data.content || "";
+  if (type === "image") return "[图片]";
+  if (type === "face") return data.faceText || "[表情]";
+  if (type === "audio") return "[语音]";
+  if (type === "video") return "[视频]";
+  if (type === "file") return `[文件${data.fileName ? `: ${data.fileName}` : ""}]`;
+  if (type === "forward") return "[聊天记录]";
+  return rawElementText(data);
+}
+
+function openForwardViewer(parsed) {
+  if (!els.forwardViewer || !els.forwardViewerBody) return;
+  els.forwardViewerTitle.textContent = parsed.title || "合并转发";
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+  els.forwardViewerBody.innerHTML = messages.length
+    ? messages
+        .map((item) => `
+          <article class="forward-message">
+            <header><strong>${escapeHtml(item.sender || "未知用户")}</strong>${item.time ? `<span>${escapeHtml(formatForwardTime(item.time))}</span>` : ""}</header>
+            <p>${highlightText(item.text || "[消息]", state.q)}</p>
+          </article>
+        `)
+        .join("")
+    : `
+      <div class="forward-preview-list">
+        ${(parsed.previews || []).map((preview) => `<p>${escapeHtml(preview)}</p>`).join("") || `<p>${escapeHtml(parsed.summary || "该合并转发只有摘要，原始消息正文未随归档保存。")}</p>`}
+      </div>
+    `;
+  els.forwardViewer.hidden = false;
+}
+
+function closeForwardViewer() {
+  if (els.forwardViewer) els.forwardViewer.hidden = true;
+}
+
+function formatForwardTime(value) {
+  const ts = Number(value || 0);
+  if (ts > 100000000000) return new Date(ts).toLocaleString("zh-CN");
+  if (ts > 1000000000) return fmtFullTime(ts);
+  return String(value || "");
 }
 
 function parseForwardXml(xml) {
@@ -1410,6 +1945,195 @@ function parseForwardXml(xml) {
   const previews = [...text.matchAll(/<title[^>]*color=["']#777777["'][^>]*>(.*?)<\/title>/gi)].map((match) => stripHtml(match[1])).filter(Boolean);
   const summary = stripHtml(matchFirst(text, /<summary[^>]*>(.*?)<\/summary>/i) || "");
   return { title, previews, summary };
+}
+
+function normalizedElementsFromComponent(component) {
+  if (!component || typeof component !== "object") return [];
+  const candidates = [];
+  const data = component.data && typeof component.data === "object" ? component.data : {};
+  candidates.push(data.data && typeof data.data === "object" ? data.data : data);
+  candidates.push(component);
+  const result = [];
+  for (const candidate of candidates) {
+    for (const element of expandMessageElements(candidate)) {
+      result.push(normalizeMessageElement(element, component.kind || "component"));
+    }
+  }
+  return result;
+}
+
+function normalizeMessageElement(value, fallbackKind = "") {
+  const raw = unwrapMessageElement(value);
+  const kind = inferElementKind(raw, fallbackKind);
+  return { kind, raw, data: raw };
+}
+
+function unwrapMessageElement(value) {
+  if (!value || typeof value !== "object") return value;
+  let current = value;
+  for (let guard = 0; guard < 5; guard += 1) {
+    if (!current || typeof current !== "object") return current;
+    if (current.raw && typeof current.raw === "object") {
+      current = current.raw;
+      continue;
+    }
+    if (current.data && typeof current.data === "object" && !hasKnownMessageShape(current)) {
+      current = current.data;
+      continue;
+    }
+    if (current.message && typeof current.message === "object" && !Array.isArray(current.message) && !hasKnownMessageShape(current)) {
+      current = current.message;
+      continue;
+    }
+    if (current.element && typeof current.element === "object" && !hasKnownMessageShape(current)) {
+      current = current.element;
+      continue;
+    }
+    return current;
+  }
+  return current;
+}
+
+function hasKnownMessageShape(value) {
+  if (!value || typeof value !== "object") return false;
+  return Boolean(
+    value.textElement ||
+    value.picElement ||
+    value.imageElement ||
+    value.faceElement ||
+    value.marketFaceElement ||
+    value.fileElement ||
+    value.pttElement ||
+    value.voiceElement ||
+    value.recordElement ||
+    value.audioElement ||
+    value.videoElement ||
+    value.grayTipElement ||
+    value.replyElement ||
+    value.arkElement ||
+    value.multiForwardMsgElement ||
+    value.elementType !== undefined ||
+    value.type !== undefined ||
+    value.kind !== undefined,
+  );
+}
+
+function expandMessageElements(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => expandMessageElements(item));
+  if (typeof value !== "object") return [];
+  const raw = unwrapMessageElement(value);
+  if (!raw || typeof raw !== "object") return [];
+  const arrays = [
+    raw.elements,
+    raw.msgElements,
+    raw.message,
+    raw.messageChain,
+    raw.message_chain,
+    raw.segments,
+    raw.payload?.elements,
+    raw.data?.elements,
+    raw.data?.message,
+    raw.message_obj?.message,
+  ].filter(Array.isArray);
+  if (arrays.length) return arrays.flatMap((items) => items.flatMap((item) => expandMessageElements(item)));
+  return [raw];
+}
+
+function dedupeNormalizedElements(elements) {
+  const result = [];
+  const seen = new Set();
+  for (const element of elements) {
+    const raw = unwrapMessageElement(element.raw || element);
+    if (!raw || typeof raw !== "object") continue;
+    const signature = JSON.stringify({
+      kind: inferElementKind(raw, element.kind),
+      id: raw.elementId || raw.msgId || raw.fileUuid || raw.fileName || "",
+      text: raw.text || raw.content || raw.textElement?.content || "",
+      image: raw.picElement?.originImageUrl || raw.imageElement?.url || raw.originImageUrl || raw.url || "",
+    });
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    result.push({ kind: inferElementKind(raw, element.kind), raw, data: raw });
+  }
+  return result;
+}
+
+function inferElementKind(raw, fallbackKind = "") {
+  if (!raw || typeof raw !== "object") return String(fallbackKind || "").toLowerCase();
+  const rawKind = String(raw.kind || raw.segment_type || raw.typeName || raw.type || "").toLowerCase();
+  const fallback = String(fallbackKind || "").toLowerCase();
+  const kind = rawKind || (["raw", "component", "data", "message", "segment"].includes(fallback) ? "" : fallback);
+  const typeHint = Number(raw.type);
+  const elementTypeHint = Number(raw.elementType);
+  if (raw.picElement || raw.imageElement || typeHint === 2 || elementTypeHint === 2 || kind.includes("image") || kind.includes("pic")) return "image";
+  if (raw.videoElement || elementTypeHint === 5 || kind.includes("video")) return "video";
+  if (raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement || elementTypeHint === 4 || kind.includes("record") || kind.includes("audio") || kind.includes("ptt") || kind.includes("voice")) return "audio";
+  if (raw.fileElement || typeHint === 6 || elementTypeHint === 3 || kind.includes("file")) return "file";
+  if (raw.faceElement || raw.marketFaceElement || typeHint === 3 || elementTypeHint === 6 || kind.includes("face") || kind.includes("emoji")) return "face";
+  if (raw.multiForwardMsgElement || elementTypeHint === 16) return "forward";
+  if (raw.arkElement || elementTypeHint === 10) return "ark";
+  if (raw.textElement || raw.text || raw.content || raw.data?.text || kind === "plain" || kind === "text") return "text";
+  return kind || fallback;
+}
+
+function allDisplayableMediaItems() {
+  return state.messages
+    .flatMap((msg) => [
+      ...(Array.isArray(msg.media) ? msg.media : []),
+      ...inlineMediaItemsFromMessage(msg),
+    ])
+    .filter((item) => mediaDisplayUrl(item));
+}
+
+function inlineMediaItemsFromMessage(item) {
+  return messageElementObjects(item)
+    .map((element, index) => mediaItemFromElement(element.raw || element, index))
+    .filter(Boolean);
+}
+
+function mediaItemFromElement(raw, index = 0) {
+  const element = unwrapMessageElement(raw);
+  if (!element || typeof element !== "object") return null;
+  if (element.picElement || element.imageElement || inferElementKind(element) === "image") {
+    const pic = element.picElement || element.imageElement || element;
+    const source = normalizeQpicSource(firstMediaSource(pic, mediaSourceKeys("image")));
+    if (!source) return null;
+    return {
+      id: `inline-image-${index}-${source}`,
+      kind: "image",
+      name: pic.fileName || pic.file || pic.name || pic.summary || "图片",
+      source,
+      width: pic.picWidth || pic.width || pic.originWidth || pic.thumbWidth,
+      height: pic.picHeight || pic.height || pic.originHeight || pic.thumbHeight,
+    };
+  }
+  if (element.videoElement || inferElementKind(element) === "video") {
+    const video = element.videoElement || element;
+    const source = normalizeQpicSource(firstMediaSource(video, mediaSourceKeys("video")) || firstMediaSource(video, ["thumbPath", "thumbUrl", "coverUrl"]));
+    if (!source && !video.fileName && !video.name) return null;
+    return {
+      id: `inline-video-${index}-${source || video.fileName || video.name}`,
+      kind: "video",
+      name: video.fileName || video.name || "视频",
+      source,
+      width: video.thumbWidth || video.width,
+      height: video.thumbHeight || video.height,
+    };
+  }
+  if (element.pttElement || element.voiceElement || element.recordElement || element.audioElement || inferElementKind(element) === "audio") {
+    const audio = element.pttElement || element.voiceElement || element.recordElement || element.audioElement || element;
+    const source = normalizeQpicSource(firstMediaSource(audio, mediaSourceKeys("audio")));
+    if (!source && !audio.fileUuid && !audio.fileName && !audio.text) return null;
+    return {
+      id: `inline-audio-${index}-${source || audio.fileUuid || audio.fileName || audio.text}`,
+      kind: "audio",
+      name: audio.fileName || audio.name || "语音",
+      source,
+      size: audio.fileSize || audio.size,
+    };
+  }
+  return null;
 }
 
 function matchFirst(value, pattern) {
@@ -1433,11 +2157,29 @@ function formatDuration(seconds) {
 }
 
 function mediaSourceDisplayUrl(item) {
-  const source = String(item?.source || item?.url || item?.path || "").trim();
+  const source = normalizeQpicSource(firstMediaSource(item, ["inline_url", "source", "url", "relative_path", "relativePath", "localPath", "filePath", "path"]));
   if (!source) return "";
+  if (/^(data:|blob:)/i.test(source)) return source;
   if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
+  if (/^https?:\/\//i.test(source) && ["video", "audio", "file"].includes(normalizeMediaKind(item.kind))) return source;
+  if (/^file:\/\//i.test(source) || /^[a-z]:[\\/]/i.test(source) || source.startsWith("/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   return "";
+}
+
+function mediaSourceKeys(kind) {
+  const normalized = normalizeMediaKind(kind);
+  const tail = ["source", "path", "filePath", "file", "file_id", "fileId", "file_"];
+  if (normalized === "image") {
+    return ["originImageUrl", "picUrl", "thumbUrl", "previewUrl", "url", "fileUrl", "sourcePath", "thumbPath", ...tail];
+  }
+  if (normalized === "video") {
+    return ["videoUrl", "url", "fileUrl", "thumbPath", "previewUrl", ...tail];
+  }
+  if (normalized === "audio") {
+    return ["audioUrl", "recordUrl", "url", "fileUrl", ...tail];
+  }
+  return ["url", "fileUrl", ...tail];
 }
 
 function applyMediaPreviewSize(node, item) {
@@ -1467,14 +2209,47 @@ function normalizeQpicSource(source) {
   return value;
 }
 
+function firstMediaSource(value, keys = []) {
+  if (!value) return "";
+  if (typeof value === "string") return firstMapValue(value);
+  if (Array.isArray(value)) return firstMapValue(value);
+  if (typeof value !== "object") return "";
+  for (const key of keys) {
+    const found = firstMapValue(value[key]);
+    if (found) return found;
+  }
+  const nested = [
+    value.data,
+    value.meta,
+    value.media,
+    value.extra,
+    value.picElement,
+    value.imageElement,
+    value.videoElement,
+    value.pttElement,
+    value.voiceElement,
+    value.recordElement,
+    value.audioElement,
+    value.fileElement,
+  ];
+  for (const item of nested) {
+    if (item && typeof item === "object" && item !== value) {
+      const found = firstMediaSource(item, keys);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
 function textFromRawElements(raw) {
-  return rawElements(raw).map((element) => rawElementText(element)).filter(Boolean).join("");
+  return rawElements(raw).map((element) => rawElementText(unwrapMessageElement(element))).filter(Boolean).join("");
 }
 
 function rawElementText(element) {
   if (!element || typeof element !== "object") return "";
   if (element.textElement?.content) return String(element.textElement.content);
   if (element.textElement?.text) return String(element.textElement.text);
+  if (element.data?.text) return String(element.data.text);
   if (element.text) return String(element.text);
   if (element.picElement || element.imageElement) return (element.picElement || element.imageElement).summary || "[图片]";
   if (element.faceElement) return element.faceElement.faceText || `[表情${element.faceElement.faceIndex || ""}]`;
@@ -1486,26 +2261,23 @@ function rawElementText(element) {
   if (element.arkElement) return "[卡片消息]";
   const typeHint = Number(element.type);
   const elementTypeHint = Number(element.elementType);
-  if (typeHint === 2 || elementTypeHint === 2) return "[图片]";
-  if (typeHint === 3 || elementTypeHint === 6) return "[表情]";
-  if (typeHint === 6 || elementTypeHint === 3) return "[文件]";
-  if (elementTypeHint === 4) return "[语音]";
-  if (elementTypeHint === 5) return "[视频]";
+  const kind = inferElementKind(element);
+  if (kind === "image" || typeHint === 2 || elementTypeHint === 2) return "[图片]";
+  if (kind === "face" || typeHint === 3 || elementTypeHint === 6) return "[表情]";
+  if (kind === "file" || typeHint === 6 || elementTypeHint === 3) return "[文件]";
+  if (kind === "audio" || elementTypeHint === 4) return "[语音]";
+  if (kind === "video" || elementTypeHint === 5) return "[视频]";
   if (elementTypeHint === 16) return "[聊天记录]";
   if (elementTypeHint === 10) return "[卡片消息]";
   return "";
 }
 
 function rawElements(raw) {
-  if (!raw || typeof raw !== "object") return [];
-  if (Array.isArray(raw.elements)) return raw.elements;
-  if (Array.isArray(raw.message)) return raw.message;
-  if (Array.isArray(raw.msgElements)) return raw.msgElements;
-  return [];
+  return expandMessageElements(raw);
 }
 
 function systemTipText(item) {
-  const elements = [...rawElements(item?.raw), ...componentRawObjects(item?.components)];
+  const elements = [...rawElements(item?.raw), ...componentRawObjects(item?.components)].map(unwrapMessageElement);
   const tips = elements.map((element) => grayTipText(element?.grayTipElement || element)).filter(Boolean);
   if (!tips.length) return "";
   const hasNonTip = elements.some((element) => !element?.grayTipElement && !element?.replyElement && !grayTipText(element));
@@ -1535,12 +2307,7 @@ function stripHtml(value) {
 
 function componentRawObjects(components) {
   if (!Array.isArray(components)) return [];
-  return components
-    .map((component) => {
-      const data = component?.data || {};
-      return data.data && typeof data.data === "object" ? data.data : data;
-    })
-    .filter((item) => item && typeof item === "object");
+  return components.flatMap((component) => normalizedElementsFromComponent(component).map((element) => element.raw)).filter((item) => item && typeof item === "object");
 }
 
 function isRecalledMessage(item) {
@@ -1551,7 +2318,7 @@ function isRecalledMessage(item) {
 }
 
 function replyInfo(item) {
-  const all = [...rawElements(item?.raw), ...componentRawObjects(item?.components)];
+  const all = [...rawElements(item?.raw), ...componentRawObjects(item?.components)].map(unwrapMessageElement);
   const reply = all.find((element) => element?.replyElement)?.replyElement || item?.raw?.replyElement;
   if (!reply || typeof reply !== "object") return null;
   return {
@@ -1582,13 +2349,12 @@ function renderReplyPreviewHtml(reply, targetKey) {
 
 function reactionList(item) {
   const raw = item?.raw || {};
-  const values = Array.isArray(raw.emojiLikesList)
-    ? raw.emojiLikesList
-    : Array.isArray(raw.reactions)
-      ? raw.reactions
-      : Array.isArray(item?.reactions)
-        ? item.reactions
-        : [];
+  const values = [
+    ...(Array.isArray(raw.emojiLikesList) ? raw.emojiLikesList : []),
+    ...(Array.isArray(raw.reactions) ? raw.reactions : []),
+    ...(Array.isArray(raw.emoji_reactions) ? raw.emoji_reactions : []),
+    ...(Array.isArray(item?.reactions) ? item.reactions : []),
+  ];
   return values
     .map((reaction) => ({
       id: String(reaction.emojiId || reaction.id || reaction.emoji || ""),
@@ -1660,13 +2426,47 @@ function renderSenderHtml(item, sender) {
   return `<div class="sender"><span>${escapeHtml(sender)}</span>${badges}</div>`;
 }
 
+function profileFromMessage(item) {
+  const raw = item?.raw || {};
+  const sender = senderDisplayName(item);
+  const uin = String(raw.senderUin || raw.sender_uin || raw.uin || raw.qq || raw.user_id || "").trim();
+  const uid = String(raw.senderUid || raw.sender_uid || raw.uid || item?.sender_id || "").trim();
+  const honor = groupHonor(raw);
+  const role = memberRoleLabel(raw.memberRole || raw.role || raw.groupRole);
+  const avatarUrl = qqAvatarUrl(item);
+  return {
+    name: sender,
+    remark: raw.remark || raw.friendRemark || raw.cardName || "",
+    uid,
+    uin,
+    primaryId: uin || uid || item?.sender_id || sender,
+    role,
+    level: honor.level ? `Lv.${honor.level}` : raw.memberLevel ? `Lv.${raw.memberLevel}` : "",
+    title: honor.uniqueTitle || raw.memberTitle || raw.specialTitle || raw.groupTitle || "",
+    avatarUrl,
+  };
+}
+
+function groupHonor(raw) {
+  const attrs = raw?.msgAttrs || raw?.msg_attrs || {};
+  return attrs?.["2"]?.groupHonor || attrs?.[2]?.groupHonor || raw?.groupHonor || {};
+}
+
+function memberRoleLabel(value) {
+  const role = String(value || "").toLowerCase();
+  if (role === "owner" || role === "4") return "群主";
+  if (role === "admin" || role === "administrator" || role === "3") return "管理员";
+  if (role === "member" || role === "2") return "成员";
+  return "";
+}
+
 function renderAvatarHtml(item, sender, self, group) {
   if (self || !group.showAvatar) return `<div class="avatar-spacer"></div>`;
   const avatarUrl = qqAvatarUrl(item);
   if (avatarUrl) {
-    return `<div class="avatar image-avatar" style="--avatar-bg:${avatarColor(sender)}"><img loading="lazy" src="${escapeAttr(avatarUrl)}" alt="${escapeAttr(sender)}" /><span>${escapeHtml(initials(sender))}</span></div>`;
+    return `<button class="avatar image-avatar" type="button" data-profile aria-label="查看 ${escapeAttr(sender)} 的资料" style="--avatar-bg:${avatarColor(sender)}"><img loading="lazy" src="${escapeAttr(avatarUrl)}" alt="${escapeAttr(sender)}" /><span>${escapeHtml(initials(sender))}</span></button>`;
   }
-  return `<div class="avatar" style="--avatar-bg:${avatarColor(sender)}">${escapeHtml(initials(sender))}</div>`;
+  return `<button class="avatar" type="button" data-profile aria-label="查看 ${escapeAttr(sender)} 的资料" style="--avatar-bg:${avatarColor(sender)}">${escapeHtml(initials(sender))}</button>`;
 }
 
 function qqAvatarUrl(item) {
@@ -1680,14 +2480,13 @@ function qqAvatarUrl(item) {
 function senderBadges(item) {
   const raw = item?.raw || {};
   const badges = [];
-  const attrs = raw.msgAttrs || raw.msg_attrs || {};
-  const honor = attrs?.["2"]?.groupHonor || attrs?.[2]?.groupHonor || raw.groupHonor || {};
+  const honor = groupHonor(raw);
   if (honor.level) badges.push({ label: `Lv.${honor.level}`, tone: "level" });
   const title = honor.uniqueTitle || raw.memberTitle || raw.specialTitle;
   if (title) badges.push({ label: title, tone: "title" });
-  const role = String(raw.memberRole || raw.role || "").toLowerCase();
-  if (role === "owner") badges.push({ label: "群主", tone: "owner" });
-  if (role === "admin" || role === "administrator") badges.push({ label: "管理员", tone: "admin" });
+  const role = memberRoleLabel(raw.memberRole || raw.role || raw.groupRole);
+  if (role === "群主") badges.push({ label: role, tone: "owner" });
+  if (role === "管理员") badges.push({ label: role, tone: "admin" });
   return badges.slice(0, 3);
 }
 
@@ -1912,6 +2711,16 @@ function bindEvents() {
   els.sessionToggleBtn?.addEventListener("click", () => {
     document.body.classList.toggle("sessions-open");
   });
+  els.inspectorPane?.querySelectorAll("[data-inspector-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.inspectorTab = button.dataset.inspectorTab || "summary";
+      renderInspector();
+    });
+  });
+  els.closeForwardBtn?.addEventListener("click", closeForwardViewer);
+  els.forwardViewer?.addEventListener("click", (event) => {
+    if (event.target === els.forwardViewer) closeForwardViewer();
+  });
   els.closeViewerBtn.addEventListener("click", closeMediaViewer);
   els.downloadViewerBtn.addEventListener("click", () => {
     const item = state.mediaItems[state.mediaIndex];
@@ -1927,6 +2736,14 @@ function bindEvents() {
   });
   document.addEventListener("click", (event) => {
     if (!els.contextMenu.contains(event.target)) hideContextMenu();
+    if (
+      els.profilePopover &&
+      !els.profilePopover.contains(event.target) &&
+      !els.contextMenu.contains(event.target) &&
+      !event.target?.closest?.("[data-profile]")
+    ) {
+      hideProfilePopover();
+    }
   });
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
@@ -1936,6 +2753,8 @@ function bindEvents() {
     }
     if (event.key === "Escape") {
       hideContextMenu();
+      hideProfilePopover();
+      closeForwardViewer();
       closeMediaViewer();
       els.detailPane.hidden = true;
     }
@@ -2129,6 +2948,8 @@ function buildDemoMessages() {
   return Array.from({ length: 64 }, (_, index) => {
       const sender = senders[index % senders.length];
       const hasMedia = index === 18 || index === 33;
+      const demoImage =
+        "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMjAiIGhlaWdodD0iMjAwIiB2aWV3Qm94PSIwIDAgMzIwIDIwMCI+PHJlY3Qgd2lkdGg9IjMyMCIgaGVpZ2h0PSIyMDAiIGZpbGw9IiMzMzkwZWMiLz48Y2lyY2xlIGN4PSIyNDgiIGN5PSI2MCIgcj0iMzQiIGZpbGw9IiNmZmYiIG9wYWNpdHk9Ii4zIi8+PHBhdGggZD0iTTAgMTUybDgwLTY0IDY0IDQ4IDQ4LTM2IDEyOCA5NnY0SDB6IiBmaWxsPSIjZmZmIiBvcGFjaXR5PSIuNzUiLz48dGV4dCB4PSIyNCIgeT0iMzYiIGZvbnQtZmFtaWx5PSJBcmlhbCIgZm9udC1zaXplPSIyMCIgZmlsbD0iI2ZmZiI+QXJjaGl2ZSBNZWRpYTwvdGV4dD48L3N2Zz4=";
       const message = {
         id: index + 1,
         message_uid: `demo-${index + 1}`,
@@ -2144,8 +2965,9 @@ function buildDemoMessages() {
               id: index + 1,
               kind: "image",
               name: "preview.png",
-              local_path: "demo",
-              source: "demo",
+              source: demoImage,
+              width: 320,
+              height: 200,
             },
           ]
         : [],
@@ -2217,6 +3039,69 @@ function buildDemoMessages() {
           elements: [
             { pttElement: { duration: 12, text: "语音转文字归档示例" } },
             { fileElement: { fileName: "archive-report.zip", fileSize: 246810 } },
+          ],
+        };
+      }
+      if (index === 39) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            {
+              picElement: {
+                originImageUrl:
+                  "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMjAiIGhlaWdodD0iMjAwIiB2aWV3Qm94PSIwIDAgMzIwIDIwMCI+PHJlY3Qgd2lkdGg9IjMyMCIgaGVpZ2h0PSIyMDAiIGZpbGw9IiMzMzkwZWMiLz48Y2lyY2xlIGN4PSIyNDgiIGN5PSI2MCIgcj0iMzQiIGZpbGw9IiNmZmYiIG9wYWNpdHk9Ii4zIi8+PHBhdGggZD0iTTAgMTUybDgwLTY0IDY0IDQ4IDQ4LTM2IDEyOCA5NnY0SDB6IiBmaWxsPSIjZmZmIiBvcGFjaXR5PSIuNzUiLz48dGV4dCB4PSIyNCIgeT0iMzYiIGZvbnQtZmFtaWx5PSJBcmlhbCIgZm9udC1zaXplPSIyMCIgZmlsbD0iI2ZmZiI+UGljIEVsZW1lbnQ8L3RleHQ+PC9zdmc+",
+                picWidth: 320,
+                picHeight: 200,
+                summary: "图片",
+              },
+            },
+            {
+              marketFaceElement: {
+                emojiId: "66",
+                faceName: "小表情",
+                supportSize: [{ width: 96, height: 96 }],
+              },
+            },
+          ],
+        };
+      }
+      if (index === 40) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            {
+              faceElement: {
+                faceIndex: 14,
+                faceText: "[微笑]",
+                url:
+                  "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0OCIgaGVpZ2h0PSI0OCIgdmlld0JveD0iMCAwIDQ4IDQ4Ij48Y2lyY2xlIGN4PSIyNCIgY3k9IjI0IiByPSIyMiIgZmlsbD0iI2ZmY2M0ZCIvPjxjaXJjbGUgY3g9IjE3IiBjeT0iMjAiIHI9IjMiIGZpbGw9IiM2MzQyMDAiLz48Y2lyY2xlIGN4PSIzMSIgY3k9IjIwIiByPSIzIiBmaWxsPSIjNjM0MjAwIi8+PHBhdGggZD0iTTE1IDMwYzQgNiAxNCA2IDE4IDAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzYzNDIwMCIgc3Ryb2tlLXdpZHRoPSIzIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=",
+              },
+            },
+          ],
+        };
+      }
+      if (index === 41) {
+        message.text = "";
+        message.raw = {
+          demo: true,
+          index,
+          elements: [
+            {
+              videoElement: {
+                fileName: "demo-video.mp4",
+                fileTime: 18,
+                thumbWidth: 300,
+                thumbHeight: 180,
+                thumbPath: {
+                  "1":
+                    "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMDAiIGhlaWdodD0iMTgwIiB2aWV3Qm94PSIwIDAgMzAwIDE4MCI+PHJlY3Qgd2lkdGg9IjMwMCIgaGVpZ2h0PSIxODAiIGZpbGw9IiMxMTE4MjciLz48Y2lyY2xlIGN4PSIxNTAiIGN5PSI5MCIgcj0iMzQiIGZpbGw9IiMzMzkwZWMiLz48cGF0aCBkPSJNMTQxIDcydjM2bDMwLTE4eiIgZmlsbD0iI2ZmZiIvPjx0ZXh0IHg9IjE4IiB5PSIzMCIgZm9udC1mYW1pbHk9IkFyaWFsIiBmb250LXNpemU9IjE4IiBmaWxsPSIjZmZmIj5WaWRlbyBFbGVtZW50PC90ZXh0Pjwvc3ZnPg==",
+                },
+              },
+            },
           ],
         };
       }

@@ -290,7 +290,7 @@ class ChatArchiveStore:
     async def store_event(self, event: Any) -> str:
         payload = await self._event_payload(event)
         message_uid = payload["message_uid"]
-        media_rows = await self._extract_media(payload["components"], message_uid, payload["created_at"], capture_files=False)
+        media_rows = await self._extract_media(payload["components"], payload.get("raw"), message_uid, payload["created_at"], capture_files=False)
         payload["media_count"] = len(media_rows)
 
         entry = {
@@ -875,24 +875,34 @@ class ChatArchiveStore:
     async def _extract_media(
         self,
         components: list[dict[str, Any]],
+        raw_message: Any,
         message_uid: str,
         created_at: int,
         *,
         capture_files: bool = True,
     ) -> list[dict[str, Any]]:
-        rows = []
-        for component in components:
-            kind = str(component.get("kind") or "").lower()
-            if kind not in MEDIA_COMPONENT_TYPES:
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for index, kind, raw_data in self._iter_media_candidates(components, raw_message):
+            source = self._first_media_value(
+                raw_data,
+                self._media_source_keys(kind),
+            )
+            source = self._normalize_qpic_source(source)
+            name = (
+                raw_data.get("name")
+                or raw_data.get("fileName")
+                or raw_data.get("file_name")
+                or raw_data.get("file")
+                or raw_data.get("summary")
+                or _safe_name(str(source or kind), fallback=kind)
+            )
+            key = (kind, str(source or ""), str(name or ""))
+            if key in seen:
                 continue
-            data = component.get("data") or {}
-            raw_data = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
-            if not isinstance(raw_data, dict):
-                raw_data = {}
-            source = raw_data.get("file") or raw_data.get("url") or raw_data.get("path") or raw_data.get("file_") or ""
-            name = raw_data.get("name") or _safe_name(str(source or kind), fallback=kind)
+            seen.add(key)
             local_path = relative_path = sha256 = detected_mime = None
-            size = raw_data.get("size")
+            size = raw_data.get("size") or raw_data.get("fileSize") or raw_data.get("file_size")
             if capture_files:
                 local_path, relative_path, size, sha256, detected_mime = self._copy_media_file(
                     kind,
@@ -902,21 +912,153 @@ class ChatArchiveStore:
                 )
             rows.append(
                 {
-                    "component_index": int(component.get("index") or 0),
+                    "component_index": int(index or 0),
                     "kind": kind,
                     "name": str(name or kind),
                     "source": str(source or ""),
                     "hash": sha256,
                     "local_path": local_path,
                     "relative_path": relative_path,
-                    "mime": detected_mime or raw_data.get("mime") or raw_data.get("content_type"),
+                    "mime": detected_mime or raw_data.get("mime") or raw_data.get("content_type") or raw_data.get("contentType"),
                     "size": size,
-                    "width": raw_data.get("width"),
-                    "height": raw_data.get("height"),
+                    "width": raw_data.get("width") or raw_data.get("picWidth") or raw_data.get("thumbWidth"),
+                    "height": raw_data.get("height") or raw_data.get("picHeight") or raw_data.get("thumbHeight"),
                     "meta": raw_data,
                 }
             )
         return rows
+
+    def _iter_media_candidates(self, components: list[dict[str, Any]], raw_message: Any) -> Iterator[tuple[int, str, dict[str, Any]]]:
+        for component in components or []:
+            index = int(component.get("index") or 0)
+            kind = str(component.get("kind") or "").lower()
+            data = component.get("data") or {}
+            raw_data = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+            if not isinstance(raw_data, dict):
+                raw_data = {}
+            nested_kind, nested_data = self._media_kind_and_data(raw_data, fallback_kind=kind)
+            if nested_kind:
+                yield index, nested_kind, nested_data
+        for index, element in enumerate(self._raw_message_elements(raw_message)):
+            kind, data = self._media_kind_and_data(element)
+            if kind:
+                yield index, kind, data
+
+    def _raw_message_elements(self, raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, dict)]
+        if not isinstance(raw, dict):
+            return []
+        for key in ("elements", "msgElements", "message", "messageChain", "message_chain", "segments"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        for key in ("payload", "data", "message_obj", "raw_message"):
+            value = raw.get(key)
+            nested = self._raw_message_elements(value)
+            if nested:
+                return nested
+        return []
+
+    def _media_kind_and_data(self, data: dict[str, Any], fallback_kind: str = "") -> tuple[str, dict[str, Any]]:
+        if not isinstance(data, dict):
+            return "", {}
+        if isinstance(data.get("picElement"), dict):
+            return "image", data["picElement"]
+        if isinstance(data.get("imageElement"), dict):
+            return "image", data["imageElement"]
+        if isinstance(data.get("videoElement"), dict):
+            return "video", data["videoElement"]
+        for key in ("pttElement", "voiceElement", "recordElement", "audioElement"):
+            if isinstance(data.get(key), dict):
+                return "record", data[key]
+        if isinstance(data.get("fileElement"), dict):
+            return "file", data["fileElement"]
+        kind = self._normalize_media_kind(fallback_kind or data.get("type") or data.get("kind") or "")
+        if kind:
+            raw_data = data.get("data") if isinstance(data.get("data"), dict) else data
+            return kind, raw_data
+        element_type = str(data.get("elementType") or "")
+        if element_type == "2":
+            return "image", data
+        if element_type == "3":
+            return "file", data
+        if element_type == "4":
+            return "record", data
+        if element_type == "5":
+            return "video", data
+        return "", {}
+
+    @staticmethod
+    def _media_source_keys(kind: str) -> tuple[str, ...]:
+        normalized = ChatArchiveStore._normalize_media_kind(kind)
+        common_tail = ("source", "path", "filePath", "file", "file_id", "fileId", "file_", "fileUuid", "fileUUID", "fileSubId")
+        if normalized == "image":
+            return (
+                "originImageUrl",
+                "picUrl",
+                "thumbUrl",
+                "previewUrl",
+                "url",
+                "fileUrl",
+                "imageUrl",
+                "faceUrl",
+                "sourcePath",
+                "thumbPath",
+                *common_tail,
+            )
+        if normalized == "video":
+            return ("videoUrl", "url", "fileUrl", "thumbPath", "thumbUrl", "coverUrl", "previewUrl", *common_tail)
+        if normalized == "record":
+            return ("audioUrl", "recordUrl", "url", "fileUrl", "audioPath", "filePath", *common_tail)
+        return ("url", "fileUrl", *common_tail)
+
+    @staticmethod
+    def _normalize_media_kind(kind: Any) -> str:
+        value = str(kind or "").strip().lower()
+        if value in {"image", "img", "pic", "picture"} or "image" in value or "pic" in value:
+            return "image"
+        if value in {"video"} or "video" in value:
+            return "video"
+        if value in {"record", "audio", "voice", "ptt"} or any(token in value for token in ("record", "audio", "voice", "ptt")):
+            return "record"
+        if value in {"file"} or "file" in value:
+            return "file"
+        return ""
+
+    def _first_media_value(self, data: Any, keys: tuple[str, ...]) -> str:
+        if isinstance(data, str):
+            return data
+        if isinstance(data, list):
+            return str(data[0] or "") if data else ""
+        if not isinstance(data, dict):
+            return ""
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+            if isinstance(value, list) and value:
+                return str(value[0] or "")
+            if isinstance(value, dict) and value:
+                first = next((str(item) for item in value.values() if item), "")
+                if first:
+                    return first
+        for key in ("data", "meta", "extra"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                found = self._first_media_value(nested, keys)
+                if found:
+                    return found
+        return ""
+
+    @staticmethod
+    def _normalize_qpic_source(source: Any) -> str:
+        value = str(source or "").strip()
+        if value.startswith("//"):
+            return "https:" + value
+        if value.startswith("/"):
+            return "https://gchat.qpic.cn" + value
+        return value
 
     def _prepare_media_for_write(self, entries: list[dict[str, Any]]) -> None:
         for entry in entries:

@@ -66,6 +66,22 @@
         <button id="jumpLatestBtn" class="button jump-latest" type="button" hidden>跳到最新</button>
       </section>
 
+      <aside id="inspectorPane" class="inspector-pane">
+        <header>
+          <div>
+            <h3>归档面板</h3>
+            <p id="inspectorMeta" class="panel-meta">当前会话概览</p>
+          </div>
+        </header>
+        <div class="inspector-tabs" role="tablist" aria-label="归档面板">
+          <button class="active" type="button" data-inspector-tab="summary">概览</button>
+          <button type="button" data-inspector-tab="media">媒体</button>
+          <button type="button" data-inspector-tab="people">成员</button>
+          <button type="button" data-inspector-tab="files">文件</button>
+        </div>
+        <div id="inspectorContent" class="inspector-content"></div>
+      </aside>
+
       <section id="detailPane" class="detail-pane" hidden>
         <header>
           <h3>原始 JSON</h3>
@@ -77,6 +93,19 @@
 
     <div id="toastLayer" class="toast-layer"></div>
     <div id="contextMenu" class="context-menu" hidden></div>
+    <div id="profilePopover" class="profile-popover" hidden></div>
+    <div id="forwardViewer" class="forward-viewer" hidden>
+      <section>
+        <header>
+          <div>
+            <h3 id="forwardViewerTitle">合并转发</h3>
+            <p class="panel-meta">只读归档预览</p>
+          </div>
+          <button id="closeForwardBtn" class="icon-button" type="button" aria-label="关闭合并转发预览">关闭</button>
+        </header>
+        <div id="forwardViewerBody" class="forward-viewer-body"></div>
+      </section>
+    </div>
     <dialog id="tagDialog" class="modal-dialog">
       <form method="dialog">
         <header>
