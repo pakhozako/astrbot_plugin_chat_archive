@@ -1983,6 +1983,8 @@ function renderComponentInlineHtml(component, options = {}) {
   const typeHint = Number(raw.type ?? component.type);
   const elementTypeHint = Number(raw.elementType ?? component.elementType);
   if (options.skipMedia && isMediaElement(raw, kind, typeHint, elementTypeHint)) return "";
+  const oneBotHtml = renderOneBotSegmentHtml(raw);
+  if (oneBotHtml !== null) return oneBotHtml;
   if (raw.picElement || raw.imageElement) return renderPicElementHtml(raw.picElement || raw.imageElement, raw);
   if (raw.mfaceElement) return renderMarketFaceHtml(raw.mfaceElement);
   if (raw.faceElement) return renderFaceHtml(raw.faceElement);
@@ -2073,12 +2075,12 @@ function genericJsonMessageHtml(item) {
   }
   for (const component of messageElementObjects(item)) {
     const raw = unwrapMessageElement(component.raw || component.data || component);
-    if (hasKnownRenderableElement(raw) || hasDirectHumanText(raw)) continue;
+    if (shouldSuppressGenericJson(raw) || hasKnownRenderableElement(raw) || hasDirectHumanText(raw)) continue;
     const html = renderGenericJsonElementHtml(raw, { sourceLabel: component.kind || "JSON" });
     if (html) snippets.push(html);
     if (snippets.length >= 3) break;
   }
-  if (!snippets.length) {
+  if (!snippets.length && !hasMediaishMessage(item)) {
     for (const candidate of [item?.raw, item?.components]) {
       const html = renderGenericJsonElementHtml(candidate);
       if (html) {
@@ -2090,8 +2092,15 @@ function genericJsonMessageHtml(item) {
   return snippets.join("");
 }
 
+function hasMediaishMessage(item) {
+  if (Array.isArray(item?.media) && item.media.length) return true;
+  return messageElementObjects(item).some((component) => shouldSuppressGenericJson(unwrapMessageElement(component.raw || component.data || component)));
+}
+
 function hasKnownRenderableElement(raw) {
   if (!raw || typeof raw !== "object") return false;
+  if (shouldSuppressGenericJson(raw)) return true;
+  if (oneBotSegment(raw)) return true;
   return Boolean(
     raw.picElement ||
       raw.imageElement ||
@@ -2115,6 +2124,17 @@ function hasKnownRenderableElement(raw) {
   );
 }
 
+function shouldSuppressGenericJson(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const kind = inferElementKind(value);
+  if (isMediaElement(value, kind, Number(value.type), Number(value.elementType))) return true;
+  if (isTemporaryLocalMedia(value)) return true;
+  const mediaKeys = ["file", "url", "path", "filePath", "file_path", "localPath", "local_path", "source"];
+  const hasMediaPath = mediaKeys.some((key) => isTemporaryMediaSource(value[key]));
+  const valueKind = String(value.kind || value.type || value.data || "").toLowerCase();
+  return Boolean(hasMediaPath && /(image|pic|face|video|audio|record|file)/.test(valueKind));
+}
+
 function hasDirectHumanText(raw) {
   if (!raw || typeof raw !== "object") return false;
   const values = [raw.textElement?.content, raw.textElement?.text, raw.text, raw.data?.text, raw.content, raw.message];
@@ -2128,6 +2148,7 @@ function hasDirectHumanText(raw) {
 function renderGenericJsonElementHtml(value, options = {}) {
   const parsed = parseJsonCandidate(value) || value;
   if (!parsed || typeof parsed !== "object") return "";
+  if (shouldSuppressGenericJson(parsed)) return "";
   if (isMetadataOnlyElement(parsed)) return "";
   const summary = summarizeJsonValue(parsed, options);
   if (!summary || !summary.fields.length) return "";
@@ -2293,9 +2314,104 @@ function truncateText(value, maxLength) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
+function oneBotSegment(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const type = String(raw.type || raw.segment_type || "").trim().toLowerCase();
+  if (!type || !Object.prototype.hasOwnProperty.call(raw, "data")) return null;
+  const data = raw.data && typeof raw.data === "object" ? raw.data : { value: raw.data };
+  return { type, data };
+}
+
+function renderOneBotSegmentHtml(raw) {
+  const segment = oneBotSegment(raw);
+  if (!segment) return null;
+  if (segment.type === "reply") return "";
+  if (segment.type === "at") return renderMentionHtml({ type: "at", data: segment.data });
+  if (segment.type === "text") return renderScalarOrJsonHtml(segment.data.text ?? segment.data.content ?? segment.data.value ?? "");
+  if (segment.type === "json") return renderOneBotJsonHtml(segment.data.data ?? segment.data.value ?? segment.data);
+  return null;
+}
+
+function renderOneBotJsonHtml(value) {
+  const data = parseOneBotJsonData(value);
+  if (!data) return "";
+  if (isMannounceJson(data)) return renderMannounceJsonHtml(data);
+  return renderGenericJsonElementHtml(data, { sourceLabel: "CQ JSON" });
+}
+
+function oneBotJsonPlainText(value) {
+  const data = parseOneBotJsonData(value);
+  if (!data) return "[JSON]";
+  if (isMannounceJson(data)) {
+    const detail = data?.meta?.mannounce || {};
+    const title = decodeMaybeBase64Text(detail.title || data.title || "") || "群公告";
+    const content = decodeMaybeBase64Text(detail.text || "") || stripMannouncePrompt(data.prompt || "");
+    return content ? `[群公告] ${title} ${content}` : `[群公告] ${title}`;
+  }
+  return jsonFieldText(data, ["prompt", "summary", "title", "text", "content", "message", "type", "app"]) || "[JSON]";
+}
+
+function parseOneBotJsonData(value) {
+  if (value && typeof value === "object") return value;
+  const text = decodeHtmlEntities(String(value || "").trim());
+  if (!text) return null;
+  return parseJsonCandidate(text);
+}
+
+function isMannounceJson(value) {
+  return Boolean(value && typeof value === "object" && (value.app === "com.tencent.mannounce" || value.meta?.mannounce));
+}
+
+function renderMannounceJsonHtml(value) {
+  const detail = value?.meta?.mannounce || {};
+  const decodedTitle = decodeMaybeBase64Text(detail.title || value.title || "");
+  const decodedText = decodeMaybeBase64Text(detail.text || "");
+  const prompt = stripMannouncePrompt(value.prompt || "");
+  const title = decodedTitle || "群公告";
+  const content = decodedText || prompt || jsonFieldText(value, ["summary", "desc", "description", "content", "text"]) || "群公告";
+  return renderNoticeElementHtml({ type: "announcement", title, content: truncateText(content, 180) });
+}
+
+function stripMannouncePrompt(value) {
+  return String(value || "")
+    .replace(/^\[群公告\]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function decodeMaybeBase64Text(value) {
+  const text = String(value || "").trim();
+  if (!text || !/^[A-Za-z0-9+/=_-]{8,}$/.test(text)) return text;
+  const normalized = text.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    if (typeof atob !== "function" || typeof TextDecoder !== "function") return text;
+    const binary = atob(normalized);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes).trim();
+    return decoded || text;
+  } catch {
+    return text;
+  }
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&#(x?[0-9a-f]+);/gi, (_, code) => {
+      const base = code.toLowerCase().startsWith("x") ? 16 : 10;
+      const number = Number.parseInt(base === 16 ? code.slice(1) : code, base);
+      return Number.isFinite(number) ? String.fromCodePoint(number) : _;
+    })
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 
 function renderMentionHtml(mention) {
-  const name = mention?.name || mention?.nick || mention?.uin || mention?.uid || mention?.target || mention?.text || "成员";
+  const data = mention?.data && typeof mention.data === "object" ? mention.data : {};
+  const id = data.qq || data.user_id || data.uid || data.uin || data.id || "";
+  const name = mention?.name || mention?.nick || mention?.uin || mention?.uid || mention?.target || mention?.text || data.name || data.nick || (String(id) === "all" ? "全体成员" : id) || "成员";
   return `<span class="inline-mention">@${escapeHtml(name)}</span>`;
 }
 
@@ -3184,6 +3300,8 @@ function inferElementKind(raw, fallbackKind = "") {
   const rawKind = String(raw.kind || raw.segment_type || raw.typeName || raw.type || "").toLowerCase();
   const fallback = String(fallbackKind || "").toLowerCase();
   const kind = rawKind || (["raw", "component", "data", "message", "segment"].includes(fallback) ? "" : fallback);
+  if (rawKind === "reply") return "reply";
+  if (rawKind === "json") return "json";
   const typeHint = Number(raw.type);
   const elementTypeHint = Number(raw.elementType);
   if (raw.picElement || raw.imageElement || typeHint === 2 || elementTypeHint === 2 || kind.includes("image") || kind.includes("pic")) return "image";
@@ -3465,6 +3583,13 @@ function textFromRawElements(raw) {
 
 function rawElementText(element) {
   if (!element || typeof element !== "object") return "";
+  const oneBot = oneBotSegment(element);
+  if (oneBot) {
+    if (oneBot.type === "reply") return "";
+    if (oneBot.type === "at") return `@${oneBot.data.qq || oneBot.data.user_id || oneBot.data.uid || oneBot.data.uin || "成员"}`;
+    if (oneBot.type === "text") return String(oneBot.data.text || oneBot.data.content || oneBot.data.value || "");
+    if (oneBot.type === "json") return oneBotJsonPlainText(oneBot.data.data ?? oneBot.data.value ?? oneBot.data);
+  }
   if (element.textElement?.content) return String(element.textElement.content);
   if (element.textElement?.text) return String(element.textElement.text);
   if (element.data?.text) return String(element.data.text);
@@ -3630,6 +3755,11 @@ function replyInfo(item) {
 
 function replyPayload(element) {
   if (!element || typeof element !== "object") return null;
+  const oneBot = oneBotSegment(element);
+  if (oneBot?.type === "reply") {
+    const id = oneBot.data.id || oneBot.data.message_id || oneBot.data.messageId || "";
+    return { id, sourceMsgText: id ? `引用消息 #${id}` : "引用消息" };
+  }
   return element.replyElement || element.reply || element.quoteElement || element.quote || element.quotedMessage || element.sourceMsg || element.sourceMessage || element.data?.reply || element.data?.quote || null;
 }
 
