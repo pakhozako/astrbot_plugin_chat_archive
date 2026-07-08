@@ -1249,7 +1249,7 @@ function renderMedia(item) {
     button.setAttribute("aria-label", `预览 ${item.name || "图片"}`);
     applyMediaPreviewSize(button, item);
     button.innerHTML = `
-      <span class="media-loading">图片加载中</span>
+      <span class="media-loading">加载中</span>
       <span class="media-error">图片不可用</span>
       <img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(item.name || "图片")}" />
     `;
@@ -1280,6 +1280,7 @@ function renderMedia(item) {
 
   const meta = document.createElement("div");
   meta.className = "media-file";
+  if (kind === "image") meta.classList.add("compact");
   meta.innerHTML = `
     <div class="file-icon">${escapeHtml(fileIcon(item.kind))}</div>
     <div class="file-main">
@@ -1724,9 +1725,15 @@ function messagePlainText(item) {
 }
 
 function messageBodyHtml(item) {
-  const rendered = messageElementObjects(item).map((component) => renderComponentInlineHtml(component)).filter(Boolean).join("");
+  const skipInlineMedia = Array.isArray(item?.media) && item.media.length > 0;
+  const rendered = messageElementObjects(item)
+    .map((component) => renderComponentInlineHtml(component, { skipMedia: skipInlineMedia }))
+    .filter(Boolean)
+    .join("");
   if (rendered) return rendered;
-  return highlightText(messagePlainText(item), state.q);
+  const plain = messagePlainText(item);
+  if (skipInlineMedia && isMediaPlaceholderText(plain)) return "";
+  return plain ? highlightText(plain, state.q) : "";
 }
 
 function messageElementObjects(item) {
@@ -1741,25 +1748,14 @@ function messageElementObjects(item) {
 }
 
 function mediaForMessage(item) {
-  return dedupeMediaItems([
-    ...(Array.isArray(item?.media) ? item.media : []),
-    ...inlineMediaItemsFromMessage(item),
-  ]);
+  return mediaForGrid(item);
 }
 
 function mediaForGrid(item) {
   const dbMedia = Array.isArray(item?.media) ? item.media : [];
   const inlineMedia = inlineMediaItemsFromMessage(item);
   if (!dbMedia.length) return dedupeMediaItems(inlineMedia);
-  const dbSources = new Set(
-    dbMedia
-      .map((media) => canonicalMediaSource(media))
-      .filter(Boolean),
-  );
-  return dedupeMediaItems([
-    ...dbMedia,
-    ...inlineMedia.filter((media) => !dbSources.has(canonicalMediaSource(media))),
-  ]);
+  return dedupeMediaItems(dbMedia);
 }
 
 function dedupeMediaItems(items) {
@@ -1803,12 +1799,13 @@ function componentText(component) {
   );
 }
 
-function renderComponentInlineHtml(component) {
+function renderComponentInlineHtml(component, options = {}) {
   if (!component || typeof component !== "object") return "";
   const raw = unwrapMessageElement(component.raw || component.data || component);
   const kind = inferElementKind(raw, component.kind);
   const typeHint = Number(raw.type ?? component.type);
   const elementTypeHint = Number(raw.elementType ?? component.elementType);
+  if (options.skipMedia && isMediaElement(raw, kind, typeHint, elementTypeHint)) return "";
   if (raw.picElement || raw.imageElement) return renderPicElementHtml(raw.picElement || raw.imageElement, raw);
   if (raw.mfaceElement) return renderMarketFaceHtml(raw.mfaceElement);
   if (raw.faceElement) return renderFaceHtml(raw.faceElement);
@@ -1841,6 +1838,40 @@ function renderComponentInlineHtml(component) {
   if (kind === "text") return highlightText(componentText(component), state.q);
   return "";
 }
+
+function isMediaElement(raw, kind = "", typeHint = NaN, elementTypeHint = NaN) {
+  if (!raw || typeof raw !== "object") return false;
+  return Boolean(
+    raw.picElement ||
+      raw.imageElement ||
+      raw.mfaceElement ||
+      raw.marketFaceElement ||
+      raw.market_face ||
+      raw.fileElement ||
+      raw.pttElement ||
+      raw.voiceElement ||
+      raw.recordElement ||
+      raw.audioElement ||
+      raw.videoElement ||
+      typeHint === 2 ||
+      typeHint === 3 ||
+      typeHint === 6 ||
+      elementTypeHint === 2 ||
+      elementTypeHint === 3 ||
+      elementTypeHint === 4 ||
+      elementTypeHint === 5 ||
+      elementTypeHint === 6 ||
+      ["image", "face", "file", "audio", "video"].includes(String(kind || ""))
+  );
+}
+
+function isMediaPlaceholderText(value) {
+  const text = String(value || "").replace(/\s+/g, "").trim();
+  if (!text) return true;
+  const stripped = text.replace(/(\[?图片\]?|\[?表情包?\]?|\[?视频\]?|\[?语音\]?|\[?文件\]?|图|图片不可用)/g, "");
+  return stripped.length === 0;
+}
+
 
 function renderMentionHtml(mention) {
   const name = mention?.name || mention?.nick || mention?.uin || mention?.uid || mention?.target || mention?.text || "成员";
@@ -2403,10 +2434,7 @@ function inferElementKind(raw, fallbackKind = "") {
 
 function allDisplayableMediaItems() {
   return state.messages
-    .flatMap((msg) => [
-      ...(Array.isArray(msg.media) ? msg.media : []),
-      ...inlineMediaItemsFromMessage(msg),
-    ])
+    .flatMap((msg) => mediaForGrid(msg))
     .filter((item) => mediaDisplayUrl(item));
 }
 
