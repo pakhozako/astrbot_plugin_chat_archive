@@ -220,10 +220,60 @@ function mediaUrl(item) {
   return pluginApiUrl(`media/${item.id}`);
 }
 
+/**
+ * 统一媒体代理 URL 处理
+ * @param {string} source - 媒体来源 URL 或路径
+ * @param {string} kind - 媒体类型（可选）
+ * @returns {string} 处理后的 URL
+ */
+function mediaProxyUrl(source, kind = 'image') {
+  const value = String(source || '').trim();
+  if (!value) return '';
+
+  // 本地归档媒体（通过 /media/<id> 端点）
+  if (value.startsWith('/media/')) {
+    return value;
+  }
+
+  // blob URL（临时预览）
+  if (value.startsWith('blob:')) {
+    return value;
+  }
+
+  // data URI
+  if (value.startsWith('data:')) {
+    return value;
+  }
+
+  // qpic.cn 等 QQ 域名 - 通过代理避免跨域和 referer 限制
+  if (value.includes('qpic.cn') || value.includes('multimedia.nt.qq.com.cn')) {
+    // 检查是否已经是代理 URL
+    if (value.includes('/api/media-proxy?')) {
+      return value;
+    }
+    // 标准化为 https
+    const normalized = normalizeQpicSource(value);
+    return `/api/v1/plugins/extensions/${encodeURIComponent(PLUGIN)}/media-proxy?url=${encodeURIComponent(normalized)}`;
+  }
+
+  // 其他 HTTP(S) URL - 直接使用（可能跨域）
+  if (value.startsWith('http://') || value.startsWith('https://')) {
+    return value;
+  }
+
+  // 相对路径 - 标准化
+  if (value.startsWith('/')) {
+    return normalizeQpicSource(value);
+  }
+
+  // 本地文件路径（临时，无法直接访问）
+  return '';
+}
+
 function mediaDisplayUrl(item) {
-  if (item?.inline_url) return String(item.inline_url);
+  if (item?.inline_url) return mediaProxyUrl(item.inline_url, item.kind);
   if (item?.local_path && item?.id) return mediaUrl(item);
-  return mediaSourceDisplayUrl(item);
+  return mediaProxyUrl(mediaSourceDisplayUrl(item), item.kind);
 }
 
 function markMediaContainerLoaded(container) {
@@ -2581,12 +2631,66 @@ function mediaSourceKeys(kind) {
   return ["url", "fileUrl", "file_url", "downloadUrl", "download_url", ...tail];
 }
 
+// 媒体尺寸约束配置
+const MEDIA_SIZE_CONSTRAINTS = {
+  inline: { maxWidth: 260, maxHeight: 220, minWidth: 120, minHeight: 92 },
+  card: { maxWidth: 320, maxHeight: 340, minWidth: 160, minHeight: 96 },
+  preview: { maxWidth: 1200, maxHeight: 800, minWidth: 0, minHeight: 0 }
+};
+
+/**
+ * 统一媒体尺寸计算函数
+ * @param {number} width - 原始宽度
+ * @param {number} height - 原始高度
+ * @param {string} context - 渲染上下文: 'inline' | 'card' | 'preview'
+ * @returns {Object} { width, height }
+ */
+function calculateMediaSize(width, height, context = 'card') {
+  const constraints = MEDIA_SIZE_CONSTRAINTS[context] || MEDIA_SIZE_CONSTRAINTS.card;
+  const { maxWidth, maxHeight, minWidth, minHeight } = constraints;
+
+  let displayWidth = Number(width || 0);
+  let displayHeight = Number(height || 0);
+
+  // 如果没有尺寸信息，返回默认值
+  if (!displayWidth || !displayHeight) {
+    return {
+      width: minWidth || 200,
+      height: minHeight || 150
+    };
+  }
+
+  // 计算缩放比例，保持纵横比
+  const scale = Math.min(maxWidth / displayWidth, maxHeight / displayHeight, 1);
+  displayWidth = Math.round(displayWidth * scale);
+  displayHeight = Math.round(displayHeight * scale);
+
+  // 应用最小值约束
+  if (minWidth && displayWidth < minWidth) {
+    const minScale = minWidth / displayWidth;
+    displayWidth = minWidth;
+    displayHeight = Math.round(displayHeight * minScale);
+  }
+  if (minHeight && displayHeight < minHeight) {
+    const minScale = minHeight / displayHeight;
+    displayHeight = minHeight;
+    displayWidth = Math.round(displayWidth * minScale);
+  }
+
+  // 确保最小尺寸
+  displayWidth = Math.max(64, displayWidth);
+  displayHeight = Math.max(48, displayHeight);
+
+  return { width: displayWidth, height: displayHeight };
+}
+
 function applyMediaPreviewSize(node, item) {
-  const size = previewSize(item?.width || item?.picWidth, item?.height || item?.picHeight, 320, 340, 160, 96);
+  const size = calculateMediaSize(item?.width || item?.picWidth, item?.height || item?.picHeight, 'card');
   node.style.width = `${size.width}px`;
   node.style.height = `${size.height}px`;
 }
 
+// 向后兼容的 previewSize 函数
 function previewSize(width, height, maxWidth, maxHeight, fallbackWidth, fallbackHeight) {
   let displayWidth = Number(width || 0);
   let displayHeight = Number(height || 0);
