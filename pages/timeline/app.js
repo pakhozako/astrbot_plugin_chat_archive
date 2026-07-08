@@ -1989,7 +1989,7 @@ function renderPicElementHtml(pic, wrapper = {}) {
   const displayUrl = mediaSourceDisplayUrl({ kind: "image", source });
   const label = pic?.summary || pic?.fileName || pic?.file || pic?.name || wrapper?.summary || "图片";
   if (!displayUrl) return `<span class="inline-face">${escapeHtml(`[${label}]`)}</span>`;
-  const size = previewSize(pic?.picWidth || pic?.width || pic?.originWidth || pic?.thumbWidth, pic?.picHeight || pic?.height || pic?.originHeight || pic?.thumbHeight, 260, 220, 120, 92);
+  const size = calculateMediaSize(pic?.picWidth || pic?.width || pic?.originWidth || pic?.thumbWidth, pic?.picHeight || pic?.height || pic?.originHeight || pic?.thumbHeight, 'inline');
   return `
     <button class="inline-image-preview" type="button" data-inline-media-kind="image" data-inline-media-name="${escapeAttr(label)}" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片" style="width:${size.width}px;height:${size.height}px">
       <span class="media-loading">加载中</span>
@@ -2046,7 +2046,7 @@ function renderVideoElementHtml(video, wrapper = {}) {
   const name = video?.fileName || video?.name || "视频";
   const thumbUrl = thumb ? mediaSourceDisplayUrl({ kind: "image", source: thumb }) : "";
   const displayUrl = mediaSourceDisplayUrl({ kind: "video", source });
-  const size = previewSize(video?.thumbWidth || video?.width || wrapper?.width, video?.thumbHeight || video?.height || wrapper?.height, 300, 220, 220, 150);
+  const size = calculateMediaSize(video?.thumbWidth || video?.width || wrapper?.width, video?.thumbHeight || video?.height || wrapper?.height, 'video');
   return `
     <button class="video-element" type="button" data-inline-media-kind="video" data-inline-media-name="${escapeAttr(name)}" ${displayUrl ? `data-inline-video="${escapeAttr(displayUrl)}"` : ""} aria-label="预览视频" style="width:${size.width}px;height:${size.height}px">
       <span class="video-cover">
@@ -2632,54 +2632,39 @@ function mediaSourceKeys(kind) {
 }
 
 // 媒体尺寸约束配置
+// 各渲染上下文的尺寸约束。max* 为上限，fallback* 为缺少原始尺寸时的兜底值。
+// 注意：fallback 仅在无尺寸信息时使用，不会强制放大已知尺寸的小图（避免表情包被拉大）。
 const MEDIA_SIZE_CONSTRAINTS = {
-  inline: { maxWidth: 260, maxHeight: 220, minWidth: 120, minHeight: 92 },
-  card: { maxWidth: 320, maxHeight: 340, minWidth: 160, minHeight: 96 },
-  preview: { maxWidth: 1200, maxHeight: 800, minWidth: 0, minHeight: 0 }
+  inline: { maxWidth: 260, maxHeight: 220, fallbackWidth: 120, fallbackHeight: 92 },
+  video: { maxWidth: 300, maxHeight: 220, fallbackWidth: 220, fallbackHeight: 150 },
+  card: { maxWidth: 320, maxHeight: 340, fallbackWidth: 160, fallbackHeight: 96 },
+  preview: { maxWidth: 1200, maxHeight: 800, fallbackWidth: 320, fallbackHeight: 240 },
 };
 
 /**
- * 统一媒体尺寸计算函数
+ * 统一媒体尺寸计算函数：所有内联/卡片/预览媒体都走这里。
  * @param {number} width - 原始宽度
  * @param {number} height - 原始高度
- * @param {string} context - 渲染上下文: 'inline' | 'card' | 'preview'
- * @returns {Object} { width, height }
+ * @param {string} context - 渲染上下文: 'inline' | 'video' | 'card' | 'preview'
+ * @returns {{width: number, height: number}}
  */
 function calculateMediaSize(width, height, context = 'card') {
   const constraints = MEDIA_SIZE_CONSTRAINTS[context] || MEDIA_SIZE_CONSTRAINTS.card;
-  const { maxWidth, maxHeight, minWidth, minHeight } = constraints;
+  const { maxWidth, maxHeight, fallbackWidth, fallbackHeight } = constraints;
 
   let displayWidth = Number(width || 0);
   let displayHeight = Number(height || 0);
 
-  // 如果没有尺寸信息，返回默认值
+  // 缺少尺寸信息时用兜底值
   if (!displayWidth || !displayHeight) {
-    return {
-      width: minWidth || 200,
-      height: minHeight || 150
-    };
+    displayWidth = fallbackWidth;
+    displayHeight = fallbackHeight;
   }
 
-  // 计算缩放比例，保持纵横比
+  // 保持纵横比缩小，绝不放大（scale 上限为 1）
   const scale = Math.min(maxWidth / displayWidth, maxHeight / displayHeight, 1);
-  displayWidth = Math.round(displayWidth * scale);
-  displayHeight = Math.round(displayHeight * scale);
-
-  // 应用最小值约束
-  if (minWidth && displayWidth < minWidth) {
-    const minScale = minWidth / displayWidth;
-    displayWidth = minWidth;
-    displayHeight = Math.round(displayHeight * minScale);
-  }
-  if (minHeight && displayHeight < minHeight) {
-    const minScale = minHeight / displayHeight;
-    displayHeight = minHeight;
-    displayWidth = Math.round(displayWidth * minScale);
-  }
-
-  // 确保最小尺寸
-  displayWidth = Math.max(64, displayWidth);
-  displayHeight = Math.max(48, displayHeight);
+  displayWidth = Math.max(64, Math.round(displayWidth * scale));
+  displayHeight = Math.max(48, Math.round(displayHeight * scale));
 
   return { width: displayWidth, height: displayHeight };
 }
@@ -2688,20 +2673,6 @@ function applyMediaPreviewSize(node, item) {
   const size = calculateMediaSize(item?.width || item?.picWidth, item?.height || item?.picHeight, 'card');
   node.style.width = `${size.width}px`;
   node.style.height = `${size.height}px`;
-}
-
-// 向后兼容的 previewSize 函数
-function previewSize(width, height, maxWidth, maxHeight, fallbackWidth, fallbackHeight) {
-  let displayWidth = Number(width || 0);
-  let displayHeight = Number(height || 0);
-  if (!displayWidth || !displayHeight) {
-    displayWidth = fallbackWidth;
-    displayHeight = fallbackHeight;
-  }
-  const scale = Math.min(maxWidth / displayWidth, maxHeight / displayHeight, 1);
-  displayWidth = Math.max(64, Math.round(displayWidth * scale));
-  displayHeight = Math.max(48, Math.round(displayHeight * scale));
-  return { width: displayWidth, height: displayHeight };
 }
 
 function normalizeQpicSource(source) {
