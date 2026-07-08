@@ -1942,7 +1942,7 @@ function renderPicElementHtml(pic, wrapper = {}) {
   const size = previewSize(pic?.picWidth || pic?.width || pic?.originWidth || pic?.thumbWidth, pic?.picHeight || pic?.height || pic?.originHeight || pic?.thumbHeight, 260, 220, 120, 92);
   return `
     <button class="inline-image-preview" type="button" data-inline-media-kind="image" data-inline-media-name="${escapeAttr(label)}" data-inline-image="${escapeAttr(displayUrl)}" aria-label="预览图片" style="width:${size.width}px;height:${size.height}px">
-      <span class="media-loading">图片加载中</span>
+      <span class="media-loading">加载中</span>
       <span class="media-error">图片不可用</span>
       <img loading="lazy" src="${escapeAttr(displayUrl)}" alt="${escapeAttr(label)}" />
     </button>
