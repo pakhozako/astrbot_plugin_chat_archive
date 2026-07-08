@@ -35,7 +35,7 @@ English: **AstrBot Chat Archive** captures text and media metadata from AstrBot 
 ```text
 main.py                  ← 插件入口、生命周期、消息捕获和 /chatlog 命令
 storage.py               ← SQLite 存储、Pending WAL、搜索、导出、媒体 GC
-web.py                   ← 插件 Web API 和媒体文件安全路由
+web.py                   ← 插件 Web API、媒体文件和导出文件安全路由
 metadata.yaml            ← AstrBot 插件元数据和 Page 声明
 _conf_schema.json        ← AstrBot WebUI 配置表单
 CHANGELOG.md             ← 变更记录
@@ -67,7 +67,7 @@ tests/
 | Fallback Recovery | SQLite 写入失败时落 `fallback_failed_batches.jsonl`，启动自动重放 |
 | 媒体归档 | 复制本地可访问图片、视频、语音、文件，支持 `base64://`、`data:`、`file://` 和公网图片 URL |
 | 媒体去重 | 以 SHA-256 命名实体文件，`media_blobs.ref_count` 管理引用生命周期 |
-| 安全路由 | `/media/<media_id>` 只接受数据库数字 ID；远程媒体代理仅允许配置白名单域名 |
+| 安全路由 | `/media/<media_id>` 只接受数据库数字 ID；远程媒体代理仅允许配置白名单域名；导出下载只允许读取 `exports/` 内文件 |
 | Telegram 风格 WebUI | 会话列表、消息气泡、日期分组、连续消息合并、分页加载 |
 | 搜索与过滤 | 支持 FTS5/LIKE 搜索、高亮、发送者/类型/媒体/时间/标签过滤 |
 | 收藏与标签 | 支持收藏消息、标签筛选、搜索历史和会话已读状态 |
@@ -109,7 +109,7 @@ messages.jsonl              已成功写入消息的追加日志
 pending.jsonl               未提交 SQLite 的 Pending WAL
 fallback_failed_batches.jsonl
 media/                      去重后的媒体实体文件
-proxy_cache/                WebUI 远程图片代理缓存
+proxy_cache/                WebUI 远程媒体代理缓存
 exports/                    导出文件
 ```
 
@@ -169,7 +169,7 @@ timeline
 | 媒体 | 图片缩略图、视频/音频播放、文件下载、全屏预览 |
 | 操作 | 收藏、标签、复制文本、查看原始 JSON、右键菜单 |
 | 设置 | 主题、轮询间隔、自动滚动、紧凑模式、搜索历史 |
-| 导出 | 根据当前会话、搜索和过滤条件导出 JSON/Markdown/TXT/HTML/ZIP |
+| 导出 | 根据当前会话、搜索和过滤条件导出 JSON/Markdown/TXT/HTML/ZIP，并通过 AstrBot Page Bridge 下载 |
 
 ---
 
@@ -203,6 +203,7 @@ Chat Archive fallback replay
 - `%`、`_`、中文和混合关键词不会导致 SQL 语法错误。
 - 导出开始时取当前消息上界，确保导出过程中新写入的消息不会进入本次快照。
 - JSON/Markdown/TXT/HTML/ZIP 均为游标分页写入，避免一次性加载全表。
+- WebUI 导出完成后通过受控 `/export-file?name=...` 下载生成文件，该路由只接受 `exports/` 目录内的文件名。
 
 ---
 
@@ -215,6 +216,7 @@ Chat Archive fallback replay
 - 若远程媒体没有成功归档落盘，WebUI 可通过 `/image-proxy?url=...` 或 `/media-proxy?kind=...&url=...` 兜底显示；代理默认只允许 QQ 图片、头像、表情和媒体相关域名，并带浏览器请求头和 Referer 重试。
 - `/media/<media_id>` 不接受任意路径或 hash 字符串，只接受数据库媒体数字 ID。
 - `/file-proxy?path=...` 只允许读取插件媒体目录内文件，不能代理任意系统路径。
+- `/export-file?name=...` 只允许读取插件导出目录内文件，不能代理任意系统路径。
 - `durable_write=true` 会带来每条消息一次 journal append + fsync 的成本；这是为了优先保证“消息进入插件后不丢失”。
 - WebUI 使用分页加载和稳定 DOM 信息流，避免媒体消息滚动时反复重建节点。
 - WebUI 借鉴 OneBot/QQ 客户端的只读展示经验：本地 IndexedDB 只做会话预显示缓存，后端数据仍是唯一可信来源；系统提示、撤回、回复、@提及、QQ 表情、表情回应、语音条、文件卡片、视频摘要、合并转发和 Ark 转发卡片会尽量从 `raw/components` 中解析展示，但不会提供发送、撤回或群管理能力。

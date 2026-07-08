@@ -40,6 +40,7 @@ class ChatArchiveWeb:
             ("/image-data", self.image_data, ["GET"], "Chat archive inline remote image data"),
             ("/media-proxy", self.media_proxy, ["GET"], "Chat archive remote media proxy"),
             ("/export", self.export_archive, ["POST"], "Export chat archive"),
+            ("/export-file", self.export_file, ["GET"], "Download chat archive export"),
         ]
         for path, handler, methods, desc in routes:
             self.context.register_web_api(f"/{PLUGIN_NAME}{path}", self._wrap(handler), methods, desc)
@@ -276,7 +277,25 @@ class ChatArchiveWeb:
             tag_id=tag_id,
             include_media=include_media,
         )
-        return json_response({"ok": True, "data": {"path": str(path), "format": fmt}})
+        return json_response(
+            {
+                "ok": True,
+                "data": {
+                    "path": str(path),
+                    "name": path.name,
+                    "format": fmt,
+                    "download_endpoint": "export-file",
+                    "download_params": {"name": path.name},
+                },
+            }
+        )
+
+    async def export_file(self):
+        row = self.store.get_export_file(str(request.query.get("name", "") or ""))
+        if not row:
+            return json_response({"ok": False, "message": "export file not found"}, status_code=404)
+        path = Path(row["path"])
+        return file_response(path, filename=row["name"] or path.name, content_type=row["mime"])
 
     @staticmethod
     def _optional_int(value) -> int | None:

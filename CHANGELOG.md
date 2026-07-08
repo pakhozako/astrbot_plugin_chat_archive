@@ -13,3 +13,4 @@
 - Added read-only OneBot/QQ timeline rendering improvements: session IndexedDB pre-cache, system tip pills, recall markers, reply previews, QQ face/market-face rendering fallback, reaction chips, and QQ avatar/member badge display.
 - Added more read-only message element cards for OneBot/QQ archives: raw-only image preview fallback, voice bars with duration/text, file cards, video summaries, merged-forward cards, and Ark forward summaries.
 - Expanded read-only LuckyLilliaBot-inspired archive rendering with stable merged-forward preview keys, nested forward segment rendering, @mention chips, reaction image fallback, and allowlisted `/media-proxy` support for remote video/audio/file previews.
+- Added controlled WebUI export downloads through `/export-file`, limited to generated files inside the plugin `exports/` directory and wired to the AstrBot Page Bridge download flow.

@@ -640,6 +640,28 @@ async function downloadMedia(item) {
   window.open(url, "_blank", "noopener");
 }
 
+async function downloadExportFile(data) {
+  const name = data?.name || "chat_archive_export";
+  const endpointName = endpoint(data?.download_endpoint || "export-file");
+  const params = data?.download_params || { name };
+  if (bridgeAvailable && bridge?.download) {
+    await bridge.download(endpointName, params, name);
+    return;
+  }
+  const query = new URLSearchParams(params).toString();
+  triggerBrowserDownload(pluginApiUrl(`${endpointName}${query ? `?${query}` : ""}`), name);
+}
+
+function triggerBrowserDownload(url, name) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name || "";
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 async function loadStats() {
   const stats = await apiGet("/stats");
   const previous = state.lastKnownCount || Number(stats.messages || 0);
@@ -3233,7 +3255,8 @@ function bindEvents() {
       end_ts: state.filters.endTs || "",
       include_media: Boolean(els.includeMediaExport?.checked || format === "zip"),
     });
-    toast(`已导出：${data.path}`);
+    await downloadExportFile(data);
+    toast(`已导出：${data.name || data.path || "归档文件"}`);
   });
   els.settingsBtn?.addEventListener("click", async () => {
     await loadSearchHistory();
@@ -3477,7 +3500,13 @@ async function demoApiPost(path, body = {}) {
   if (clean === "settings") return body;
   if (clean === "search-history") return { recorded: true };
   if (clean === "seen") return { ok: true };
-  return { path: "demo-export.json" };
+  return {
+    path: "demo-export.json",
+    name: "demo-export.json",
+    format: body.format || "json",
+    download_endpoint: "export-file",
+    download_params: { name: "demo-export.json" },
+  };
 }
 
 function buildDemoMessages() {

@@ -2358,6 +2358,25 @@ class ChatArchiveStore:
             return {"path": resolved, "name": resolved.name, "mime": mime}
         return None
 
+    def get_export_file(self, value: str) -> dict[str, Any] | None:
+        text = str(value or "").strip()
+        if not text or "/" in text or "\\" in text or ":" in text:
+            return None
+        name = _safe_name(text, fallback="")
+        if not name:
+            return None
+        try:
+            path = (self.export_dir / name).resolve()
+            export_root = self.export_dir.resolve()
+        except Exception:
+            return None
+        if path == export_root or export_root not in path.parents:
+            return None
+        if not path.exists() or not path.is_file():
+            return None
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return {"path": path, "name": path.name, "mime": mime}
+
     def get_remote_proxy_file(self, source: str, *, kind: str = "image") -> dict[str, Any] | None:
         if not self.config.proxy_remote_media:
             return None
