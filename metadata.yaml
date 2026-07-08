@@ -9,7 +9,7 @@ pages:
     desc: "以类似 Telegram 的信息流浏览已归档消息、媒体和原始 JSON。"
 version: "0.1.0"
 author: "Codex"
-repo: ""
+repo: "https://github.com/pakhozako/astrbot_plugin_chat_archive"
 support_platforms:
   - aiocqhttp
   - webchat
