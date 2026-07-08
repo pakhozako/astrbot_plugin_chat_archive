@@ -2328,9 +2328,80 @@ function renderOneBotSegmentHtml(raw) {
   if (segment.type === "reply") return "";
   if (segment.type === "at") return renderMentionHtml({ type: "at", data: segment.data });
   if (segment.type === "text") return renderScalarOrJsonHtml(segment.data.text ?? segment.data.content ?? segment.data.value ?? "");
+  if (segment.type === "image") return renderPicElementHtml(segment.data, segment.data);
+  if (segment.type === "face") return renderFaceHtml({ ...segment.data, faceIndex: segment.data.id || segment.data.face_id, faceText: segment.data.name || segment.data.text });
+  if (segment.type === "mface" || segment.type === "marketface") {
+    return renderMarketFaceHtml({ ...segment.data, emojiId: segment.data.emoji_id || segment.data.emojiId || segment.data.id, faceName: segment.data.name || segment.data.summary || segment.data.faceName });
+  }
+  if (segment.type === "record") return renderPttElementHtml(segment.data, segment.data);
+  if (segment.type === "video") return renderVideoElementHtml(segment.data, segment.data);
+  if (segment.type === "file") return renderFileElementHtml(segment.data);
+  if (segment.type === "xml") return renderOneBotXmlHtml(segment.data);
+  if (segment.type === "share") return renderOneBotShareHtml(segment.data);
+  if (segment.type === "music") return renderOneBotMusicHtml(segment.data);
+  if (segment.type === "node") return renderOneBotNodeHtml(segment.data);
+  if (segment.type === "poke") return renderOneBotPokeHtml(segment.data);
+  if (segment.type === "location") return renderOneBotLocationHtml(segment.data);
   if (segment.type === "json") return renderOneBotJsonHtml(segment.data.data ?? segment.data.value ?? segment.data);
   if (segment.type === "forward") return renderOneBotForwardHtml(segment.data);
-  return null;
+  return renderOneBotRichCardHtml("CQ", `CQ ${segment.type}`, oneBotSegmentPlainText(segment) || "OneBot 消息段");
+}
+
+function renderOneBotRichCardHtml(icon, title, subtitle, className = "onebot-element") {
+  return `<span class="inline-rich-card ${escapeAttr(className)}"><span class="rich-card-icon">${escapeHtml(icon)}</span><span class="rich-card-main"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle || "OneBot 消息段")}</small></span></span>`;
+}
+
+function renderOneBotXmlHtml(data) {
+  const xml = decodeHtmlEntities(data?.data || data?.value || data?.xml || "");
+  const parsed = parseForwardXml(xml);
+  if (parsed.title || parsed.previews.length || parsed.summary) {
+    return renderForwardCardHtml(parsed.title || "XML 卡片", parsed.previews.slice(0, 3), parsed.summary || "XML 消息", {
+      title: parsed.title || "XML 卡片",
+      previews: parsed.previews,
+      summary: parsed.summary || "XML 消息",
+      messages: [],
+    });
+  }
+  return renderOneBotRichCardHtml("XML", "XML 卡片", truncateText(stripHtml(xml) || data?.title || "XML 消息", 120), "xml-element");
+}
+
+function renderOneBotShareHtml(data) {
+  const title = data?.title || data?.name || "分享";
+  const subtitle = data?.content || data?.desc || data?.description || data?.url || "链接分享";
+  return renderOneBotRichCardHtml("链", title, subtitle, "share-element");
+}
+
+function renderOneBotMusicHtml(data) {
+  const title = data?.title || data?.name || `${data?.type || "音乐"} 分享`;
+  const subtitle = data?.content || data?.desc || data?.audio || data?.url || "音乐卡片";
+  return renderOneBotRichCardHtml("乐", title, subtitle, "music-element");
+}
+
+function renderOneBotNodeHtml(data) {
+  const content = Array.isArray(data?.content) ? data.content : [];
+  const previews = content.map((item) => rawElementText(unwrapMessageElement(item))).filter(Boolean).slice(0, 3);
+  if (previews.length) {
+    return renderForwardCardHtml(data?.name || "转发节点", previews, `${content.length} 条节点消息`, {
+      title: data?.name || "转发节点",
+      previews,
+      summary: `${content.length} 条节点消息`,
+      messages: [],
+    });
+  }
+  return renderOneBotRichCardHtml("节", data?.name || "转发节点", data?.id ? `节点 ID: ${shortForwardId(data.id)}` : "合并转发节点", "node-element");
+}
+
+function renderOneBotPokeHtml(data) {
+  const target = data?.qq || data?.user_id || data?.target_id || data?.id || "成员";
+  return renderOneBotRichCardHtml("戳", "戳一戳", `目标：${target}`, "poke-element");
+}
+
+function renderOneBotLocationHtml(data) {
+  const title = data?.title || data?.name || "位置";
+  const lat = data?.lat || data?.latitude;
+  const lon = data?.lon || data?.lng || data?.longitude;
+  const subtitle = data?.content || data?.address || (lat && lon ? `${lat}, ${lon}` : "位置消息");
+  return renderOneBotRichCardHtml("位", title, subtitle, "location-element");
 }
 
 function renderOneBotForwardHtml(data) {
@@ -2367,6 +2438,29 @@ function oneBotJsonPlainText(value) {
     return content ? `[群公告] ${title} ${content}` : `[群公告] ${title}`;
   }
   return jsonFieldText(data, ["prompt", "summary", "title", "text", "content", "message", "type", "app"]) || "[JSON]";
+}
+
+function oneBotSegmentPlainText(segment) {
+  if (!segment) return "";
+  const data = segment.data || {};
+  if (segment.type === "reply") return "";
+  if (segment.type === "at") return `@${data.qq || data.user_id || data.uid || data.uin || "成员"}`;
+  if (segment.type === "text") return String(data.text || data.content || data.value || "");
+  if (segment.type === "image") return "[图片]";
+  if (segment.type === "face") return data.name || data.text || `[表情${data.id || data.face_id || ""}]`;
+  if (segment.type === "mface" || segment.type === "marketface") return `[${data.name || data.summary || data.faceName || "表情包"}]`;
+  if (segment.type === "record") return data.text || "[语音]";
+  if (segment.type === "video") return "[视频]";
+  if (segment.type === "file") return `[文件${data.name || data.file ? `: ${data.name || data.file}` : ""}]`;
+  if (segment.type === "json") return oneBotJsonPlainText(data.data ?? data.value ?? data);
+  if (segment.type === "forward") return data.id ? `[合并转发] ${data.id}` : "[合并转发]";
+  if (segment.type === "xml") return "[XML 卡片]";
+  if (segment.type === "share") return `[分享] ${data.title || data.url || ""}`.trim();
+  if (segment.type === "music") return `[音乐] ${data.title || data.type || ""}`.trim();
+  if (segment.type === "node") return "[转发节点]";
+  if (segment.type === "poke") return `[戳一戳] ${data.qq || data.user_id || data.target_id || ""}`.trim();
+  if (segment.type === "location") return `[位置] ${data.title || data.address || ""}`.trim();
+  return `[CQ:${segment.type}]`;
 }
 
 function parseOneBotJsonData(value) {
