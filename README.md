@@ -12,24 +12,6 @@
 
 English: **AstrBot Chat Archive** captures text and media metadata from AstrBot message events, stores them in SQLite/JSONL, and provides a Telegram-like timeline page for browsing, searching, previewing media, tagging, and exporting archives.
 
----
-
-## 🏷️ 项目命名
-
-我建议使用：
-
-| 场景 | 名称 |
-|------|------|
-| 插件显示名 | 聊天档案馆 |
-| 英文名 | Chat Archive |
-| 完整项目名 | AstrBot Chat Archive |
-| 插件包名 | `astrbot_plugin_chat_archive` |
-| 命令入口 | `/chatlog` |
-
-理由：`Chat Archive` 直观、可搜索、和现有包名一致；中文名“聊天档案馆”比“聊天归档”更像产品名，但不影响技术识别。
-
----
-
 ## 🏗️ 项目结构
 
 ```text
@@ -205,52 +187,6 @@ Chat Archive fallback replay
 - JSON/Markdown/TXT/HTML/ZIP 均为游标分页写入，避免一次性加载全表。
 - WebUI 导出完成后通过受控 `/export-file?name=...` 下载生成文件，该路由只接受 `exports/` 目录内的文件名。
 
----
-
-## ⚡ 性能与安全说明
-
-- SQLite 使用 WAL 和增量索引：`sessions(session_id)`、`messages(session_id, timestamp)`、`messages(platform)`。
-- 媒体文件以 `sha256` 文件名保存，相同内容只保存一份实体文件。
-- OneBot/QQ 常见媒体来源会尽量规范化：支持 `base64://`、`data:*;base64,`、`file://`、本地路径和公网图片 URL。
-- 远程图片 URL 会优先下载到插件媒体目录，再通过 `/media/<media_id>` 渲染；默认只允许公网 `http/https` 图片，避免前端直接暴露外链和降低 SSRF 风险。
-- 若远程媒体没有成功归档落盘，WebUI 可通过 `/image-proxy?url=...` 或 `/media-proxy?kind=...&url=...` 兜底显示；代理默认只允许 QQ 图片、头像、表情和媒体相关域名，并带浏览器请求头和 Referer 重试。
-- `/media/<media_id>` 不接受任意路径或 hash 字符串，只接受数据库媒体数字 ID。
-- `/file-proxy?path=...` 只允许读取插件媒体目录内文件，不能代理任意系统路径。
-- `/export-file?name=...` 只允许读取插件导出目录内文件，不能代理任意系统路径。
-- `durable_write=true` 会带来每条消息一次 journal append + fsync 的成本；这是为了优先保证“消息进入插件后不丢失”。
-- WebUI 使用分页加载和稳定 DOM 信息流，避免媒体消息滚动时反复重建节点。
-- WebUI 借鉴 OneBot/QQ 客户端的只读展示经验：本地 IndexedDB 只做会话预显示缓存，后端数据仍是唯一可信来源；系统提示、撤回、回复、@提及、QQ 表情、表情回应、语音条、文件卡片、视频摘要、合并转发和 Ark 转发卡片会尽量从 `raw/components` 中解析展示，但不会提供发送、撤回或群管理能力。
-
----
-
-## 🧰 维护建议
-
-| 周期 | 建议 |
-|------|------|
-| 每周 | 查看 `/chatlog status` 中 DB、媒体目录、Pending、最近 prune 信息 |
-| 异常后 | 检查是否出现 `fallback_failed_batches.*.jsonl` |
-| 大量删除后 | 执行 `/chatlog gc dry`，确认后执行 `/chatlog gc` |
-| 性能下降时 | 执行 `/chatlog optimize`；必要时维护窗口内执行 `/chatlog optimize vacuum` |
-| 发布前 | 跑语法检查、metadata/schema 校验、离线 smoke test 和隔离 AstrBot WebUI 测试 |
-
----
-
-## ✅ 测试
-
-```bash
-python -m py_compile main.py storage.py web.py
-node -c pages/timeline/app.js
-python -c "import yaml; yaml.safe_load(open('metadata.yaml', encoding='utf-8'))"
-python -c "import json; json.load(open('_conf_schema.json', encoding='utf-8'))"
-python tests/storage_smoke.py
-python tests/test_pending_replay.py
-python tests/test_reliability_stage1.py
-python tests/test_search_export_stage3.py
-python tests/test_experience_stage4.py
-```
-
----
-
 ## 🙏 致谢
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) — Agentic AI 助手框架
@@ -259,4 +195,4 @@ python tests/test_experience_stage4.py
 
 ## 📄 许可证
 
-请按你的仓库实际许可证补充。如果准备发布到插件市场，建议在仓库根目录添加 `LICENSE`。
+MIT License. See [LICENSE](LICENSE).

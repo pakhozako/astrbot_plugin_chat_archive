@@ -272,7 +272,7 @@ function mediaProxyUrl(source, kind = 'image') {
 
 function mediaDisplayUrl(item) {
   if (item?.inline_url) return mediaProxyUrl(item.inline_url, item.kind);
-  if (item?.local_path && item?.id) return mediaUrl(item);
+  if (item?.local_path && item?.id && !isTemporaryMediaSource(item.local_path)) return mediaUrl(item);
   return mediaProxyUrl(mediaSourceDisplayUrl(item), item.kind);
 }
 
@@ -1826,8 +1826,9 @@ function mediaForMessage(item) {
 function mediaForGrid(item) {
   const dbMedia = Array.isArray(item?.media) ? item.media : [];
   const inlineMedia = inlineMediaItemsFromMessage(item);
-  if (!dbMedia.length) return dedupeMediaItems(inlineMedia);
-  return dedupeMediaItems(dbMedia);
+  if (!dbMedia.length) return dedupeMediaItems(inlineMedia).filter((mediaItem) => !isTemporaryLocalMedia(mediaItem));
+  const normalized = dedupeMediaItems(dbMedia).filter((mediaItem) => !isTemporaryLocalMedia(mediaItem) || isStableMediaItem(mediaItem));
+  return preferStableMediaItems(normalized);
 }
 
 function dedupeMediaItems(items) {
@@ -1835,7 +1836,7 @@ function dedupeMediaItems(items) {
   const seen = new Set();
   for (const item of items || []) {
     if (!item || typeof item !== "object") continue;
-    const key = `${normalizeMediaKind(item.kind)}:${canonicalMediaSource(item) || item.id || item.name || result.length}`;
+    const key = mediaDedupeKey(item, result.length);
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(item);
@@ -1844,8 +1845,110 @@ function dedupeMediaItems(items) {
 }
 
 function canonicalMediaSource(item) {
-  const source = firstMediaSource(item, ["inline_url", "source", "url", "path", "relative_path", "relativePath", "filePath", "localPath"]);
+  const source = firstMediaSource(item, ["inline_url", "source", "url", "path", "local_path", "relative_path", "relativePath", "filePath", "file_path", "localPath"]);
   return normalizeQpicSource(source);
+}
+
+function mediaDedupeKey(item, fallbackIndex = 0) {
+  const kind = normalizeMediaKind(item?.kind);
+  const hash = firstRawString(item, ["hash", "sha256", "media_hash", "mediaHash", "md5", "md5HexStr"]) || firstRawString(item?.meta, ["hash", "sha256", "md5", "md5HexStr"]);
+  if (hash) return `${kind}:hash:${hash.toLowerCase()}`;
+  const source = canonicalMediaSource(item);
+  if (source && !isTemporaryMediaSource(source)) return `${kind}:source:${normalizeMediaIdentity(source)}`;
+  const stablePath = firstRawString(item, ["relative_path", "relativePath", "local_path", "localPath", "filePath", "file_path", "path"]);
+  if (stablePath && !isTemporaryMediaSource(stablePath)) return `${kind}:path:${normalizeMediaIdentity(stablePath)}`;
+  const name = mediaNameFingerprint(item?.name || item?.fileName || item?.file_name || item?.source || "");
+  if (name && (item?.size || item?.width || item?.height || source || stablePath)) {
+    return `${kind}:name:${name}:${item?.size || ""}:${item?.width || ""}:${item?.height || ""}`;
+  }
+  return `${kind}:id:${item?.id || fallbackIndex}`;
+}
+
+function firstRawString(value, keys) {
+  if (!value || typeof value !== "object") return "";
+  for (const key of keys) {
+    const direct = value[key];
+    if (direct !== undefined && direct !== null && typeof direct !== "object") {
+      const text = String(direct).trim();
+      if (text) return text;
+    }
+  }
+  for (const key of Object.keys(value)) {
+    if (!keys.some((name) => name.toLowerCase() === key.toLowerCase())) continue;
+    const direct = value[key];
+    if (direct !== undefined && direct !== null && typeof direct !== "object") {
+      const text = String(direct).trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function normalizeMediaIdentity(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/[?#].*$/, "")
+    .toLowerCase();
+}
+
+function mediaNameFingerprint(value) {
+  const text = String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  return text;
+}
+
+function preferStableMediaItems(items) {
+  const stableKinds = new Set(
+    (items || [])
+      .filter((item) => isStableMediaItem(item))
+      .map((item) => normalizeMediaKind(item.kind)),
+  );
+  if (!stableKinds.size) return items || [];
+  return (items || []).filter((item) => {
+    const kind = normalizeMediaKind(item.kind);
+    return !(stableKinds.has(kind) && !isStableMediaItem(item) && isTemporaryLocalMedia(item));
+  });
+}
+
+function isStableMediaItem(item) {
+  if (!item || typeof item !== "object") return false;
+  const source = canonicalMediaSource(item);
+  if (item.id && item.local_path && !isTemporaryMediaSource(item.local_path)) return true;
+  return Boolean(source && (/^(data:|blob:|https?:\/\/)/i.test(source) || source.startsWith("media/")));
+}
+
+function isTemporaryLocalMedia(item) {
+  if (!item || typeof item !== "object") return false;
+  const values = [
+    item.source,
+    item.url,
+    item.path,
+    item.local_path,
+    item.localPath,
+    item.filePath,
+    item.file_path,
+    item.relative_path,
+    item.relativePath,
+    item.name,
+  ];
+  return values.some(isTemporaryMediaSource);
+}
+
+function isTemporaryMediaSource(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const normalized = text.replace(/\\/g, "/").toLowerCase();
+  return (
+    /(^|\/)\.astrbot\/data\/temp\//.test(normalized) ||
+    /(^|\/)data\/temp\/media_(image|video|audio|record|file)_/.test(normalized) ||
+    /(^|\/)temp\/media_(image|video|audio|record|file)_[a-f0-9-]+\.(gif|webp|png|jpe?g|mp4|mp3|wav|amr|silk)$/i.test(normalized)
+  );
 }
 
 function componentText(component) {
@@ -1885,8 +1988,9 @@ function renderComponentInlineHtml(component, options = {}) {
   if (raw.fileElement) return renderFileElementHtml(raw.fileElement);
   if (raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement) return renderPttElementHtml(raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement, raw);
   if (raw.videoElement) return renderVideoElementHtml(raw.videoElement, raw);
-  if (raw.multiForwardMsgElement) return renderForwardElementHtml(raw.multiForwardMsgElement);
+  if (forwardElementFromRaw(raw)) return renderForwardElementHtml(forwardElementFromRaw(raw));
   if (raw.arkElement) return renderArkElementHtml(raw.arkElement);
+  if (noticeElementFromRaw(raw)) return renderNoticeElementHtml(noticeElementFromRaw(raw));
   if (raw.atElement || raw.mentionElement) return renderMentionHtml(raw.atElement || raw.mentionElement);
   if (raw.replyElement || raw.grayTipElement) return "";
   if (raw.textElement?.content) return highlightText(raw.textElement.content, state.q);
@@ -1925,6 +2029,7 @@ function isMediaElement(raw, kind = "", typeHint = NaN, elementTypeHint = NaN) {
       raw.recordElement ||
       raw.audioElement ||
       raw.videoElement ||
+      forwardElementFromRaw(raw) ||
       typeHint === 2 ||
       typeHint === 3 ||
       typeHint === 6 ||
@@ -1940,7 +2045,11 @@ function isMediaElement(raw, kind = "", typeHint = NaN, elementTypeHint = NaN) {
 function isMediaPlaceholderText(value) {
   const text = String(value || "").replace(/\s+/g, "").trim();
   if (!text) return true;
-  const stripped = text.replace(/(\[?图片\]?|\[?表情包?\]?|\[?视频\]?|\[?语音\]?|\[?文件\]?|图|图片不可用)/g, "");
+  const stripped = text
+    .replace(/(图片不可用|媒体不可用|加载失败|不可用|下载|download|\[?图片\]?|\[?表情包?\]?|\[?视频\]?|\[?语音\]?|\[?文件\]?|图)/gi, "")
+    .replace(/[a-z]:[\\/][^<>:"|?*\n\r]+?media_(?:image|video|audio|record|file)_[a-f0-9-]+\.(?:gif|webp|png|jpe?g|mp4|mp3|wav|amr|silk)/gi, "")
+    .replace(/(?:^|[\\/])?media_(?:image|video|audio|record|file)_[a-f0-9-]+\.(?:gif|webp|png|jpe?g|mp4|mp3|wav|amr|silk)/gi, "")
+    .replace(/[a-f0-9]{16,}\.(?:gif|webp|png|jpe?g|mp4|mp3|wav|amr|silk)/gi, "");
   return stripped.length === 0;
 }
 
@@ -2094,6 +2203,13 @@ function renderForwardElementHtml(forward) {
 
 function renderArkElementHtml(ark) {
   let data = ark?.data || ark?.arkData || null;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      data = null;
+    }
+  }
   if (!data && ark?.bytesData) {
     try {
       data = JSON.parse(ark.bytesData);
@@ -2112,6 +2228,71 @@ function renderArkElementHtml(ark) {
   }
   const prompt = data?.prompt || ark?.prompt || "[卡片消息]";
   return `<span class="inline-rich-card ark-element"><span class="rich-card-icon">卡</span><span class="rich-card-main"><strong>${escapeHtml(prompt)}</strong><small>Ark 卡片</small></span></span>`;
+}
+
+function renderNoticeElementHtml(notice) {
+  const text = noticeText(notice) || "群通知";
+  const title = noticeTitle(notice) || "群公告";
+  return `<span class="inline-rich-card notice-element"><span class="rich-card-icon">告</span><span class="rich-card-main"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(text)}</small></span></span>`;
+}
+
+function forwardElementFromRaw(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return (
+    raw.multiForwardMsgElement ||
+    raw.forwardElement ||
+    raw.mergedForwardElement ||
+    raw.multi_forward ||
+    raw.multiForward ||
+    raw.forward ||
+    raw.data?.multiForwardMsgElement ||
+    raw.data?.forwardElement ||
+    null
+  );
+}
+
+function noticeElementFromRaw(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const nested =
+    raw.groupAnnouncementElement ||
+    raw.announcementElement ||
+    raw.groupNoticeElement ||
+    raw.noticeElement ||
+    raw.notifyElement ||
+    raw.notificationElement ||
+    raw.operatorElement ||
+    raw.muteElement ||
+    raw.memberChangeElement ||
+    raw.essenceElement ||
+    raw.data?.groupAnnouncementElement ||
+    raw.data?.noticeElement ||
+    raw.data?.notice ||
+    raw.data?.notifyElement ||
+    raw.data?.notificationElement ||
+    null;
+  if (nested) return nested;
+  if (isNoticeLike(raw)) return raw;
+  return null;
+}
+
+function noticeTitle(notice) {
+  if (notice?.groupAnnouncementElement || notice?.announcementElement) return "群公告";
+  const type = noticeEventType(notice);
+  if (type.includes("upload")) return "群文件";
+  if (type.includes("ban") || type.includes("mute") || notice?.duration || notice?.shutUpTime) return "群禁言";
+  if (type.includes("recall") || type.includes("revoke")) return "消息撤回";
+  if (type.includes("announce") || type.includes("announcement")) return "群公告";
+  if (type.includes("admin")) return "管理员变更";
+  if (type.includes("increase") || type.includes("decrease") || type.includes("member")) return "群成员变更";
+  if (type.includes("poke") || type.includes("notify") || type.includes("honor")) return "群互动";
+  if (type.includes("essence")) return "精华消息";
+  if (type.includes("card")) return "群名片";
+  if (type.includes("title")) return "群头衔";
+  return notice?.title || notice?.name || "群通知";
+}
+
+function noticeText(notice) {
+  return structuredNoticeText(notice);
 }
 
 function renderForwardCardHtml(title, previews, summary, parsed = null) {
@@ -2191,6 +2372,13 @@ function parseForwardData(forward) {
 
 function parseArkForwardFromElement(ark) {
   let data = ark?.data || ark?.arkData || null;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      data = null;
+    }
+  }
   if (!data && ark?.bytesData) {
     try {
       data = JSON.parse(ark.bytesData);
@@ -2211,6 +2399,230 @@ function parseArkForwardData(data) {
     messages: normalizeForwardMessages(detail.news || []),
     resId: detail.resid || "",
   };
+}
+
+function structuredNoticeText(value) {
+  const notice = unwrapMessageElement(value);
+  if (!notice || typeof notice !== "object") return "";
+  const type = noticeEventType(notice);
+  const nested = [
+    notice.data,
+    notice.extra,
+    notice.detail,
+    notice.info,
+    notice.meta,
+    notice.groupAnnouncementElement,
+    notice.announcementElement,
+    notice.groupNoticeElement,
+    notice.noticeElement,
+    notice.notifyElement,
+    notice.notificationElement,
+    notice.muteElement,
+    notice.operatorElement,
+    notice.memberChangeElement,
+    notice.essenceElement,
+  ];
+  if (!isNoticeLike(notice)) {
+    const announcement = noticeAnnouncementText(notice);
+    if (announcement && (notice.title || notice.name || notice.subject || notice.announcement || notice.notice)) return announcement;
+    for (const item of nested) {
+      if (item && item !== notice) {
+        const found = structuredNoticeText(item);
+        if (found) return found;
+      }
+    }
+    return "";
+  }
+
+  const operator = noticeName(
+    notice,
+    ["operatorName", "operatorNick", "operator_name", "operator_nick", "operator", "adminName", "adminNick", "admin_name", "admin_nick", "senderName", "senderNick", "sender_name", "sender_nick"],
+    ["operator_id", "operatorId", "admin_id", "adminId", "sender_id", "senderId"],
+  );
+  const target = noticeName(
+    notice,
+    ["targetName", "targetNick", "target_name", "target_nick", "target", "memberName", "memberNick", "member_name", "member_nick", "userName", "nickname", "nick", "card", "cardName"],
+    ["user_id", "userId", "target_id", "targetId", "member_id", "memberId"],
+  );
+  const duration = firstRawNumber(notice, ["duration", "shutUpTime", "shut_up_time", "banTime", "ban_time", "muteTime", "mute_time"]);
+  if (type.includes("ban") || type.includes("mute") || duration) {
+    const who = target || "成员";
+    const isLift = type.includes("lift") || type.includes("unban") || type.includes("cancel") || Number(duration) === 0;
+    if (isLift) return `${operator || "管理员"} 解除了 ${who} 的禁言`;
+    const time = duration ? `（${formatNoticeDuration(duration)}）` : "";
+    return `${who} 被 ${operator || "管理员"} 禁言${time}`;
+  }
+  if (type.includes("recall") || type.includes("revoke")) {
+    const who = target || operator || "成员";
+    if (operator && target && !sameNoticeActor(operator, target)) return `${operator} 撤回了 ${target} 的一条消息`;
+    return `${who} 撤回了一条消息`;
+  }
+  if (type.includes("admin")) {
+    const who = target || "成员";
+    if (type.includes("unset") || type.includes("remove") || type.includes("delete")) return `${who} 被取消管理员`;
+    return `${who} 被设为管理员`;
+  }
+  if (type.includes("increase")) {
+    if (type.includes("invite")) return `${target || "成员"} 受 ${operator || "成员"} 邀请加入群聊`;
+    return `${target || "成员"} 加入群聊`;
+  }
+  if (type.includes("decrease")) {
+    if (type.includes("kick_me")) return "机器人被移出群聊";
+    if (type.includes("kick")) return `${target || "成员"} 被 ${operator || "管理员"} 移出群聊`;
+    return `${target || "成员"} 退出群聊`;
+  }
+  if (type.includes("upload")) {
+    const fileName = noticeFileName(notice);
+    return `${target || operator || "成员"} 上传了群文件${fileName ? `：${fileName}` : ""}`;
+  }
+  if (type.includes("poke")) return `${operator || "成员"} 戳了戳 ${target || "成员"}`;
+  if (type.includes("honor")) return `${target || "成员"} 获得群荣誉${firstTextValue(notice, ["honor_type", "honorType", "title"]) ? `：${firstTextValue(notice, ["honor_type", "honorType", "title"])}` : ""}`;
+  if (type.includes("essence")) {
+    if (type.includes("delete") || type.includes("remove")) return `${operator || "管理员"} 移除了精华消息`;
+    return `${operator || "管理员"} 设置了一条精华消息`;
+  }
+  if (type.includes("card")) return `${target || "成员"} 更新了群名片`;
+  if (type.includes("title")) return `${target || "成员"} 更新了群头衔`;
+  if (type.includes("friend_add")) return `${target || "用户"} 已添加好友`;
+
+  const announcement = noticeAnnouncementText(notice);
+  if (announcement) return announcement;
+  const direct = firstTextValue(notice, ["text", "content", "message", "summary", "prompt", "desc", "description", "wording", "tips", "tip"]);
+  if (direct) return direct;
+  for (const item of nested) {
+    if (item && item !== notice) {
+      const found = structuredNoticeText(item);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
+function isNoticeLike(value) {
+  if (!value || typeof value !== "object") return false;
+  if (value.grayTipElement || value.revokeElement || value.recallElement) return true;
+  if (value.post_type === "notice" || value.postType === "notice") return true;
+  if (value.notice_type !== undefined || value.noticeType !== undefined || value.sub_type !== undefined || value.subType !== undefined) return true;
+  if (
+    value.groupAnnouncementElement ||
+    value.announcementElement ||
+    value.groupNoticeElement ||
+    value.noticeElement ||
+    value.notifyElement ||
+    value.notificationElement ||
+    value.muteElement ||
+    value.operatorElement ||
+    value.memberChangeElement ||
+    value.essenceElement
+  ) {
+    return true;
+  }
+  const type = noticeEventType(value);
+  return /(announcement|announce|notice|notify|recall|revoke|ban|mute|admin|member|increase|decrease|upload|essence|poke|honor|card|title|group_)/.test(type);
+}
+
+function noticeEventType(notice) {
+  if (!notice || typeof notice !== "object") return "";
+  return [
+    notice.notice_type,
+    notice.noticeType,
+    notice.sub_type,
+    notice.subType,
+    notice.type,
+    notice.event,
+    notice.kind,
+    notice.action,
+    notice.operatorType,
+  ]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function noticeName(notice, nameKeys, idKeys) {
+  const named = firstTextValue(notice, nameKeys);
+  if (named) return named;
+  const id = firstRawString(notice, idKeys);
+  return id ? `QQ ${id}` : "";
+}
+
+function noticeAnnouncementText(notice) {
+  const title = firstTextValue(notice, ["title", "name", "subject"]);
+  const content = firstTextValue(notice, ["content", "text", "message", "announcement", "notice", "desc", "description"]);
+  if (title && content && title !== content) return `${title}：${content}`;
+  return content || title || "";
+}
+
+function noticeFileName(notice) {
+  return firstTextValue(notice, ["fileName", "file_name", "name"]) || firstTextValue(notice?.file, ["fileName", "file_name", "name"]);
+}
+
+function firstRawNumber(value, keys) {
+  const text = firstRawString(value, keys);
+  if (text === "") return 0;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function sameNoticeActor(a, b) {
+  const left = String(a || "").replace(/\D/g, "") || String(a || "").trim();
+  const right = String(b || "").replace(/\D/g, "") || String(b || "").trim();
+  return Boolean(left && right && left === right);
+}
+
+function firstTextValue(value, keys) {
+  if (!value || typeof value !== "object") return "";
+  for (const key of keys) {
+    const direct = value[key];
+    if (typeof direct === "string" || typeof direct === "number") {
+      const text = cleanNoticeText(direct);
+      if (text) return text;
+    } else if (Array.isArray(direct)) {
+      for (const item of direct) {
+        const text = typeof item === "object" ? firstTextValue(item, keys) : cleanNoticeText(item);
+        if (text) return text;
+      }
+    } else if (direct && typeof direct === "object") {
+      const text = firstTextValue(direct, keys);
+      if (text) return text;
+    }
+  }
+  for (const key of Object.keys(value)) {
+    if (!keys.some((name) => name.toLowerCase() === key.toLowerCase())) continue;
+    const direct = value[key];
+    if (typeof direct === "string" || typeof direct === "number") {
+      const text = cleanNoticeText(direct);
+      if (text) return text;
+    } else if (direct && typeof direct === "object") {
+      const text = firstTextValue(direct, keys);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function cleanNoticeText(value) {
+  const text = stripHtml(String(value ?? "")).replace(/\s+/g, " ").trim();
+  if (!text || /^[{}[\]",:]+$/.test(text)) return "";
+  if ((text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"))) {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") return "";
+    } catch {
+      // Keep non-JSON text that happens to use brackets.
+    }
+  }
+  return text.length > 180 ? `${text.slice(0, 180)}...` : text;
+}
+
+function formatNoticeDuration(value) {
+  const seconds = Number(value || 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "永久";
+  if (seconds < 60) return `${Math.floor(seconds)} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时`;
+  return `${Math.floor(seconds / 86400)} 天`;
 }
 
 function normalizeForwardMessages(items) {
@@ -2435,10 +2847,23 @@ function hasKnownMessageShape(value) {
     value.audioElement ||
     value.videoElement ||
     value.grayTipElement ||
-    value.replyElement ||
-    value.arkElement ||
-    value.multiForwardMsgElement ||
-    value.elementType !== undefined ||
+      value.replyElement ||
+      value.arkElement ||
+      value.multiForwardMsgElement ||
+      value.forwardElement ||
+      value.mergedForwardElement ||
+      value.multi_forward ||
+      value.groupAnnouncementElement ||
+      value.announcementElement ||
+      value.groupNoticeElement ||
+      value.noticeElement ||
+      value.notifyElement ||
+      value.notificationElement ||
+      value.elementType !== undefined ||
+      value.notice_type !== undefined ||
+      value.noticeType !== undefined ||
+      value.post_type !== undefined ||
+      value.postType !== undefined ||
     value.type !== undefined ||
     value.kind !== undefined,
   );
@@ -2463,6 +2888,35 @@ function expandMessageElements(value) {
     raw.message_obj?.message,
   ].filter(Array.isArray);
   if (arrays.length) return arrays.flatMap((items) => items.flatMap((item) => expandMessageElements(item)));
+  const single = [
+    raw.raw_message,
+    raw.notice,
+    raw.noticeElement,
+    raw.groupNoticeElement,
+    raw.groupAnnouncementElement,
+    raw.announcementElement,
+    raw.notifyElement,
+    raw.operatorElement,
+    raw.muteElement,
+    raw.memberChangeElement,
+    raw.essenceElement,
+    raw.notificationElement,
+    raw.forward,
+    raw.multiForward,
+    raw.mergedForwardElement,
+    raw.multi_forward,
+    raw.data?.notice,
+    raw.data?.raw_message,
+    raw.data?.forward,
+    raw.data?.notifyElement,
+    raw.data?.notificationElement,
+  ];
+  for (const item of single) {
+    if (item && typeof item === "object" && item !== raw) {
+      if (forwardElementFromRaw(raw) || noticeElementFromRaw(raw)) return [raw];
+      return [raw, ...expandMessageElements(item)];
+    }
+  }
   return [raw];
 }
 
@@ -2497,8 +2951,9 @@ function inferElementKind(raw, fallbackKind = "") {
   if (raw.pttElement || raw.voiceElement || raw.recordElement || raw.audioElement || elementTypeHint === 4 || kind.includes("record") || kind.includes("audio") || kind.includes("ptt") || kind.includes("voice")) return "audio";
   if (raw.fileElement || typeHint === 6 || elementTypeHint === 3 || kind.includes("file")) return "file";
   if (raw.faceElement || raw.marketFaceElement || typeHint === 3 || elementTypeHint === 6 || kind.includes("face") || kind.includes("emoji")) return "face";
-  if (raw.multiForwardMsgElement || elementTypeHint === 16) return "forward";
+  if (forwardElementFromRaw(raw) || elementTypeHint === 16 || kind.includes("forward") || kind.includes("multimsg")) return "forward";
   if (raw.arkElement || elementTypeHint === 10) return "ark";
+  if (noticeElementFromRaw(raw) || kind.includes("announcement") || kind.includes("notice") || kind.includes("notify")) return "notice";
   if (raw.atElement || raw.mentionElement || kind === "at" || kind.includes("mention")) return "mention";
   if (raw.textElement || raw.text || raw.content || raw.data?.text || kind === "plain" || kind === "text") return "text";
   return kind || fallback;
@@ -2613,9 +3068,10 @@ function formatDuration(seconds) {
 }
 
 function mediaSourceDisplayUrl(item) {
-  const source = normalizeQpicSource(firstMediaSource(item, ["inline_url", "source", "url", "relative_path", "relativePath", "localPath", "filePath", "path"]));
+  const source = normalizeQpicSource(firstMediaSource(item, ["inline_url", "source", "url", "relative_path", "relativePath", "local_path", "localPath", "file_path", "filePath", "path"]));
   if (!source) return "";
   if (/^(data:|blob:)/i.test(source)) return source;
+  if (isTemporaryMediaSource(source)) return "";
   if (source.startsWith("media/")) return pluginApiUrl(`file-proxy?path=${encodeURIComponent(source)}`);
   if (/^https?:\/\//i.test(source) && normalizeMediaKind(item.kind) === "image") return pluginApiUrl(`image-proxy?url=${encodeURIComponent(source)}`);
   if (/^https?:\/\//i.test(source) && ["video", "audio", "file"].includes(normalizeMediaKind(item.kind))) {
@@ -2779,8 +3235,11 @@ function rawElementText(element) {
   if (element.fileElement?.fileName) return `[文件: ${element.fileElement.fileName}]`;
   if (element.pttElement || element.voiceElement) return (element.pttElement || element.voiceElement).text || "[语音]";
   if (element.videoElement) return "[视频]";
-  if (element.multiForwardMsgElement) return parseForwardXml(element.multiForwardMsgElement.xmlContent).title || "[聊天记录]";
+  if (forwardElementFromRaw(element)) return parseForwardData(forwardElementFromRaw(element)).title || "[聊天记录]";
   if (element.arkElement) return "[卡片消息]";
+  if (noticeElementFromRaw(element)) return structuredNoticeText(noticeElementFromRaw(element));
+  const notice = structuredNoticeText(element);
+  if (notice) return notice;
   const typeHint = Number(element.type);
   const elementTypeHint = Number(element.elementType);
   const kind = inferElementKind(element);
@@ -2800,19 +3259,30 @@ function rawElements(raw) {
 
 function systemTipText(item) {
   const elements = [...rawElements(item?.raw), ...componentRawObjects(item?.components)].map(unwrapMessageElement);
-  const tips = elements.map((element) => grayTipText(element?.grayTipElement || element)).filter(Boolean);
-  if (!tips.length) return "";
-  const hasNonTip = elements.some((element) => !element?.grayTipElement && !element?.replyElement && !grayTipText(element));
-  return hasNonTip ? "" : tips.join(" ");
+  const tips = elements
+    .map((element) => grayTipText(element?.grayTipElement || element) || structuredNoticeText(element))
+    .filter(Boolean);
+  if (tips.length) {
+    const hasNonTip = elements.some((element) => {
+      if (element?.replyElement) return false;
+      if (element?.grayTipElement || grayTipText(element) || structuredNoticeText(element)) return false;
+      return !isMetadataOnlyElement(element);
+    });
+    if (!hasNonTip) return tips.join(" ");
+  }
+  if (isRecalledMessage(item)) return recallText(item) || "已撤回一条消息";
+  return "";
 }
 
 function grayTipText(grayTip) {
   if (!grayTip || typeof grayTip !== "object") return "";
+  const revokeText = recallText({ raw: grayTip });
+  if (revokeText) return revokeText;
   const jsonStr = grayTip.jsonGrayTipElement?.jsonStr || grayTip.jsonStr;
   if (jsonStr) {
     try {
       const parsed = JSON.parse(jsonStr);
-      const text = Array.isArray(parsed.items) ? parsed.items.map(grayTipItemText).join("") : "";
+      const text = Array.isArray(parsed.items) ? parsed.items.map(grayTipItemText).join("") : structuredNoticeText(parsed);
       if (text) return stripHtml(text);
     } catch {
       return "";
@@ -2828,11 +3298,64 @@ function grayTipItemText(item) {
   if (item.txt || item.text || item.content) return String(item.txt || item.text || item.content);
   if (item.name || item.nick || item.nickname) return String(item.name || item.nick || item.nickname);
   if (item.uid || item.uin) return String(item.uid || item.uin);
+  const nested = structuredNoticeText(item);
+  if (nested) return nested;
   return "";
 }
 
 function stripHtml(value) {
   return String(value || "").replace(/<[^>]+>/g, "").trim();
+}
+
+function recallText(item) {
+  const raw = item?.raw || item || {};
+  const elements = [raw, ...rawElements(raw), ...componentRawObjects(item?.components)].map(unwrapMessageElement);
+  for (const element of elements) {
+    const revoke = element?.grayTipElement?.revokeElement || element?.revokeElement || element?.recallElement || element?.recall;
+    if (revoke && typeof revoke === "object") {
+      const operator = firstTextValue(revoke, ["operatorName", "operatorNick", "operator", "senderName", "senderNick", "nick", "nickname"]);
+      const target = firstTextValue(revoke, ["targetName", "targetNick", "target", "authorName", "authorNick", "userName"]);
+      const who = target || operator || "成员";
+      return `${who} 撤回了一条消息`;
+    }
+    const type = String(element?.type || element?.notice_type || element?.sub_type || element?.event || "").toLowerCase();
+    if (type.includes("recall") || type.includes("revoke")) {
+      const text = structuredNoticeText(element);
+      if (text) return text;
+      const who = firstTextValue(element, ["operatorName", "operatorNick", "senderName", "senderNick", "targetName", "targetNick"]) || "成员";
+      return `${who} 撤回了一条消息`;
+    }
+  }
+  if (raw.recallTime || raw.msgStatus === "recalled" || raw.status === "recalled") return "已撤回一条消息";
+  return "";
+}
+
+function isMetadataOnlyElement(element) {
+  if (!element || typeof element !== "object") return true;
+  const keys = Object.keys(element);
+  if (!keys.length) return true;
+  return keys.every((key) =>
+    [
+      "msgId",
+      "msgSeq",
+      "msgRandom",
+      "msgTime",
+      "time",
+      "timestamp",
+      "senderUin",
+      "senderUid",
+      "senderNick",
+      "sendMemberName",
+      "sendNickName",
+      "peerUin",
+      "peerUid",
+      "chatType",
+      "message_type",
+      "platform",
+      "self_id",
+      "post_type",
+    ].includes(key),
+  );
 }
 
 function componentRawObjects(components) {
@@ -2844,19 +3367,45 @@ function isRecalledMessage(item) {
   const raw = item?.raw || {};
   if (raw.recallTime && String(raw.recallTime) !== "0") return true;
   if (raw.msgStatus === "recalled" || raw.status === "recalled") return true;
-  return [...rawElements(raw), ...componentRawObjects(item?.components)].some((element) => Boolean(element?.grayTipElement?.revokeElement || element?.revokeElement));
+  return [...rawElements(raw), ...componentRawObjects(item?.components)].some((element) => {
+    const rawElement = unwrapMessageElement(element);
+    const type = String(rawElement?.type || rawElement?.notice_type || rawElement?.sub_type || rawElement?.event || "").toLowerCase();
+    return Boolean(rawElement?.grayTipElement?.revokeElement || rawElement?.revokeElement || type.includes("recall") || type.includes("revoke"));
+  });
 }
 
 function replyInfo(item) {
   const all = [...rawElements(item?.raw), ...componentRawObjects(item?.components)].map(unwrapMessageElement);
-  const reply = all.find((element) => element?.replyElement)?.replyElement || item?.raw?.replyElement;
+  const holder = all.find((element) => replyPayload(element));
+  const reply = replyPayload(holder) || replyPayload(item?.raw);
   if (!reply || typeof reply !== "object") return null;
+  const sourceText = replyText(reply);
   return {
-    msgId: reply.replayMsgId || reply.replyMsgId || reply.msgId || "",
-    msgSeq: reply.replayMsgSeq || reply.replyMsgSeq || reply.msgSeq || "",
-    sender: reply.senderNick || reply.senderName || reply.sourceMsgSender || "",
-    text: reply.sourceMsgText || reply.text || reply.summary || "[消息]",
+    msgId: reply.replayMsgId || reply.replyMsgId || reply.msgId || reply.message_id || reply.id || "",
+    msgSeq: reply.replayMsgSeq || reply.replyMsgSeq || reply.msgSeq || reply.seq || "",
+    sender: replySender(reply),
+    text: sourceText || "[消息]",
   };
+}
+
+function replyPayload(element) {
+  if (!element || typeof element !== "object") return null;
+  return element.replyElement || element.reply || element.quoteElement || element.quote || element.quotedMessage || element.sourceMsg || element.sourceMessage || element.data?.reply || element.data?.quote || null;
+}
+
+function replyText(reply) {
+  if (!reply || typeof reply !== "object") return "";
+  const direct = firstTextValue(reply, ["sourceMsgText", "source_msg_text", "text", "summary", "content", "messageText", "message_text", "raw_message"]);
+  if (direct) return direct;
+  if (typeof reply.message === "string") return cleanNoticeText(reply.message);
+  return textFromRawElements(reply.sourceMsg || reply.sourceMessage || reply.elements || reply.messageChain || reply.message_chain || reply.message);
+}
+
+function replySender(reply) {
+  return (
+    firstTextValue(reply, ["senderNick", "senderName", "sourceMsgSender", "sender", "nick", "nickname", "userName", "card"]) ||
+    firstRawString(reply, ["sender_id", "senderId", "user_id", "userId", "uin", "uid"])
+  );
 }
 
 function replyTargetMessageKey(reply) {

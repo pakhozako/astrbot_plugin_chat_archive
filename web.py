@@ -69,8 +69,8 @@ class ChatArchiveWeb:
     async def messages(self):
         umo = str(request.query.get("umo", "") or "")
         q = str(request.query.get("q", "") or "")
-        before = int(request.query.get("before", 0, int) or 0)
-        limit = int(request.query.get("limit", self.page_size, int) or self.page_size)
+        before = self._bounded_int(request.query.get("before", ""), default=0, minimum=0)
+        limit = self._bounded_int(request.query.get("limit", ""), default=self.page_size, minimum=1, maximum=300)
         start_ts = self._optional_int(request.query.get("start_ts", ""))
         end_ts = self._optional_int(request.query.get("end_ts", ""))
         sender = str(request.query.get("sender", "") or "")
@@ -144,7 +144,7 @@ class ChatArchiveWeb:
     async def search_history(self):
         method = str(getattr(request, "method", "") or "").upper()
         if method == "GET":
-            limit = int(request.query.get("limit", 20, int) or 20)
+            limit = self._bounded_int(request.query.get("limit", ""), default=20, minimum=1, maximum=100)
             return json_response({"ok": True, "data": self.store.list_search_history(limit=limit)})
         body = await request.json(default={})
         if not isinstance(body, dict):
@@ -154,7 +154,7 @@ class ChatArchiveWeb:
         result = self.store.record_search_history(
             str(body.get("query") or ""),
             body.get("filters") if isinstance(body.get("filters"), dict) else {},
-            hit_count=int(body.get("hit_count") or 0),
+            hit_count=self._bounded_int(body.get("hit_count"), default=0, minimum=0, maximum=1_000_000),
         )
         return json_response({"ok": True, "data": result})
 
@@ -305,6 +305,18 @@ class ChatArchiveWeb:
             return int(float(value))
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _bounded_int(value, *, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            number = int(default)
+        if minimum is not None:
+            number = max(int(minimum), number)
+        if maximum is not None:
+            number = min(int(maximum), number)
+        return number
 
     @staticmethod
     def _optional_bool(value) -> bool:
