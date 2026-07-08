@@ -2329,7 +2329,25 @@ function renderOneBotSegmentHtml(raw) {
   if (segment.type === "at") return renderMentionHtml({ type: "at", data: segment.data });
   if (segment.type === "text") return renderScalarOrJsonHtml(segment.data.text ?? segment.data.content ?? segment.data.value ?? "");
   if (segment.type === "json") return renderOneBotJsonHtml(segment.data.data ?? segment.data.value ?? segment.data);
+  if (segment.type === "forward") return renderOneBotForwardHtml(segment.data);
   return null;
+}
+
+function renderOneBotForwardHtml(data) {
+  const id = String(data?.id || data?.resid || data?.res_id || data?.forward_id || "").trim();
+  const preview = id ? [`转发 ID: ${shortForwardId(id)}`] : [];
+  return renderForwardCardHtml("合并转发", preview, id ? "OneBot 合并转发" : "合并转发", {
+    title: "合并转发",
+    previews: preview,
+    summary: id ? "OneBot 合并转发" : "合并转发",
+    messages: [],
+    resId: id,
+  });
+}
+
+function shortForwardId(value) {
+  const text = String(value || "");
+  return text.length > 28 ? `${text.slice(0, 14)}...${text.slice(-8)}` : text;
 }
 
 function renderOneBotJsonHtml(value) {
@@ -3589,6 +3607,10 @@ function rawElementText(element) {
     if (oneBot.type === "at") return `@${oneBot.data.qq || oneBot.data.user_id || oneBot.data.uid || oneBot.data.uin || "成员"}`;
     if (oneBot.type === "text") return String(oneBot.data.text || oneBot.data.content || oneBot.data.value || "");
     if (oneBot.type === "json") return oneBotJsonPlainText(oneBot.data.data ?? oneBot.data.value ?? oneBot.data);
+    if (oneBot.type === "forward") {
+      const id = oneBot.data.id || oneBot.data.resid || oneBot.data.res_id || oneBot.data.forward_id || "";
+      return id ? `[合并转发] ${id}` : "[合并转发]";
+    }
   }
   if (element.textElement?.content) return String(element.textElement.content);
   if (element.textElement?.text) return String(element.textElement.text);
