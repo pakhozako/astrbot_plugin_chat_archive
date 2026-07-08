@@ -1803,6 +1803,8 @@ function messageBodyHtml(item) {
     .filter(Boolean)
     .join("");
   if (rendered) return rendered;
+  const genericJson = genericJsonMessageHtml(item);
+  if (genericJson) return genericJson;
   const plain = messagePlainText(item);
   if (skipInlineMedia && isMediaPlaceholderText(plain)) return "";
   return plain ? highlightText(plain, state.q) : "";
@@ -1993,11 +1995,11 @@ function renderComponentInlineHtml(component, options = {}) {
   if (noticeElementFromRaw(raw)) return renderNoticeElementHtml(noticeElementFromRaw(raw));
   if (raw.atElement || raw.mentionElement) return renderMentionHtml(raw.atElement || raw.mentionElement);
   if (raw.replyElement || raw.grayTipElement) return "";
-  if (raw.textElement?.content) return highlightText(raw.textElement.content, state.q);
-  if (raw.textElement?.text) return highlightText(raw.textElement.text, state.q);
-  if (raw.text) return highlightText(raw.text, state.q);
-  if (raw.data?.text) return highlightText(raw.data.text, state.q);
-  if (raw.content) return highlightText(raw.content, state.q);
+  if (raw.textElement?.content !== undefined) return renderScalarOrJsonHtml(raw.textElement.content);
+  if (raw.textElement?.text !== undefined) return renderScalarOrJsonHtml(raw.textElement.text);
+  if (raw.text !== undefined) return renderScalarOrJsonHtml(raw.text);
+  if (raw.data?.text !== undefined) return renderScalarOrJsonHtml(raw.data.text);
+  if (raw.content !== undefined) return renderScalarOrJsonHtml(raw.content);
   if (typeHint === 2 || elementTypeHint === 2) return renderPicElementHtml(raw, raw);
   if (typeHint === 3 || elementTypeHint === 6) return renderFaceHtml(raw);
   if (typeHint === 6 || elementTypeHint === 3) return renderFileElementHtml(raw);
@@ -2011,8 +2013,8 @@ function renderComponentInlineHtml(component, options = {}) {
   if (kind === "audio") return renderPttElementHtml(raw, raw);
   if (kind === "video") return renderVideoElementHtml(raw, raw);
   if (kind === "mention" || kind === "at") return renderMentionHtml(raw);
-  if (kind === "text") return highlightText(componentText(component), state.q);
-  return "";
+  if (kind === "text") return renderScalarOrJsonHtml(componentText(component));
+  return renderGenericJsonElementHtml(raw);
 }
 
 function isMediaElement(raw, kind = "", typeHint = NaN, elementTypeHint = NaN) {
@@ -2051,6 +2053,244 @@ function isMediaPlaceholderText(value) {
     .replace(/(?:^|[\\/])?media_(?:image|video|audio|record|file)_[a-f0-9-]+\.(?:gif|webp|png|jpe?g|mp4|mp3|wav|amr|silk)/gi, "")
     .replace(/[a-f0-9]{16,}\.(?:gif|webp|png|jpe?g|mp4|mp3|wav|amr|silk)/gi, "");
   return stripped.length === 0;
+}
+
+function renderScalarOrJsonHtml(value) {
+  const parsed = parseJsonCandidate(value);
+  if (parsed && typeof parsed === "object") {
+    const html = renderGenericJsonElementHtml(parsed);
+    if (html) return html;
+  }
+  return highlightText(value, state.q);
+}
+
+function genericJsonMessageHtml(item) {
+  const snippets = [];
+  const parsedText = parseJsonCandidate(item?.text);
+  if (parsedText && typeof parsedText === "object") {
+    const html = renderGenericJsonElementHtml(parsedText, { sourceLabel: "文本 JSON" });
+    if (html) snippets.push(html);
+  }
+  for (const component of messageElementObjects(item)) {
+    const raw = unwrapMessageElement(component.raw || component.data || component);
+    if (hasKnownRenderableElement(raw) || hasDirectHumanText(raw)) continue;
+    const html = renderGenericJsonElementHtml(raw, { sourceLabel: component.kind || "JSON" });
+    if (html) snippets.push(html);
+    if (snippets.length >= 3) break;
+  }
+  if (!snippets.length) {
+    for (const candidate of [item?.raw, item?.components]) {
+      const html = renderGenericJsonElementHtml(candidate);
+      if (html) {
+        snippets.push(html);
+        break;
+      }
+    }
+  }
+  return snippets.join("");
+}
+
+function hasKnownRenderableElement(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  return Boolean(
+    raw.picElement ||
+      raw.imageElement ||
+      raw.faceElement ||
+      raw.mfaceElement ||
+      raw.marketFaceElement ||
+      raw.market_face ||
+      raw.fileElement ||
+      raw.pttElement ||
+      raw.voiceElement ||
+      raw.recordElement ||
+      raw.audioElement ||
+      raw.videoElement ||
+      raw.atElement ||
+      raw.mentionElement ||
+      raw.replyElement ||
+      raw.grayTipElement ||
+      raw.arkElement ||
+      forwardElementFromRaw(raw) ||
+      noticeElementFromRaw(raw),
+  );
+}
+
+function hasDirectHumanText(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  const values = [raw.textElement?.content, raw.textElement?.text, raw.text, raw.data?.text, raw.content, raw.message];
+  return values.some((value) => {
+    if (value === undefined || value === null || typeof value === "object") return false;
+    const text = String(value).trim();
+    return Boolean(text && !isJsonLikeText(text));
+  });
+}
+
+function renderGenericJsonElementHtml(value, options = {}) {
+  const parsed = parseJsonCandidate(value) || value;
+  if (!parsed || typeof parsed !== "object") return "";
+  if (isMetadataOnlyElement(parsed)) return "";
+  const summary = summarizeJsonValue(parsed, options);
+  if (!summary || !summary.fields.length) return "";
+  return `
+    <span class="inline-rich-card json-element">
+      <span class="rich-card-icon">JSON</span>
+      <span class="rich-card-main">
+        <strong>${escapeHtml(summary.title)}</strong>
+        <small>${escapeHtml(summary.subtitle)}</small>
+        <span class="json-field-list">
+          ${summary.fields.map((field) => `<span><b>${escapeHtml(field.key)}</b><em>${escapeHtml(field.value)}</em></span>`).join("")}
+        </span>
+      </span>
+    </span>
+  `;
+}
+
+function summarizeJsonValue(value, options = {}) {
+  const normalized = normalizeJsonForRender(value);
+  if (!normalized || typeof normalized !== "object") return null;
+  const arrayValue = Array.isArray(normalized);
+  const title =
+    jsonFieldText(normalized, ["title", "name", "app", "custom_type", "customType", "type", "notice_type", "noticeType", "post_type", "postType", "event", "kind", "action", "cmd"]) ||
+    options.sourceLabel ||
+    (arrayValue ? "JSON 数组" : "JSON 消息");
+  const subtitle =
+    jsonFieldText(normalized, ["summary", "prompt", "desc", "description", "content", "text", "message", "wording"]) ||
+    (arrayValue ? `${normalized.length} 项` : `${Object.keys(normalized).length} 个字段`);
+  const fields = jsonPreviewFields(normalized);
+  return { title, subtitle, fields };
+}
+
+function normalizeJsonForRender(value) {
+  const parsed = parseJsonCandidate(value) || value;
+  if (!parsed || typeof parsed !== "object") return null;
+  return parsed;
+}
+
+function parseJsonCandidate(value) {
+  if (value && typeof value === "object") return value;
+  if (!isJsonLikeText(value)) return null;
+  try {
+    const parsed = JSON.parse(String(value).trim());
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isJsonLikeText(value) {
+  const text = String(value ?? "").trim();
+  if (text.length < 2) return false;
+  return (text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"));
+}
+
+function jsonFieldText(value, keys) {
+  if (!value || typeof value !== "object") return "";
+  for (const key of keys) {
+    const found = jsonValueAtKey(value, key);
+    if (found !== undefined) {
+      const text = jsonPreviewValue(found);
+      if (text && !isJsonLikeText(text)) return text;
+    }
+  }
+  return "";
+}
+
+function jsonValueAtKey(value, key) {
+  if (!value || typeof value !== "object") return undefined;
+  if (Object.prototype.hasOwnProperty.call(value, key)) return value[key];
+  const lower = String(key).toLowerCase();
+  const matched = Object.keys(value).find((candidate) => candidate.toLowerCase() === lower);
+  return matched ? value[matched] : undefined;
+}
+
+function jsonPreviewFields(value) {
+  if (Array.isArray(value)) {
+    return value.slice(0, 4).map((item, index) => ({ key: `#${index + 1}`, value: jsonPreviewValue(item) || jsonTypeLabel(item) }));
+  }
+  const priority = [
+    "post_type",
+    "postType",
+    "custom_type",
+    "customType",
+    "message_type",
+    "messageType",
+    "notice_type",
+    "noticeType",
+    "sub_type",
+    "subType",
+    "type",
+    "kind",
+    "event",
+    "action",
+    "app",
+    "sender_id",
+    "senderId",
+    "user_id",
+    "userId",
+    "group_id",
+    "groupId",
+    "operator_id",
+    "operatorId",
+    "target_id",
+    "targetId",
+    "title",
+    "summary",
+    "prompt",
+    "content",
+    "text",
+    "message",
+  ];
+  const orderedKeys = [
+    ...priority.filter((key) => jsonValueAtKey(value, key) !== undefined),
+    ...Object.keys(value).filter((key) => !priority.some((item) => item.toLowerCase() === key.toLowerCase())),
+  ];
+  const fields = [];
+  const seen = new Set();
+  for (const key of orderedKeys) {
+    const actualKey = Object.keys(value).find((candidate) => candidate.toLowerCase() === String(key).toLowerCase()) || key;
+    if (seen.has(actualKey) || isHiddenJsonPreviewKey(actualKey)) continue;
+    seen.add(actualKey);
+    const preview = jsonPreviewValue(value[actualKey]);
+    if (!preview) continue;
+    fields.push({ key: actualKey, value: preview });
+    if (fields.length >= 5) break;
+  }
+  return fields;
+}
+
+function isHiddenJsonPreviewKey(key) {
+  return /^(raw|raw_json|components|components_json|meta_json)$/i.test(String(key || ""));
+}
+
+function jsonPreviewValue(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") {
+    const text = stripHtml(value).replace(/\s+/g, " ").trim();
+    if (!text) return "";
+    if (isJsonLikeText(text)) {
+      const parsed = parseJsonCandidate(text);
+      return parsed ? jsonTypeLabel(parsed) : truncateText(text, 80);
+    }
+    return truncateText(text, 96);
+  }
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `${value.length} 项数组`;
+  if (typeof value === "object") {
+    const text = jsonFieldText(value, ["title", "name", "summary", "prompt", "text", "content", "message", "type", "kind"]);
+    return text || `${Object.keys(value).length} 个字段`;
+  }
+  return truncateText(String(value), 80);
+}
+
+function jsonTypeLabel(value) {
+  if (Array.isArray(value)) return `${value.length} 项数组`;
+  if (value && typeof value === "object") return `${Object.keys(value).length} 个字段`;
+  return typeof value;
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value ?? "").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 
