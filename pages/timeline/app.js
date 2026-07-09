@@ -60,6 +60,8 @@ const state = {
 const demoMessages = buildDemoMessages();
 const imageDataCache = new Map();
 const imageDataInFlight = new Map();
+const forwardDataCache = new Map();
+const forwardDataInFlight = new Map();
 const IMAGE_LOAD_TIMEOUT_MS = 12000;
 const IMAGE_DATA_FALLBACK_TIMEOUT_MS = 5000;
 
@@ -1213,7 +1215,7 @@ function renderMessage(item, group, active = false) {
     const forwardTarget = event.target?.closest?.("[data-forward-preview]");
     if (forwardTarget) {
       const forward = getForwardPreview(forwardTarget.dataset.forwardPreview || "");
-      if (forward) openForwardViewer(forward);
+      if (forward) openForwardViewer(forward).catch(() => {});
       return;
     }
     const action = event.target?.closest?.("[data-action]")?.dataset.action;
@@ -2764,9 +2766,11 @@ function noticeText(notice) {
 }
 
 function renderForwardCardHtml(title, previews, summary, parsed = null) {
-  const previewKey = registerForwardPreview(parsed || { title, previews, summary, messages: [] });
+  const preview = parsed || { title, previews, summary, messages: [] };
+  const previewKey = registerForwardPreview(preview);
+  const forwardId = previewForwardId(preview);
   return `
-    <button class="forward-card" type="button" data-forward-preview="${escapeAttr(previewKey)}" aria-label="预览合并转发">
+    <button class="forward-card" type="button" data-forward-preview="${escapeAttr(previewKey)}"${forwardId ? ` data-forward-id="${escapeAttr(forwardId)}"` : ""} aria-label="预览合并转发">
       <strong>${escapeHtml(title || "[聊天记录]")}</strong>
       ${previews.map((preview) => `<span>${escapeHtml(preview)}</span>`).join("")}
       <small>${escapeHtml(summary || "合并转发")}</small>
@@ -2786,11 +2790,35 @@ function getForwardPreview(key) {
   return state.forwardPreview.get(String(key || "")) || null;
 }
 
+function normalizeForwardPreviewPayload(value) {
+  if (!value || typeof value !== "object") return null;
+  const messages = normalizeForwardMessages(value.messages || []);
+  const previews = Array.isArray(value.previews)
+    ? value.previews.map((item) => String(item || "").trim()).filter(Boolean)
+    : messages.map((item) => `${item.sender}: ${item.text}`).slice(0, 5);
+  return {
+    title: value.title || "[聊天记录]",
+    previews,
+    summary: value.summary || (messages.length ? `${messages.length} 条消息` : "合并转发"),
+    messages,
+    resId: previewForwardId(value),
+    forward_id: previewForwardId(value),
+    messageCount: Number(value.message_count || value.messageCount || messages.length || 0),
+    hasCachedMessages: Boolean(value.has_cached_messages || messages.length),
+  };
+}
+
+function previewForwardId(parsed) {
+  return String(parsed?.forward_id || parsed?.forwardId || parsed?.resId || parsed?.resid || parsed?.res_id || "").trim();
+}
+
 function stableForwardPreviewKey(parsed) {
+  const forwardId = previewForwardId(parsed);
+  if (forwardId) return `fwid-${forwardId}`;
   const raw = JSON.stringify({
     title: parsed?.title || "",
     summary: parsed?.summary || "",
-    resId: parsed?.resId || "",
+    resId: forwardId,
     previews: parsed?.previews || [],
     messages: (parsed?.messages || []).map((item) => ({
       id: item.id || "",
@@ -2808,7 +2836,7 @@ function stableForwardPreviewKey(parsed) {
 }
 
 function forwardPreviewsFromMessage(item) {
-  const result = [];
+  const result = (Array.isArray(item?.forward_previews) ? item.forward_previews : []).map(normalizeForwardPreviewPayload).filter(Boolean);
   for (const element of messageElementObjects(item)) {
     const raw = unwrapMessageElement(element.raw || element);
     if (raw?.multiForwardMsgElement) result.push(parseForwardData(raw.multiForwardMsgElement));
@@ -2835,6 +2863,7 @@ function parseForwardData(forward) {
     previews: parsed.previews.length ? parsed.previews : messages.map((item) => `${item.sender}: ${item.text}`).slice(0, 5),
     summary: parsed.summary || forward?.summary || (messages.length ? `${messages.length} 条消息` : "合并转发"),
     messages,
+    resId: forward?.resId || forward?.resid || forward?.res_id || forward?.id || forward?.forward_id || "",
   };
 }
 
@@ -3161,32 +3190,72 @@ function renderForwardSegmentHtml(segment) {
   return highlightText(forwardSegmentText(segment), state.q);
 }
 
-function openForwardViewer(parsed) {
-  if (!els.forwardViewer || !els.forwardViewerBody) return;
-  els.forwardViewerTitle.textContent = parsed.title || "合并转发";
+async function fetchForwardPreview(forwardId) {
+  const id = String(forwardId || "").trim();
+  if (!id || !bridgeAvailable || !bridge?.apiGet) return null;
+  if (forwardDataCache.has(id)) return forwardDataCache.get(id);
+  if (!forwardDataInFlight.has(id)) {
+    forwardDataInFlight.set(
+      id,
+      apiGet("/forward-preview", { id })
+        .then((data) => {
+          const normalized = normalizeForwardPreviewPayload(data);
+          if (normalized) forwardDataCache.set(id, normalized);
+          return normalized;
+        })
+        .catch(() => null)
+        .finally(() => forwardDataInFlight.delete(id)),
+    );
+  }
+  return forwardDataInFlight.get(id);
+}
+
+function renderForwardViewerBody(parsed, loading = false) {
   const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-  els.forwardViewerBody.innerHTML = messages.length
-    ? messages
-        .map((item) => `
-          <article class="forward-message">
-            <header><strong>${escapeHtml(item.sender || "未知用户")}</strong>${item.time ? `<span>${escapeHtml(formatForwardTime(item.time))}</span>` : ""}</header>
-            <div class="forward-segments">
-              ${
-                Array.isArray(item.segments) && item.segments.length
-                  ? item.segments.map(renderForwardSegmentHtml).filter(Boolean).join("")
-                  : highlightText(item.text || "[消息]", state.q)
-              }
-            </div>
-          </article>
-        `)
-        .join("")
-    : `
-      <div class="forward-preview-list">
-        ${(parsed.previews || []).map((preview) => `<p>${escapeHtml(preview)}</p>`).join("") || `<p>${escapeHtml(parsed.summary || "该合并转发只有摘要，原始消息正文未随归档保存。")}</p>`}
-      </div>
-    `;
+  if (messages.length) {
+    return messages
+      .map((item) => `
+        <article class="forward-message">
+          <header><strong>${escapeHtml(item.sender || "未知用户")}</strong>${item.time ? `<span>${escapeHtml(formatForwardTime(item.time))}</span>` : ""}</header>
+          <div class="forward-segments">
+            ${
+              Array.isArray(item.segments) && item.segments.length
+                ? item.segments.map(renderForwardSegmentHtml).filter(Boolean).join("")
+                : highlightText(item.text || "[消息]", state.q)
+            }
+          </div>
+        </article>
+      `)
+      .join("");
+  }
+  const note = loading ? "正在读取归档缓存..." : parsed.resId ? "该合并转发当前只有摘要；如果后端之后补到 get_forward_msg 节点，会自动在这里展开。" : "该合并转发只有摘要，原始消息正文未随归档保存。";
+  return `
+    <div class="forward-preview-list">
+      ${(parsed.previews || []).map((preview) => `<p>${escapeHtml(preview)}</p>`).join("") || `<p>${escapeHtml(parsed.summary || note)}</p>`}
+      <small>${escapeHtml(note)}</small>
+    </div>
+  `;
+}
+
+async function openForwardViewer(parsed) {
+  if (!els.forwardViewer || !els.forwardViewerBody) return;
+  const initial = normalizeForwardPreviewPayload(parsed) || parsed;
+  els.forwardViewerTitle.textContent = initial.title || "合并转发";
+  const hasMessages = Array.isArray(initial.messages) && initial.messages.length;
+  els.forwardViewerBody.innerHTML = renderForwardViewerBody(initial, !hasMessages && Boolean(initial.resId));
   bindForwardViewerInteractions();
   els.forwardViewer.hidden = false;
+  if (hasMessages || !initial.resId) return;
+  const cached = await fetchForwardPreview(initial.resId);
+  if (!cached || els.forwardViewer.hidden) {
+    els.forwardViewerBody.innerHTML = renderForwardViewerBody(initial, false);
+    bindForwardViewerInteractions();
+    return;
+  }
+  state.forwardPreview.set(stableForwardPreviewKey(cached), cached);
+  els.forwardViewerTitle.textContent = cached.title || initial.title || "合并转发";
+  els.forwardViewerBody.innerHTML = renderForwardViewerBody(cached, false);
+  bindForwardViewerInteractions();
 }
 
 function bindForwardViewerInteractions() {
@@ -3229,7 +3298,7 @@ function handleForwardViewerClick(event) {
   const forwardTarget = event.target?.closest?.("[data-forward-preview]");
   if (forwardTarget?.dataset.forwardPreview) {
     const forward = getForwardPreview(forwardTarget.dataset.forwardPreview);
-    if (forward) openForwardViewer(forward);
+    if (forward) openForwardViewer(forward).catch(() => {});
   }
 }
 

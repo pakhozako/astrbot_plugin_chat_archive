@@ -4,8 +4,10 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import html
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -23,6 +25,11 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+try:
+    from astrbot.api import logger
+except ModuleNotFoundError:
+    logger = logging.getLogger(__name__)
 
 
 MEDIA_COMPONENT_TYPES = {"image", "video", "record", "file"}
@@ -65,7 +72,9 @@ class ArchiveConfig:
     remote_media_timeout_seconds: float = 10.0
     allow_private_remote_media: bool = False
     proxy_remote_media: bool = True
-    remote_media_allowed_hosts: tuple[str, ...] = tuple(sorted(REMOTE_MEDIA_ALLOWED_HOSTS))
+    remote_media_allowed_hosts: tuple[str, ...] = tuple(
+        sorted(REMOTE_MEDIA_ALLOWED_HOSTS)
+    )
     max_storage_mb: float | None = None
     batch_size: int = DEFAULT_BATCH_SIZE
     flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS
@@ -202,6 +211,28 @@ class ChatArchiveStore:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS forward_archives (
+                    forward_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    summary TEXT,
+                    preview_json TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS forward_refs (
+                    forward_id TEXT NOT NULL,
+                    message_uid TEXT NOT NULL,
+                    platform TEXT,
+                    umo TEXT,
+                    session_id TEXT,
+                    message_id TEXT,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(forward_id, message_uid),
+                    FOREIGN KEY(forward_id) REFERENCES forward_archives(forward_id) ON DELETE CASCADE,
+                    FOREIGN KEY(message_uid) REFERENCES messages(message_uid) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -246,6 +277,9 @@ class ChatArchiveStore:
                 CREATE INDEX IF NOT EXISTS idx_media_message ON media(message_uid);
                 CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind);
                 CREATE INDEX IF NOT EXISTS idx_media_hash ON media(hash);
+                CREATE INDEX IF NOT EXISTS idx_forward_archives_updated ON forward_archives(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_forward_refs_message ON forward_refs(message_uid);
+                CREATE INDEX IF NOT EXISTS idx_forward_refs_forward ON forward_refs(forward_id);
                 CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag_id);
                 CREATE INDEX IF NOT EXISTS idx_search_history_updated ON search_history(updated_at DESC);
                 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
@@ -266,11 +300,35 @@ class ChatArchiveStore:
             )
             self._ensure_column(conn, "messages", "timestamp", "INTEGER")
             self._ensure_column(conn, "media", "hash", "TEXT")
-            conn.execute("UPDATE messages SET timestamp = created_at WHERE timestamp IS NULL")
+            self._ensure_column(conn, "forward_archives", "title", "TEXT")
+            self._ensure_column(conn, "forward_archives", "summary", "TEXT")
+            self._ensure_column(
+                conn, "forward_archives", "preview_json", "TEXT NOT NULL DEFAULT '[]'"
+            )
+            self._ensure_column(
+                conn, "forward_archives", "payload_json", "TEXT NOT NULL DEFAULT '{}'"
+            )
+            self._ensure_column(
+                conn, "forward_archives", "message_count", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                conn, "forward_archives", "created_at", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                conn, "forward_archives", "updated_at", "INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "UPDATE messages SET timestamp = created_at WHERE timestamp IS NULL"
+            )
 
     @staticmethod
-    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-        existing = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    def _ensure_column(
+        conn: sqlite3.Connection, table: str, column: str, definition: str
+    ) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
@@ -288,7 +346,9 @@ class ChatArchiveStore:
         )
 
     @staticmethod
-    def _get_meta_locked(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    def _get_meta_locked(
+        conn: sqlite3.Connection, key: str, default: Any = None
+    ) -> Any:
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         if not row:
             return default
@@ -300,7 +360,13 @@ class ChatArchiveStore:
     async def store_event(self, event: Any) -> str:
         payload = await self._event_payload(event)
         message_uid = payload["message_uid"]
-        media_rows = await self._extract_media(payload["components"], payload.get("raw"), message_uid, payload["created_at"], capture_files=False)
+        media_rows = await self._extract_media(
+            payload["components"],
+            payload.get("raw"),
+            message_uid,
+            payload["created_at"],
+            capture_files=False,
+        )
         payload["media_count"] = len(media_rows)
 
         entry = {
@@ -309,6 +375,8 @@ class ChatArchiveStore:
             "fallback_logged": False,
         }
         async with self._batch_lock:
+            # Pending WAL is the durable handoff: append and fsync before the
+            # in-memory queue can be flushed to SQLite, so restarts can replay it.
             entry["seq"] = self._next_pending_sequence()
             entry["queued_at"] = int(time.time())
             self.append_pending(entry)
@@ -358,6 +426,9 @@ class ChatArchiveStore:
                 "media": [dict(row) for row in entry.get("media") or []],
                 "favorite": False,
                 "tags": [],
+                "forward_previews": self._summarize_forward_archives(
+                    self._extract_forward_archives(payload)
+                ),
             }
             messages.append(item)
         return messages
@@ -370,7 +441,13 @@ class ChatArchiveStore:
             if not uid:
                 continue
             by_uid[uid] = item
-        return sorted(by_uid.values(), key=lambda item: (int(item.get("created_at") or 0), int(item.get("id") or 0)))
+        return sorted(
+            by_uid.values(),
+            key=lambda item: (
+                int(item.get("created_at") or 0),
+                int(item.get("id") or 0),
+            ),
+        )
 
     async def replay_fallback_log(self) -> dict[str, Any]:
         if not self.fallback_path.exists() or self.fallback_path.stat().st_size <= 0:
@@ -391,7 +468,9 @@ class ChatArchiveStore:
 
         archive_path = self._archive_fallback_file()
         if failed_entries:
-            self._append_fallback(failed_entries, RuntimeError("fallback replay failed"))
+            self._append_fallback(
+                failed_entries, RuntimeError("fallback replay failed")
+            )
         return {
             "attempted": attempted,
             "replayed": replayed,
@@ -404,10 +483,17 @@ class ChatArchiveStore:
 
     async def replay_pending(self) -> dict[str, Any]:
         if not self.pending_path.exists() or self.pending_path.stat().st_size <= 0:
-            return {"attempted": 0, "replayed": 0, "failed": 0, "archive_path": None, "cleared": True}
+            return {
+                "attempted": 0,
+                "replayed": 0,
+                "failed": 0,
+                "archive_path": None,
+                "cleared": True,
+                "corrupt": 0,
+            }
 
         async with self._batch_lock:
-            entries = self._read_pending_entries(self.pending_path)
+            entries, corrupt_entries = self._read_pending_entries(self.pending_path)
             attempted = len(entries)
             replayed = 0
             failed_entries: list[dict[str, Any]] = []
@@ -415,6 +501,9 @@ class ChatArchiveStore:
             try:
                 replayed = self._write_entries(entries)
             except Exception:
+                logger.exception(
+                    "Chat Archive pending replay batch failed; retrying per entry"
+                )
                 replayed = 0
                 failed_entries = []
                 # Keep the normal path batched. Only fall back to per-entry replay
@@ -423,12 +512,22 @@ class ChatArchiveStore:
                     try:
                         replayed += self._write_entries([entry])
                     except Exception as exc:
+                        logger.exception(
+                            "Chat Archive pending replay entry failed: seq=%s message_uid=%s",
+                            entry.get("seq", entry.get("sequence")),
+                            (entry.get("payload") or {}).get("message_uid"),
+                        )
                         failed = dict(entry)
                         failed["replay_error"] = str(exc)
                         failed_entries.append(failed)
 
             if failed_entries:
-                self._append_fallback(failed_entries, RuntimeError("pending replay failed"))
+                self._append_fallback(
+                    failed_entries, RuntimeError("pending replay failed")
+                )
+            corrupt_archive_path = self._archive_corrupt_pending_entries(
+                corrupt_entries
+            )
             archive_path = self._archive_pending_file()
             self._pending_sequence = self._load_pending_sequence()
             return {
@@ -437,22 +536,52 @@ class ChatArchiveStore:
                 "failed": len(failed_entries),
                 "archive_path": str(archive_path) if archive_path else None,
                 "cleared": not self.pending_path.exists(),
+                "corrupt": len(corrupt_entries),
+                "corrupt_archive_path": str(corrupt_archive_path)
+                if corrupt_archive_path
+                else None,
             }
 
-    def _read_pending_entries(self, path: Path) -> list[dict[str, Any]]:
+    def _read_pending_entries(
+        self, path: Path
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         entries: list[dict[str, Any]] = []
+        corrupt_entries: list[dict[str, Any]] = []
         with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            for line_number, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     record = json.loads(line)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as exc:
+                    corrupt_entries.append(
+                        {
+                            "line": line_number,
+                            "error": str(exc),
+                            "raw": line,
+                        }
+                    )
+                    continue
+                if not isinstance(record, dict):
+                    corrupt_entries.append(
+                        {
+                            "line": line_number,
+                            "error": "pending record is not an object",
+                            "raw": line,
+                        }
+                    )
                     continue
                 payload = record.get("payload")
                 media = record.get("media") or []
                 if not isinstance(payload, dict) or not isinstance(media, list):
+                    corrupt_entries.append(
+                        {
+                            "line": line_number,
+                            "error": "pending record missing payload/media",
+                            "raw": line,
+                        }
+                    )
                     continue
                 entry = {
                     "payload": payload,
@@ -464,7 +593,13 @@ class ChatArchiveStore:
                 if "queued_at" in record:
                     entry["queued_at"] = record.get("queued_at")
                 entries.append(entry)
-        return entries
+        if corrupt_entries:
+            logger.warning(
+                "Chat Archive found %s corrupt pending WAL lines in %s",
+                len(corrupt_entries),
+                path,
+            )
+        return entries, corrupt_entries
 
     def _read_fallback_entries(self, path: Path) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
@@ -481,21 +616,50 @@ class ChatArchiveStore:
                     payload = item.get("payload")
                     media = item.get("media") or []
                     if isinstance(payload, dict) and isinstance(media, list):
-                        entries.append({"payload": payload, "media": media, "fallback_logged": False})
+                        entries.append(
+                            {
+                                "payload": payload,
+                                "media": media,
+                                "fallback_logged": False,
+                            }
+                        )
         return entries
 
     def _archive_fallback_file(self) -> Path | None:
         if not self.fallback_path.exists():
             return None
-        archive_path = self.fallback_path.with_name(f"{self.fallback_path.stem}.{int(time.time())}.replayed.jsonl")
+        archive_path = self.fallback_path.with_name(
+            f"{self.fallback_path.stem}.{int(time.time())}.replayed.jsonl"
+        )
         self.fallback_path.replace(archive_path)
         return archive_path
 
     def _archive_pending_file(self) -> Path | None:
         if not self.pending_path.exists():
             return None
-        archive_path = self.pending_path.with_name(f"{self.pending_path.stem}.{int(time.time())}.replayed.jsonl")
+        archive_path = self.pending_path.with_name(
+            f"{self.pending_path.stem}.{int(time.time())}.replayed.jsonl"
+        )
         self.pending_path.replace(archive_path)
+        return archive_path
+
+    def _archive_corrupt_pending_entries(
+        self, corrupt_entries: list[dict[str, Any]]
+    ) -> Path | None:
+        if not corrupt_entries:
+            return None
+        archive_path = self.pending_path.with_name(
+            f"{self.pending_path.stem}.{int(time.time())}.corrupt.jsonl"
+        )
+        with archive_path.open("w", encoding="utf-8") as f:
+            for item in corrupt_entries:
+                f.write(_json_dumps(item) + "\n")
+            f.flush()
+            if self.config.durable_write:
+                os.fsync(f.fileno())
+        logger.warning(
+            "Chat Archive archived corrupt pending WAL lines: %s", archive_path
+        )
         return archive_path
 
     def _schedule_flush_locked(self) -> None:
@@ -514,6 +678,8 @@ class ChatArchiveStore:
             await self.flush_pending()
         except asyncio.CancelledError:
             return
+        except Exception:
+            logger.exception("Chat Archive scheduled flush failed")
 
     async def _flush_locked(self) -> int:
         if not self._batch_queue:
@@ -522,6 +688,9 @@ class ChatArchiveStore:
         try:
             written = self._write_entries(entries)
         except Exception as exc:
+            logger.exception(
+                "Chat Archive batch flush failed; entries moved to fallback log"
+            )
             self._append_fallback(entries, exc)
             return 0
         del self._batch_queue[: len(entries)]
@@ -544,7 +713,10 @@ class ChatArchiveStore:
                     except json.JSONDecodeError:
                         continue
                     try:
-                        max_sequence = max(max_sequence, int(record.get("seq", record.get("sequence")) or 0))
+                        max_sequence = max(
+                            max_sequence,
+                            int(record.get("seq", record.get("sequence")) or 0),
+                        )
                     except (TypeError, ValueError):
                         continue
         except OSError:
@@ -558,9 +730,13 @@ class ChatArchiveStore:
             "payload": entry["payload"],
             "media": entry["media"],
         }
-        self._write_jsonl_record(self.pending_path, record, durable=self.config.durable_write)
+        self._write_jsonl_record(
+            self.pending_path, record, durable=self.config.durable_write
+        )
 
     def remove_pending(self, entries: list[dict[str, Any]]) -> None:
+        # Rewriting the WAL preserves unknown/corrupt lines instead of deleting
+        # them, so successful flushes never erase data we did not understand.
         seqs = {
             int(entry.get("seq", entry.get("sequence")))
             for entry in entries
@@ -685,7 +861,11 @@ class ChatArchiveStore:
                             payload["created_at"],
                         ),
                     )
-                    if row.get("hash") and row.get("local_path") and row.get("relative_path"):
+                    if (
+                        row.get("hash")
+                        and row.get("local_path")
+                        and row.get("relative_path")
+                    ):
                         conn.execute(
                             """
                             INSERT INTO media_blobs (
@@ -706,6 +886,9 @@ class ChatArchiveStore:
                                 payload["stored_at"],
                             ),
                         )
+                forward_archives = self._extract_forward_archives(payload)
+                if forward_archives:
+                    self._write_forward_archives_locked(conn, payload, forward_archives)
                 record = dict(payload)
                 record["media"] = media_rows
                 records_to_append.append(record)
@@ -730,12 +913,16 @@ class ChatArchiveStore:
                 for entry in failed
             ],
         }
-        self._write_jsonl_record(self.fallback_path, record, durable=self.config.durable_write)
+        self._write_jsonl_record(
+            self.fallback_path, record, durable=self.config.durable_write
+        )
         for entry in failed:
             entry["fallback_logged"] = True
 
     @staticmethod
-    def _write_jsonl_record(path: Path, record: dict[str, Any], *, durable: bool) -> None:
+    def _write_jsonl_record(
+        path: Path, record: dict[str, Any], *, durable: bool
+    ) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(_json_dumps(record) + "\n")
             f.flush()
@@ -751,11 +938,20 @@ class ChatArchiveStore:
         raw = self._safe_jsonable(getattr(message_obj, "raw_message", None))
         sender = getattr(message_obj, "sender", None)
         created_at = int(getattr(message_obj, "timestamp", 0) or time.time())
-        message_id = str(getattr(message_obj, "message_id", "") or getattr(event, "message_id", "") or "")
+        message_id = str(
+            getattr(message_obj, "message_id", "")
+            or getattr(event, "message_id", "")
+            or ""
+        )
         if not message_id:
             message_id = self._stable_adapter_message_id(raw)
         umo = str(getattr(event, "unified_msg_origin", "") or "")
-        sender_id = self._safe_event_call(event, "get_sender_id") or getattr(sender, "user_id", "") or getattr(sender, "id", "") or ""
+        sender_id = (
+            self._safe_event_call(event, "get_sender_id")
+            or getattr(sender, "user_id", "")
+            or getattr(sender, "id", "")
+            or ""
+        )
         sender_name = (
             self._safe_event_call(event, "get_sender_name")
             or getattr(sender, "nickname", "")
@@ -773,16 +969,32 @@ class ChatArchiveStore:
 
         return {
             "message_uid": self._message_uid(umo, message_id, created_at, sender_id),
-            "platform": str(getattr(platform_meta, "name", "") or getattr(platform_meta, "platform_name", "") or ""),
+            "platform": str(
+                getattr(platform_meta, "name", "")
+                or getattr(platform_meta, "platform_name", "")
+                or ""
+            ),
             "message_type": message_type,
             "umo": umo,
             "session_id": str(getattr(message_obj, "session_id", "") or ""),
-            "group_id": str(self._safe_event_call(event, "get_group_id") or getattr(message_obj, "group_id", "") or ""),
+            "group_id": str(
+                self._safe_event_call(event, "get_group_id")
+                or getattr(message_obj, "group_id", "")
+                or ""
+            ),
             "sender_id": str(sender_id),
             "sender_name": str(sender_name),
-            "self_id": str(self._safe_event_call(event, "get_self_id") or getattr(message_obj, "self_id", "") or ""),
+            "self_id": str(
+                self._safe_event_call(event, "get_self_id")
+                or getattr(message_obj, "self_id", "")
+                or ""
+            ),
             "message_id": message_id,
-            "text": str(getattr(event, "message_str", "") or getattr(message_obj, "message_str", "") or ""),
+            "text": str(
+                getattr(event, "message_str", "")
+                or getattr(message_obj, "message_str", "")
+                or ""
+            ),
             "components": components,
             "raw": raw,
             "created_at": created_at,
@@ -812,12 +1024,24 @@ class ChatArchiveStore:
                 continue
             normalized = text.lower().replace("-", "_")
             compact = normalized.replace("_", "")
-            if normalized in {"group", "group_message", "guild", "channel"} or compact in {
+            if normalized in {
+                "group",
+                "group_message",
+                "guild",
+                "channel",
+            } or compact in {
                 "groupmessage",
                 "messagetype.groupmessage",
             }:
                 return "group"
-            if normalized in {"private", "friend", "friend_message", "direct", "dm", "private_message"} or compact in {
+            if normalized in {
+                "private",
+                "friend",
+                "friend_message",
+                "direct",
+                "dm",
+                "private_message",
+            } or compact in {
                 "friendmessage",
                 "privatemessage",
                 "messagetype.friendmessage",
@@ -841,17 +1065,34 @@ class ChatArchiveStore:
             if text:
                 return text
         parts = []
-        for key in ("chatType", "peerUid", "peerUin", "group_id", "user_id", "sender_id", "msgSeq", "message_seq", "seq", "msgRandom", "msgTime", "time"):
+        for key in (
+            "chatType",
+            "peerUid",
+            "peerUin",
+            "group_id",
+            "user_id",
+            "sender_id",
+            "msgSeq",
+            "message_seq",
+            "seq",
+            "msgRandom",
+            "msgTime",
+            "time",
+        ):
             text = str(raw.get(key) or "").strip()
             if text:
                 parts.append(f"{key}={text}")
         if len(parts) >= 3:
-            return "stable:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+            return (
+                "stable:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+            )
         return ""
 
     async def _component_payload(self, component: Any, index: int) -> dict[str, Any]:
         type_value = getattr(component, "type", "")
-        kind = str(getattr(type_value, "value", type_value) or component.__class__.__name__).lower()
+        kind = str(
+            getattr(type_value, "value", type_value) or component.__class__.__name__
+        ).lower()
         data = self._safe_jsonable(component)
         if hasattr(component, "toDict"):
             try:
@@ -893,7 +1134,9 @@ class ChatArchiveStore:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
-        for index, kind, raw_data in self._iter_media_candidates(components, raw_message):
+        for index, kind, raw_data in self._iter_media_candidates(
+            components, raw_message
+        ):
             source = self._first_media_value(
                 raw_data,
                 self._media_source_keys(kind),
@@ -916,13 +1159,19 @@ class ChatArchiveStore:
                 continue
             seen.add(key)
             local_path = relative_path = sha256 = detected_mime = None
-            size = raw_data.get("size") or raw_data.get("fileSize") or raw_data.get("file_size")
+            size = (
+                raw_data.get("size")
+                or raw_data.get("fileSize")
+                or raw_data.get("file_size")
+            )
             if capture_files:
-                local_path, relative_path, size, sha256, detected_mime = self._copy_media_file(
-                    kind,
-                    str(source or ""),
-                    str(name or kind),
-                    created_at,
+                local_path, relative_path, size, sha256, detected_mime = (
+                    self._copy_media_file(
+                        kind,
+                        str(source or ""),
+                        str(name or kind),
+                        created_at,
+                    )
                 )
             rows.append(
                 {
@@ -933,24 +1182,43 @@ class ChatArchiveStore:
                     "hash": sha256,
                     "local_path": local_path,
                     "relative_path": relative_path,
-                    "mime": detected_mime or raw_data.get("mime") or raw_data.get("content_type") or raw_data.get("contentType"),
+                    "mime": detected_mime
+                    or raw_data.get("mime")
+                    or raw_data.get("content_type")
+                    or raw_data.get("contentType"),
                     "size": size,
-                    "width": raw_data.get("width") or raw_data.get("picWidth") or raw_data.get("pic_width") or raw_data.get("thumbWidth") or raw_data.get("thumb_width"),
-                    "height": raw_data.get("height") or raw_data.get("picHeight") or raw_data.get("pic_height") or raw_data.get("thumbHeight") or raw_data.get("thumb_height"),
+                    "width": raw_data.get("width")
+                    or raw_data.get("picWidth")
+                    or raw_data.get("pic_width")
+                    or raw_data.get("thumbWidth")
+                    or raw_data.get("thumb_width"),
+                    "height": raw_data.get("height")
+                    or raw_data.get("picHeight")
+                    or raw_data.get("pic_height")
+                    or raw_data.get("thumbHeight")
+                    or raw_data.get("thumb_height"),
                     "meta": raw_data,
                 }
             )
         return rows
 
-    def _iter_media_candidates(self, components: list[dict[str, Any]], raw_message: Any) -> Iterator[tuple[int, str, dict[str, Any]]]:
+    def _iter_media_candidates(
+        self, components: list[dict[str, Any]], raw_message: Any
+    ) -> Iterator[tuple[int, str, dict[str, Any]]]:
         for component in components or []:
             index = int(component.get("index") or 0)
             kind = str(component.get("kind") or "").lower()
             data = component.get("data") or {}
-            raw_data = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+            raw_data = (
+                data.get("data")
+                if isinstance(data, dict) and isinstance(data.get("data"), dict)
+                else data
+            )
             if not isinstance(raw_data, dict):
                 raw_data = {}
-            nested_kind, nested_data = self._media_kind_and_data(raw_data, fallback_kind=kind)
+            nested_kind, nested_data = self._media_kind_and_data(
+                raw_data, fallback_kind=kind
+            )
             if nested_kind:
                 yield index, nested_kind, nested_data
         for index, element in enumerate(self._raw_message_elements(raw_message)):
@@ -972,7 +1240,14 @@ class ChatArchiveStore:
             return []
         if self._has_known_message_shape(raw):
             return [raw]
-        for key in ("elements", "msgElements", "message", "messageChain", "message_chain", "segments"):
+        for key in (
+            "elements",
+            "msgElements",
+            "message",
+            "messageChain",
+            "message_chain",
+            "segments",
+        ):
             value = raw.get(key)
             if isinstance(value, list):
                 return self._raw_message_elements(value)
@@ -982,6 +1257,818 @@ class ChatArchiveStore:
             if nested:
                 return nested
         return []
+
+    def _extract_forward_archives(
+        self, payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        archives: list[dict[str, Any]] = []
+        for component in payload.get("components") or []:
+            if not isinstance(component, dict):
+                continue
+            data = component.get("data") or {}
+            if isinstance(data, dict):
+                raw_data = (
+                    data.get("data") if isinstance(data.get("data"), dict) else data
+                )
+                archives.extend(self._forward_archives_from_value(raw_data))
+        archives.extend(self._forward_archives_from_value(payload.get("raw")))
+
+        by_id: dict[str, dict[str, Any]] = {}
+        for archive in archives:
+            forward_id = self._clean_forward_id(archive.get("forward_id"))
+            if not forward_id:
+                continue
+            archive["forward_id"] = forward_id
+            existing = by_id.get(forward_id)
+            if not existing or int(archive.get("message_count") or 0) > int(
+                existing.get("message_count") or 0
+            ):
+                by_id[forward_id] = archive
+        return list(by_id.values())
+
+    def _forward_archives_from_value(
+        self, value: Any, depth: int = 0
+    ) -> list[dict[str, Any]]:
+        if depth > 8 or value is None:
+            return []
+        if isinstance(value, str):
+            parsed = self._json_loads_maybe(value)
+            return (
+                self._forward_archives_from_value(parsed, depth + 1)
+                if parsed is not None
+                else []
+            )
+        if isinstance(value, list):
+            result: list[dict[str, Any]] = []
+            for item in value:
+                result.extend(self._forward_archives_from_value(item, depth + 1))
+            return result
+        if not isinstance(value, dict):
+            return []
+
+        result: list[dict[str, Any]] = []
+        segment = self._onebot_segment(value)
+        if segment:
+            segment_type, segment_data = segment
+            if segment_type == "forward":
+                archive = self._onebot_forward_archive(segment_data)
+                if archive:
+                    result.append(archive)
+            elif segment_type == "node":
+                archive = self._onebot_node_archive(segment_data)
+                if archive:
+                    result.append(archive)
+            elif segment_type == "xml":
+                archive = self._xml_forward_archive(segment_data)
+                if archive:
+                    result.append(archive)
+            elif segment_type == "json":
+                parsed = self._json_loads_maybe(
+                    segment_data.get("data")
+                    or segment_data.get("value")
+                    or segment_data
+                )
+                if parsed is not None:
+                    result.extend(self._forward_archives_from_value(parsed, depth + 1))
+
+        for key in (
+            "multiForwardMsgElement",
+            "forwardElement",
+            "mergedForwardElement",
+            "multi_forward",
+            "multiForward",
+            "forward",
+        ):
+            forward = value.get(key)
+            if isinstance(forward, dict):
+                archive = self._forward_archive_from_data(forward, source="qq_forward")
+                if archive:
+                    result.append(archive)
+            elif isinstance(forward, str):
+                parsed = self._json_loads_maybe(forward)
+                if isinstance(parsed, dict):
+                    archive = self._forward_archive_from_data(
+                        parsed, source="qq_forward"
+                    )
+                    if archive:
+                        result.append(archive)
+
+        ark = value.get("arkElement") or value.get("ark")
+        if isinstance(ark, dict):
+            archive = self._ark_forward_archive(ark)
+            if archive:
+                result.append(archive)
+
+        for key in (
+            "elements",
+            "msgElements",
+            "message",
+            "messageChain",
+            "message_chain",
+            "segments",
+            "data",
+            "payload",
+            "message_obj",
+            "raw_message",
+            "meta",
+            "extra",
+        ):
+            nested = value.get(key)
+            if nested is value:
+                continue
+            if isinstance(nested, (dict, list, str)):
+                result.extend(self._forward_archives_from_value(nested, depth + 1))
+        return result
+
+    @staticmethod
+    def _onebot_segment(value: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        segment_type = (
+            str(
+                value.get("type")
+                or value.get("kind")
+                or value.get("segment_type")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        if not segment_type or "data" not in value:
+            return None
+        data = value.get("data")
+        if isinstance(data, dict):
+            return segment_type, data
+        return segment_type, {"value": data}
+
+    def _onebot_forward_archive(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        forward_id = self._first_text(data, ("id", "resid", "res_id", "forward_id"))
+        if not forward_id:
+            return None
+        preview = [f"转发 ID: {self._short_forward_id(forward_id)}"]
+        return self._build_forward_archive(
+            forward_id=forward_id,
+            title="合并转发",
+            summary="OneBot 合并转发",
+            previews=preview,
+            messages=[],
+            payload={"kind": "onebot_forward", "data": data},
+        )
+
+    def _onebot_node_archive(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        forward_id = self._first_text(data, ("id", "resid", "res_id", "forward_id"))
+        content = data.get("content") if isinstance(data.get("content"), list) else []
+        messages = self._normalize_forward_messages(content)
+        previews = [
+            message.get("text") or "" for message in messages if message.get("text")
+        ][:5]
+        if not forward_id:
+            return None
+        return self._build_forward_archive(
+            forward_id=forward_id,
+            title=self._first_text(data, ("name", "title")) or "转发节点",
+            summary=f"{len(messages)} 条节点消息" if messages else "转发节点",
+            previews=previews or [f"节点 ID: {self._short_forward_id(forward_id)}"],
+            messages=messages,
+            payload={"kind": "onebot_node", "data": data, "messages": messages},
+        )
+
+    def _xml_forward_archive(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        xml_text = self._first_text(data, ("data", "value", "xml", "content"))
+        parsed = self._parse_forward_xml(xml_text)
+        if not (parsed["title"] or parsed["previews"] or parsed["summary"]):
+            return None
+        forward_id = self._first_text(
+            data, ("id", "resid", "res_id", "forward_id")
+        ) or self._forward_id_from_text(xml_text)
+        if not forward_id:
+            return None
+        return self._build_forward_archive(
+            forward_id=forward_id,
+            title=parsed["title"] or "XML 卡片",
+            summary=parsed["summary"] or "XML 消息",
+            previews=parsed["previews"],
+            messages=[],
+            payload={"kind": "xml_forward", "data": data, "parsed": parsed},
+        )
+
+    def _forward_archive_from_data(
+        self, forward: dict[str, Any], *, source: str
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_forward_xml(
+            self._first_text(forward, ("xmlContent", "xml", "xml_content"))
+        )
+        nested_data = (
+            forward.get("data") if isinstance(forward.get("data"), dict) else {}
+        )
+        messages = self._normalize_forward_messages(
+            forward.get("messages")
+            or forward.get("items")
+            or forward.get("previewList")
+            or nested_data.get("messages")
+            or nested_data.get("items")
+            or [],
+        )
+        forward_id = self._first_text(
+            forward,
+            (
+                "resid",
+                "resId",
+                "res_id",
+                "id",
+                "forward_id",
+                "multiMsgResid",
+                "multi_msg_resid",
+            ),
+        ) or self._forward_id_from_text(
+            self._first_text(forward, ("xmlContent", "xml", "xml_content"))
+        )
+        if not forward_id:
+            return None
+        title = (
+            parsed["title"]
+            or self._first_text(forward, ("title", "name", "brief"))
+            or "[聊天记录]"
+        )
+        previews = (
+            parsed["previews"]
+            or [
+                f"{item.get('sender')}: {item.get('text')}"
+                for item in messages
+                if item.get("text")
+            ][:5]
+        )
+        summary = (
+            parsed["summary"]
+            or self._first_text(forward, ("summary", "desc", "description"))
+            or (f"{len(messages)} 条消息" if messages else "合并转发")
+        )
+        return self._build_forward_archive(
+            forward_id=forward_id,
+            title=title,
+            summary=summary,
+            previews=previews,
+            messages=messages,
+            payload={"kind": source, "data": forward, "messages": messages},
+        )
+
+    def _ark_forward_archive(self, ark: dict[str, Any]) -> dict[str, Any] | None:
+        data: Any = ark.get("data") or ark.get("arkData") or ark.get("bytesData")
+        parsed = self._json_loads_maybe(data) if isinstance(data, str) else data
+        if not isinstance(parsed, dict):
+            return None
+        detail = (
+            parsed.get("meta", {}).get("detail")
+            if isinstance(parsed.get("meta"), dict)
+            else None
+        )
+        if not isinstance(detail, dict):
+            return None
+        forward_id = self._first_text(
+            detail, ("resid", "resId", "res_id", "id", "forward_id")
+        )
+        if not forward_id:
+            return None
+        news = detail.get("news") if isinstance(detail.get("news"), list) else []
+        messages = self._normalize_forward_messages(news)
+        previews = [
+            self._first_text(item, ("text", "title", "desc"))
+            for item in news
+            if isinstance(item, dict)
+        ]
+        previews = [item for item in previews if item][:5]
+        return self._build_forward_archive(
+            forward_id=forward_id,
+            title=self._first_text(detail, ("source", "title")) or "[聊天记录]",
+            summary=self._first_text(detail, ("summary", "desc")) or "合并转发",
+            previews=previews,
+            messages=messages,
+            payload={"kind": "ark_forward", "data": parsed, "messages": messages},
+        )
+
+    def _normalize_forward_messages(self, items: Any) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        messages: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if isinstance(item, str):
+                messages.append(
+                    {
+                        "id": f"line-{index}",
+                        "sender": "消息",
+                        "text": item,
+                        "time": "",
+                        "segments": [{"type": "text", "data": {"text": item}}],
+                    }
+                )
+                continue
+            if not isinstance(item, dict):
+                continue
+            segments = self._normalize_forward_segments(item)
+            text = self._first_text(
+                item,
+                (
+                    "text",
+                    "summary",
+                    "content",
+                    "messageText",
+                    "message_text",
+                    "raw_message",
+                ),
+            ) or "".join(self._forward_segment_text(segment) for segment in segments)
+            messages.append(
+                {
+                    "id": self._first_text(
+                        item, ("msgId", "msgSeq", "message_id", "message_seq", "id")
+                    )
+                    or f"line-{index}",
+                    "sender": self._forward_sender_name(item),
+                    "text": text or "[消息]",
+                    "time": self._first_text(
+                        item, ("time", "timestamp", "msgTime", "msg_time")
+                    ),
+                    "segments": segments,
+                }
+            )
+        return messages
+
+    def _normalize_forward_segments(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_segments = None
+        for key in (
+            "segments",
+            "elements",
+            "message",
+            "messageChain",
+            "message_chain",
+            "content",
+        ):
+            value = item.get(key)
+            if isinstance(value, list):
+                raw_segments = value
+                break
+        if raw_segments is None and (
+            item.get("text") or item.get("content") or item.get("summary")
+        ):
+            return [
+                {
+                    "type": "text",
+                    "data": {
+                        "text": self._first_text(item, ("text", "content", "summary"))
+                    },
+                }
+            ]
+        result: list[dict[str, Any]] = []
+        for segment in raw_segments or []:
+            data = (
+                segment.get("data")
+                if isinstance(segment, dict) and isinstance(segment.get("data"), dict)
+                else segment
+            )
+            if not isinstance(data, dict):
+                if isinstance(data, str):
+                    result.append({"type": "text", "data": {"text": data}})
+                continue
+            kind = self._infer_forward_segment_kind(
+                data, segment.get("type") if isinstance(segment, dict) else ""
+            )
+            result.append({"type": kind, "data": data})
+        return result
+
+    def _infer_forward_segment_kind(
+        self, data: dict[str, Any], fallback: Any = ""
+    ) -> str:
+        segment = (
+            self._onebot_segment({"type": fallback, "data": data})
+            if fallback
+            else self._onebot_segment(data)
+        )
+        if segment:
+            return segment[0]
+        raw_kind = str(
+            data.get("kind")
+            or data.get("segment_type")
+            or data.get("typeName")
+            or data.get("type")
+            or fallback
+            or ""
+        ).lower()
+        element_type = str(data.get("elementType") or "")
+        if (
+            data.get("picElement")
+            or data.get("imageElement")
+            or element_type == "2"
+            or "image" in raw_kind
+            or "pic" in raw_kind
+        ):
+            return "image"
+        if data.get("videoElement") or element_type == "5" or "video" in raw_kind:
+            return "video"
+        if (
+            data.get("pttElement")
+            or data.get("voiceElement")
+            or data.get("recordElement")
+            or data.get("audioElement")
+            or element_type == "4"
+            or any(token in raw_kind for token in ("record", "audio", "voice", "ptt"))
+        ):
+            return "record"
+        if data.get("fileElement") or element_type == "3" or "file" in raw_kind:
+            return "file"
+        if (
+            data.get("faceElement")
+            or data.get("marketFaceElement")
+            or element_type == "6"
+            or "face" in raw_kind
+        ):
+            return "face"
+        if (
+            data.get("multiForwardMsgElement")
+            or element_type == "16"
+            or "forward" in raw_kind
+        ):
+            return "forward"
+        if data.get("arkElement") or element_type == "10":
+            return "ark"
+        if (
+            data.get("atElement")
+            or data.get("mentionElement")
+            or raw_kind == "at"
+            or "mention" in raw_kind
+        ):
+            return "at"
+        if (
+            data.get("textElement")
+            or data.get("text")
+            or data.get("content")
+            or raw_kind in {"text", "plain"}
+        ):
+            return "text"
+        return raw_kind or "unknown"
+
+    def _forward_segment_text(self, segment: dict[str, Any]) -> str:
+        data = segment.get("data") if isinstance(segment, dict) else {}
+        if not isinstance(data, dict):
+            return ""
+        kind = str(
+            segment.get("type") or self._infer_forward_segment_kind(data)
+        ).lower()
+        if kind == "text":
+            return self._first_text(
+                data, ("text", "content", "value")
+            ) or self._first_text(data.get("textElement") or {}, ("content", "text"))
+        if kind in {"at", "mention"}:
+            return "@" + (
+                self._first_text(data, ("qq", "user_id", "uid", "uin")) or "成员"
+            )
+        if kind == "image":
+            return "[图片]"
+        if kind == "face":
+            return self._first_text(data, ("faceText", "name", "text")) or "[表情]"
+        if kind in {"record", "audio", "voice", "ptt"}:
+            return "[语音]"
+        if kind == "video":
+            return "[视频]"
+        if kind == "file":
+            name = self._first_text(data, ("fileName", "file_name", "name", "file"))
+            return f"[文件: {name}]" if name else "[文件]"
+        if kind == "forward":
+            return "[聊天记录]"
+        if kind == "json":
+            parsed = self._json_loads_maybe(
+                data.get("data") or data.get("value") or data
+            )
+            return (
+                self._first_text(parsed or {}, ("prompt", "desc", "title"))
+                if isinstance(parsed, dict)
+                else "[JSON]"
+            )
+        return self._first_text(data, ("summary", "text", "content", "title", "name"))
+
+    @staticmethod
+    def _forward_sender_name(item: dict[str, Any]) -> str:
+        sender = item.get("sender")
+        if isinstance(sender, dict):
+            for key in (
+                "nickname",
+                "card",
+                "name",
+                "user_name",
+                "userName",
+                "user_id",
+                "uin",
+            ):
+                text = str(sender.get(key) or "").strip()
+                if text:
+                    return text
+        for key in (
+            "senderName",
+            "sender_name",
+            "nickname",
+            "userName",
+            "user_name",
+            "nick",
+            "name",
+        ):
+            text = str(item.get(key) or "").strip()
+            if text:
+                return text
+        for key in ("user_id", "userId", "uin", "sender_id", "senderId"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                return f"QQ {text}"
+        return "未知用户"
+
+    @staticmethod
+    def _build_forward_archive(
+        *,
+        forward_id: str,
+        title: str,
+        summary: str,
+        previews: list[str],
+        messages: list[dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        clean_previews = [
+            str(item).strip() for item in previews if str(item or "").strip()
+        ][:8]
+        clean_messages = messages[:200] if isinstance(messages, list) else []
+        data = dict(payload or {})
+        if clean_messages and "messages" not in data:
+            data["messages"] = clean_messages
+        return {
+            "forward_id": forward_id,
+            "title": str(title or "合并转发").strip()[:160],
+            "summary": str(summary or "合并转发").strip()[:240],
+            "previews": clean_previews,
+            "messages": clean_messages,
+            "payload": data,
+            "message_count": len(clean_messages),
+        }
+
+    def _write_forward_archives_locked(
+        self,
+        conn: sqlite3.Connection,
+        payload: dict[str, Any],
+        archives: list[dict[str, Any]],
+    ) -> None:
+        now = int(time.time())
+        for archive in archives:
+            forward_id = self._clean_forward_id(archive.get("forward_id"))
+            if not forward_id:
+                continue
+            existing = conn.execute(
+                "SELECT message_count FROM forward_archives WHERE forward_id = ?",
+                (forward_id,),
+            ).fetchone()
+            new_count = int(archive.get("message_count") or 0)
+            existing_count = int(existing["message_count"] or 0) if existing else -1
+            if not existing or new_count >= existing_count:
+                messages = (
+                    archive.get("messages")
+                    if isinstance(archive.get("messages"), list)
+                    else []
+                )
+                archive_payload = (
+                    archive.get("payload")
+                    if isinstance(archive.get("payload"), dict)
+                    else {}
+                )
+                conn.execute(
+                    """
+                    INSERT INTO forward_archives (
+                        forward_id, title, summary, preview_json, payload_json,
+                        message_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(forward_id) DO UPDATE SET
+                        title = excluded.title,
+                        summary = excluded.summary,
+                        preview_json = excluded.preview_json,
+                        payload_json = excluded.payload_json,
+                        message_count = excluded.message_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        forward_id,
+                        archive.get("title") or "合并转发",
+                        archive.get("summary") or "合并转发",
+                        _json_dumps(archive.get("previews") or []),
+                        _json_dumps({**archive_payload, "messages": messages}),
+                        new_count,
+                        int(payload.get("created_at") or now),
+                        now,
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO forward_refs (
+                    forward_id, message_uid, platform, umo, session_id, message_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    forward_id,
+                    payload.get("message_uid"),
+                    payload.get("platform"),
+                    payload.get("umo"),
+                    payload.get("session_id"),
+                    payload.get("message_id"),
+                    int(payload.get("created_at") or now),
+                ),
+            )
+
+    def get_forward_preview(self, forward_id: str) -> dict[str, Any] | None:
+        clean_id = self._clean_forward_id(forward_id)
+        if not clean_id:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM forward_archives WHERE forward_id = ?", (clean_id,)
+            ).fetchone()
+            if not row:
+                return None
+            refs = [
+                dict(ref)
+                for ref in conn.execute(
+                    """
+                    SELECT message_uid, platform, umo, session_id, message_id, created_at
+                    FROM forward_refs
+                    WHERE forward_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                    """,
+                    (clean_id,),
+                ).fetchall()
+            ]
+        item = dict(row)
+        previews = self._json_loads_maybe(item.pop("preview_json") or "[]")
+        payload = self._json_loads_maybe(item.pop("payload_json") or "{}")
+        if not isinstance(previews, list):
+            previews = []
+        if not isinstance(payload, dict):
+            payload = {}
+        messages = (
+            payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        )
+        return {
+            "forward_id": item["forward_id"],
+            "title": item.get("title") or "合并转发",
+            "summary": item.get("summary") or "合并转发",
+            "previews": previews,
+            "messages": messages,
+            "message_count": int(item.get("message_count") or len(messages)),
+            "payload": payload,
+            "refs": refs,
+            "created_at": int(item.get("created_at") or 0),
+            "updated_at": int(item.get("updated_at") or 0),
+        }
+
+    def _forward_preview_summary_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        previews = self._json_loads_maybe(row["preview_json"] or "[]")
+        payload = self._json_loads_maybe(row["payload_json"] or "{}")
+        if not isinstance(previews, list):
+            previews = []
+        if not isinstance(payload, dict):
+            payload = {}
+        messages = (
+            payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        )
+        return {
+            "forward_id": row["forward_id"],
+            "title": row["title"] or "合并转发",
+            "summary": row["summary"] or "合并转发",
+            "previews": [str(item) for item in previews[:5] if str(item or "").strip()],
+            "message_count": int(row["message_count"] or len(messages)),
+            "has_cached_messages": bool(messages),
+            "updated_at": int(row["updated_at"] or 0),
+        }
+
+    def _summarize_forward_archives(
+        self, archives: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        for archive in archives:
+            forward_id = self._clean_forward_id(archive.get("forward_id"))
+            if not forward_id:
+                continue
+            messages = (
+                archive.get("messages")
+                if isinstance(archive.get("messages"), list)
+                else []
+            )
+            summaries.append(
+                {
+                    "forward_id": forward_id,
+                    "title": archive.get("title") or "合并转发",
+                    "summary": archive.get("summary") or "合并转发",
+                    "previews": [
+                        str(item)
+                        for item in (archive.get("previews") or [])[:5]
+                        if str(item or "").strip()
+                    ],
+                    "message_count": int(archive.get("message_count") or len(messages)),
+                    "has_cached_messages": bool(messages),
+                    "messages": messages,
+                }
+            )
+        return summaries
+
+    @staticmethod
+    def _clean_forward_id(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text or len(text) > 512:
+            return ""
+        if any(ord(char) < 32 or ord(char) == 127 for char in text):
+            return ""
+        return text
+
+    @staticmethod
+    def _short_forward_id(value: Any) -> str:
+        text = str(value or "")
+        return f"{text[:14]}...{text[-8:]}" if len(text) > 28 else text
+
+    @staticmethod
+    def _json_loads_maybe(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str):
+            return None
+        text = html.unescape(value).strip()
+        if not text or text[0] not in "[{":
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _first_text(value: Any, keys: tuple[str, ...]) -> str:
+        if not isinstance(value, dict):
+            return ""
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, (str, int, float)):
+                text = str(candidate).strip()
+                if text:
+                    return text
+            if isinstance(candidate, dict):
+                text = ChatArchiveStore._first_text(candidate, keys)
+                if text:
+                    return text
+        lower_map = {str(key).lower(): key for key in value.keys()}
+        for key in keys:
+            real_key = lower_map.get(key.lower())
+            if real_key is None:
+                continue
+            candidate = value.get(real_key)
+            if isinstance(candidate, (str, int, float)):
+                text = str(candidate).strip()
+                if text:
+                    return text
+        return ""
+
+    @staticmethod
+    def _parse_forward_xml(xml_text: str) -> dict[str, Any]:
+        text = html.unescape(str(xml_text or ""))
+        if not text:
+            return {"title": "", "previews": [], "summary": ""}
+        title_match = re.search(
+            r"<title[^>]*color=[\"']#000000[\"'][^>]*>(.*?)</title>", text, re.I | re.S
+        )
+        if not title_match:
+            title_match = re.search(r"brief=[\"']([^\"']+)[\"']", text, re.I | re.S)
+        previews = [
+            ChatArchiveStore._strip_tags(match.group(1)).strip()
+            for match in re.finditer(
+                r"<title[^>]*color=[\"']#777777[\"'][^>]*>(.*?)</title>",
+                text,
+                re.I | re.S,
+            )
+        ]
+        summary_match = re.search(r"<summary[^>]*>(.*?)</summary>", text, re.I | re.S)
+        return {
+            "title": ChatArchiveStore._strip_tags(title_match.group(1)).strip()
+            if title_match
+            else "",
+            "previews": [item for item in previews if item],
+            "summary": ChatArchiveStore._strip_tags(summary_match.group(1)).strip()
+            if summary_match
+            else "",
+        }
+
+    @staticmethod
+    def _forward_id_from_text(value: str) -> str:
+        text = html.unescape(str(value or ""))
+        for pattern in (
+            r"\bresid=[\"']([^\"']+)[\"']",
+            r"\bresId=[\"']([^\"']+)[\"']",
+            r"\bforward_id=[\"']([^\"']+)[\"']",
+            r"\bid=[\"']([^\"']{16,})[\"']",
+        ):
+            match = re.search(pattern, text, re.I)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _strip_tags(value: str) -> str:
+        return html.unescape(re.sub(r"<[^>]+>", "", str(value or "")))
 
     @staticmethod
     def _has_known_message_shape(value: dict[str, Any]) -> bool:
@@ -1010,7 +2097,9 @@ class ChatArchiveStore:
         }
         return any(key in value for key in known_keys)
 
-    def _media_kind_and_data(self, data: dict[str, Any], fallback_kind: str = "") -> tuple[str, dict[str, Any]]:
+    def _media_kind_and_data(
+        self, data: dict[str, Any], fallback_kind: str = ""
+    ) -> tuple[str, dict[str, Any]]:
         if not isinstance(data, dict):
             return "", {}
         if isinstance(data.get("picElement"), dict):
@@ -1030,7 +2119,9 @@ class ChatArchiveStore:
                 return "record", data[key]
         if isinstance(data.get("fileElement"), dict):
             return "file", data["fileElement"]
-        kind = self._normalize_media_kind(fallback_kind or data.get("type") or data.get("kind") or "")
+        kind = self._normalize_media_kind(
+            fallback_kind or data.get("type") or data.get("kind") or ""
+        )
         if kind:
             raw_data = data.get("data") if isinstance(data.get("data"), dict) else data
             return kind, raw_data
@@ -1093,19 +2184,65 @@ class ChatArchiveStore:
                 *common_tail,
             )
         if normalized == "video":
-            return ("videoUrl", "video_url", "url", "fileUrl", "file_url", "downloadUrl", "download_url", "thumbPath", "thumb_path", "thumbUrl", "thumb_url", "coverUrl", "cover_url", "previewUrl", "preview_url", *common_tail)
+            return (
+                "videoUrl",
+                "video_url",
+                "url",
+                "fileUrl",
+                "file_url",
+                "downloadUrl",
+                "download_url",
+                "thumbPath",
+                "thumb_path",
+                "thumbUrl",
+                "thumb_url",
+                "coverUrl",
+                "cover_url",
+                "previewUrl",
+                "preview_url",
+                *common_tail,
+            )
         if normalized == "record":
-            return ("audioUrl", "audio_url", "recordUrl", "record_url", "pttUrl", "ptt_url", "url", "fileUrl", "file_url", "downloadUrl", "download_url", "audioPath", "audio_path", "filePath", *common_tail)
-        return ("url", "fileUrl", "file_url", "downloadUrl", "download_url", *common_tail)
+            return (
+                "audioUrl",
+                "audio_url",
+                "recordUrl",
+                "record_url",
+                "pttUrl",
+                "ptt_url",
+                "url",
+                "fileUrl",
+                "file_url",
+                "downloadUrl",
+                "download_url",
+                "audioPath",
+                "audio_path",
+                "filePath",
+                *common_tail,
+            )
+        return (
+            "url",
+            "fileUrl",
+            "file_url",
+            "downloadUrl",
+            "download_url",
+            *common_tail,
+        )
 
     @staticmethod
     def _normalize_media_kind(kind: Any) -> str:
         value = str(kind or "").strip().lower()
-        if value in {"image", "img", "pic", "picture"} or "image" in value or "pic" in value:
+        if (
+            value in {"image", "img", "pic", "picture"}
+            or "image" in value
+            or "pic" in value
+        ):
             return "image"
         if value in {"video"} or "video" in value:
             return "video"
-        if value in {"record", "audio", "voice", "ptt"} or any(token in value for token in ("record", "audio", "voice", "ptt")):
+        if value in {"record", "audio", "voice", "ptt"} or any(
+            token in value for token in ("record", "audio", "voice", "ptt")
+        ):
             return "record"
         if value in {"file"} or "file" in value:
             return "file"
@@ -1127,14 +2264,32 @@ class ChatArchiveStore:
             found = self._media_source_from_value(value, keys)
             if found:
                 return found
-        for key in ("data", "meta", "extra", "media", "picElement", "imageElement", "mfaceElement", "marketFaceElement", "market_face", "videoElement", "pttElement", "voiceElement", "recordElement", "audioElement", "fileElement"):
+        for key in (
+            "data",
+            "meta",
+            "extra",
+            "media",
+            "picElement",
+            "imageElement",
+            "mfaceElement",
+            "marketFaceElement",
+            "market_face",
+            "videoElement",
+            "pttElement",
+            "voiceElement",
+            "recordElement",
+            "audioElement",
+            "fileElement",
+        ):
             nested = self._case_insensitive_get(data, key)
             if isinstance(nested, dict):
                 found = self._first_media_value(nested, keys)
                 if found:
                     return found
         for key, value in data.items():
-            if not re.search(r"(url|path|file|source|thumb|preview|cover|origin|md5)", str(key), re.I):
+            if not re.search(
+                r"(url|path|file|source|thumb|preview|cover|origin|md5)", str(key), re.I
+            ):
                 continue
             found = self._media_source_from_value(value, keys)
             if found:
@@ -1177,11 +2332,17 @@ class ChatArchiveStore:
 
     @staticmethod
     def _market_face_source(data: dict[str, Any]) -> str:
-        emoji_id = str(data.get("emojiId") or data.get("emoji_id") or data.get("id") or "").strip()
+        emoji_id = str(
+            data.get("emojiId") or data.get("emoji_id") or data.get("id") or ""
+        ).strip()
         if not emoji_id:
             return ""
         sizes = data.get("supportSize")
-        size = sizes[0] if isinstance(sizes, list) and sizes and isinstance(sizes[0], dict) else {}
+        size = (
+            sizes[0]
+            if isinstance(sizes, list) and sizes and isinstance(sizes[0], dict)
+            else {}
+        )
         width = min(int(size.get("width") or 120), 300)
         return f"https://gxh.vip.qq.com/club/item/parcel/item/{emoji_id[:2]}/{emoji_id}/raw{width}.gif"
 
@@ -1200,11 +2361,13 @@ class ChatArchiveStore:
                 source = str(row.get("source") or "")
                 if not source:
                     continue
-                local_path, relative_path, size, sha256, detected_mime = self._copy_media_file(
-                    str(row.get("kind") or ""),
-                    source,
-                    str(row.get("name") or row.get("kind") or "media"),
-                    created_at,
+                local_path, relative_path, size, sha256, detected_mime = (
+                    self._copy_media_file(
+                        str(row.get("kind") or ""),
+                        source,
+                        str(row.get("name") or row.get("kind") or "media"),
+                        created_at,
+                    )
                 )
                 if local_path:
                     row["local_path"] = local_path
@@ -1217,7 +2380,9 @@ class ChatArchiveStore:
                 if detected_mime and not row.get("mime"):
                     row["mime"] = detected_mime
 
-    def _copy_media_file(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+    def _copy_media_file(
+        self, kind: str, source: str, name: str, created_at: int
+    ) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         if not self.config.capture_media_files or not source:
             return None, None, None, None, None
         if source.startswith(("http://", "https://")):
@@ -1246,12 +2411,23 @@ class ChatArchiveStore:
             if not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)
-            detected_mime = self._detect_media_mime(kind, target) or mimetypes.guess_type(target.name)[0]
-            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, detected_mime
+            detected_mime = (
+                self._detect_media_mime(kind, target)
+                or mimetypes.guess_type(target.name)[0]
+            )
+            return (
+                str(target),
+                str(target.relative_to(self.data_dir)).replace("\\", "/"),
+                size,
+                sha256,
+                detected_mime,
+            )
         except Exception:
             return None, None, None, None, None
 
-    def _copy_embedded_media(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+    def _copy_embedded_media(
+        self, kind: str, source: str, name: str, created_at: int
+    ) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
             mime = None
@@ -1267,17 +2443,34 @@ class ChatArchiveStore:
             if size <= 0 or size > max_bytes:
                 return None, None, size, None, mime
             sha256 = hashlib.sha256(data).hexdigest()
-            suffix = Path(_safe_name(name)).suffix or mimetypes.guess_extension(mime or "") or ".bin"
+            suffix = (
+                Path(_safe_name(name)).suffix
+                or mimetypes.guess_extension(mime or "")
+                or ".bin"
+            )
             target = self._media_target_path(kind, created_at, sha256, suffix[:16])
             if not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
-            detected_mime = self._detect_media_mime(kind, target) or self._normalize_image_mime(mime) or mime or mimetypes.guess_type(target.name)[0]
-            return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, detected_mime
+            detected_mime = (
+                self._detect_media_mime(kind, target)
+                or self._normalize_image_mime(mime)
+                or mime
+                or mimetypes.guess_type(target.name)[0]
+            )
+            return (
+                str(target),
+                str(target.relative_to(self.data_dir)).replace("\\", "/"),
+                size,
+                sha256,
+                detected_mime,
+            )
         except (ValueError, OSError, binascii.Error):
             return None, None, None, None, None
 
-    def _download_remote_media(self, kind: str, source: str, name: str, created_at: int) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+    def _download_remote_media(
+        self, kind: str, source: str, name: str, created_at: int
+    ) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         if kind != "image" or not self.config.download_remote_media:
             return None, None, None, None, None
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
@@ -1286,7 +2479,11 @@ class ChatArchiveStore:
             with response:
                 raw_content_type = response.headers.get("Content-Type")
                 content_type = self._normalize_image_mime(raw_content_type)
-                if raw_content_type and not content_type and not self._content_type_allows_sniffing(raw_content_type):
+                if (
+                    raw_content_type
+                    and not content_type
+                    and not self._content_type_allows_sniffing(raw_content_type)
+                ):
                     return None, None, None, None, None
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None and int(content_length) > max_bytes:
@@ -1323,7 +2520,13 @@ class ChatArchiveStore:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         temp_path.replace(target)
                         temp_path = None
-                    return str(target), str(target.relative_to(self.data_dir)).replace("\\", "/"), size, sha256, content_type or mimetypes.guess_type(target.name)[0]
+                    return (
+                        str(target),
+                        str(target.relative_to(self.data_dir)).replace("\\", "/"),
+                        size,
+                        sha256,
+                        content_type or mimetypes.guess_type(target.name)[0],
+                    )
                 finally:
                     if temp_path is not None:
                         try:
@@ -1333,7 +2536,9 @@ class ChatArchiveStore:
         except (OSError, HTTPError, TimeoutError, ValueError):
             return None, None, None, None, None
 
-    def _open_remote_media(self, source: str, *, image_only: bool = True, enforce_allowlist: bool = False):
+    def _open_remote_media(
+        self, source: str, *, image_only: bool = True, enforce_allowlist: bool = False
+    ):
         current_url = source
         opener = build_opener(_NoRedirectHandler)
         timeout = max(1.0, float(self.config.remote_media_timeout_seconds or 10.0))
@@ -1349,7 +2554,9 @@ class ChatArchiveStore:
                 current_url,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8" if image_only else "*/*",
+                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+                    if image_only
+                    else "*/*",
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                     **({"Referer": current_url} if referer_retry else {}),
                 },
@@ -1382,7 +2589,11 @@ class ChatArchiveStore:
                 raise ValueError("blocked private remote media address")
 
     def _validate_remote_media_allowed_host(self, hostname: str) -> None:
-        allowed = tuple(str(host or "").strip().lower() for host in (self.config.remote_media_allowed_hosts or ()) if str(host or "").strip())
+        allowed = tuple(
+            str(host or "").strip().lower()
+            for host in (self.config.remote_media_allowed_hosts or ())
+            if str(host or "").strip()
+        )
         if not allowed:
             return
         clean = hostname.lower().rstrip(".")
@@ -1523,7 +2734,9 @@ class ChatArchiveStore:
         guessed = mimetypes.guess_extension(content_type or "")
         return guessed or ".bin"
 
-    def _media_target_path(self, kind: str, created_at: int, sha256: str, suffix: str) -> Path:
+    def _media_target_path(
+        self, kind: str, created_at: int, sha256: str, suffix: str
+    ) -> Path:
         date_part = time.strftime("%Y/%m/%d", time.localtime(created_at))
         return self.media_dir / kind / date_part / f"{sha256}{suffix}"
 
@@ -1551,7 +2764,9 @@ class ChatArchiveStore:
                 str(row["umo"]): dict(row)
                 for row in conn.execute("SELECT * FROM conversation_state").fetchall()
             }
-        conversations: dict[str, dict[str, Any]] = {str(row["umo"]): dict(row) for row in rows}
+        conversations: dict[str, dict[str, Any]] = {
+            str(row["umo"]): dict(row) for row in rows
+        }
         for message in self._pending_messages():
             umo = str(message.get("umo") or "")
             if not umo:
@@ -1566,10 +2781,16 @@ class ChatArchiveStore:
                     "sample_sender": "",
                 },
             )
-            current["latest_at"] = max(int(current.get("latest_at") or 0), int(message.get("created_at") or 0))
+            current["latest_at"] = max(
+                int(current.get("latest_at") or 0), int(message.get("created_at") or 0)
+            )
             current["message_count"] = int(current.get("message_count") or 0) + 1
-            current["media_count"] = int(current.get("media_count") or 0) + int(message.get("media_count") or 0)
-            current["sample_sender"] = current.get("sample_sender") or message.get("sender_name")
+            current["media_count"] = int(current.get("media_count") or 0) + int(
+                message.get("media_count") or 0
+            )
+            current["sample_sender"] = current.get("sample_sender") or message.get(
+                "sender_name"
+            )
         with self._connection() as conn:
             for item in conversations.values():
                 umo = str(item.get("umo") or "")
@@ -1586,9 +2807,14 @@ class ChatArchiveStore:
                 item["unread_count"] += sum(
                     1
                     for message in self._pending_messages()
-                    if str(message.get("umo") or "") == umo and int(message.get("created_at") or 0) > last_seen_at
+                    if str(message.get("umo") or "") == umo
+                    and int(message.get("created_at") or 0) > last_seen_at
                 )
-        return sorted(conversations.values(), key=lambda item: int(item.get("latest_at") or 0), reverse=True)
+        return sorted(
+            conversations.values(),
+            key=lambda item: int(item.get("latest_at") or 0),
+            reverse=True,
+        )
 
     def list_messages(
         self,
@@ -1623,7 +2849,9 @@ class ChatArchiveStore:
             params.append(int(end_ts))
         if sender:
             like = f"%{self._escape_like(sender.strip())}%"
-            where.append("(m.sender_id LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\')")
+            where.append(
+                "(m.sender_id LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\')"
+            )
             params.extend([like, like])
         if message_type:
             where.append("m.message_type = ?")
@@ -1639,13 +2867,19 @@ class ChatArchiveStore:
             )
             params.append(media_kind)
         if favorite:
-            where.append("EXISTS (SELECT 1 FROM favorite_messages fav WHERE fav.message_uid = m.message_uid)")
+            where.append(
+                "EXISTS (SELECT 1 FROM favorite_messages fav WHERE fav.message_uid = m.message_uid)"
+            )
         if tag_id is not None:
-            where.append("EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_uid = m.message_uid AND mt.tag_id = ?)")
+            where.append(
+                "EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_uid = m.message_uid AND mt.tag_id = ?)"
+            )
             params.append(int(tag_id))
         if q and not use_fts:
             like = f"%{self._escape_like(q.strip())}%"
-            where.append("(m.text LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\' OR m.raw_json LIKE ? ESCAPE '\\')")
+            where.append(
+                "(m.text LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\' OR m.raw_json LIKE ? ESCAPE '\\')"
+            )
             params.extend([like, like, like])
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         if use_fts:
@@ -1667,12 +2901,18 @@ class ChatArchiveStore:
             """
         params.append(limit)
         with self._connection() as conn:
-            messages = [self._message_row_to_dict(row) for row in conn.execute(sql, params).fetchall()]
+            messages = [
+                self._message_row_to_dict(row)
+                for row in conn.execute(sql, params).fetchall()
+            ]
             uids = [m["message_uid"] for m in messages]
             media_by_uid: dict[str, list[dict[str, Any]]] = {uid: [] for uid in uids}
             if uids:
                 placeholders = ",".join("?" for _ in uids)
-                for row in conn.execute(f"SELECT * FROM media WHERE message_uid IN ({placeholders}) ORDER BY component_index", uids):
+                for row in conn.execute(
+                    f"SELECT * FROM media WHERE message_uid IN ({placeholders}) ORDER BY component_index",
+                    uids,
+                ):
                     item = dict(row)
                     item["meta"] = json.loads(item.pop("meta_json") or "{}")
                     media_by_uid.setdefault(item["message_uid"], []).append(item)
@@ -1699,8 +2939,14 @@ class ChatArchiveStore:
         merged = self._dedupe_sort_messages(list(reversed(messages)) + pending)
         return {"items": merged[-limit:], "has_more": len(messages) == limit}
 
-    def _decorate_messages_locked(self, conn: sqlite3.Connection, messages: list[dict[str, Any]]) -> None:
-        uids = [str(item.get("message_uid") or "") for item in messages if item.get("message_uid")]
+    def _decorate_messages_locked(
+        self, conn: sqlite3.Connection, messages: list[dict[str, Any]]
+    ) -> None:
+        uids = [
+            str(item.get("message_uid") or "")
+            for item in messages
+            if item.get("message_uid")
+        ]
         if not uids:
             return
         placeholders = ",".join("?" for _ in uids)
@@ -1712,6 +2958,7 @@ class ChatArchiveStore:
             ).fetchall()
         }
         tags_by_uid: dict[str, list[dict[str, Any]]] = {uid: [] for uid in uids}
+        forward_by_uid: dict[str, list[dict[str, Any]]] = {uid: [] for uid in uids}
         tag_rows = conn.execute(
             f"""
             SELECT mt.message_uid, t.id, t.name, t.color
@@ -1726,10 +2973,27 @@ class ChatArchiveStore:
             tags_by_uid.setdefault(str(row["message_uid"]), []).append(
                 {"id": int(row["id"]), "name": row["name"], "color": row["color"]}
             )
+        forward_rows = conn.execute(
+            f"""
+            SELECT
+                fr.message_uid, fa.forward_id, fa.title, fa.summary,
+                fa.preview_json, fa.payload_json, fa.message_count, fa.updated_at
+            FROM forward_refs fr
+            JOIN forward_archives fa ON fa.forward_id = fr.forward_id
+            WHERE fr.message_uid IN ({placeholders})
+            ORDER BY fr.created_at ASC
+            """,
+            uids,
+        ).fetchall()
+        for row in forward_rows:
+            forward_by_uid.setdefault(str(row["message_uid"]), []).append(
+                self._forward_preview_summary_from_row(row)
+            )
         for item in messages:
             uid = str(item.get("message_uid") or "")
             item["favorite"] = uid in favorites
             item["tags"] = tags_by_uid.get(uid, [])
+            item["forward_previews"] = forward_by_uid.get(uid, [])
 
     def _message_matches_filters(
         self,
@@ -1757,18 +3021,25 @@ class ChatArchiveStore:
             return False
         if sender:
             needle = sender.strip().lower()
-            sender_text = f"{item.get('sender_id') or ''} {item.get('sender_name') or ''}".lower()
+            sender_text = (
+                f"{item.get('sender_id') or ''} {item.get('sender_name') or ''}".lower()
+            )
             if needle not in sender_text:
                 return False
         if message_type and item.get("message_type") != message_type:
             return False
         if media_kind:
-            if not any(str(media.get("kind") or "") == media_kind for media in item.get("media") or []):
+            if not any(
+                str(media.get("kind") or "") == media_kind
+                for media in item.get("media") or []
+            ):
                 return False
         if favorite and not item.get("favorite"):
             return False
         if tag_id is not None:
-            if not any(int(tag.get("id") or 0) == int(tag_id) for tag in item.get("tags") or []):
+            if not any(
+                int(tag.get("id") or 0) == int(tag_id) for tag in item.get("tags") or []
+            ):
                 return False
         if q:
             needle = q.strip().lower()
@@ -1821,7 +3092,9 @@ class ChatArchiveStore:
                     SELECT media.kind AS value, count(*) AS count
                     FROM media
                     JOIN messages ON messages.message_uid = media.message_uid
-                    """ + ("WHERE messages.umo = ?" if umo else "") + """
+                    """
+                    + ("WHERE messages.umo = ?" if umo else "")
+                    + """
                     GROUP BY media.kind
                     ORDER BY count DESC
                     """,
@@ -1843,14 +3116,21 @@ class ChatArchiveStore:
                     """
                 ).fetchall()
             ]
-        return {"senders": senders, "message_types": message_types, "media_kinds": media_kinds, "tags": tags}
+        return {
+            "senders": senders,
+            "message_types": message_types,
+            "media_kinds": media_kinds,
+            "tags": tags,
+        }
 
     def set_favorite(self, message_uid: str, favorite: bool) -> dict[str, Any]:
         uid = str(message_uid or "").strip()
         if not uid:
             raise ValueError("message_uid is required")
         with self._connection() as conn:
-            row = conn.execute("SELECT message_uid FROM messages WHERE message_uid = ?", (uid,)).fetchone()
+            row = conn.execute(
+                "SELECT message_uid FROM messages WHERE message_uid = ?", (uid,)
+            ).fetchone()
             if not row:
                 raise ValueError("message not found")
             if favorite:
@@ -1859,7 +3139,9 @@ class ChatArchiveStore:
                     (uid, int(time.time())),
                 )
             else:
-                conn.execute("DELETE FROM favorite_messages WHERE message_uid = ?", (uid,))
+                conn.execute(
+                    "DELETE FROM favorite_messages WHERE message_uid = ?", (uid,)
+                )
             return {"message_uid": uid, "favorite": bool(favorite)}
 
     def list_tags(self) -> list[dict[str, Any]]:
@@ -1873,7 +3155,10 @@ class ChatArchiveStore:
                 ORDER BY t.name ASC
                 """
             ).fetchall()
-        return [{**dict(row), "message_count": int(row["message_count"] or 0)} for row in rows]
+        return [
+            {**dict(row), "message_count": int(row["message_count"] or 0)}
+            for row in rows
+        ]
 
     def upsert_tag(self, name: str, color: str = "") -> dict[str, Any]:
         clean_name = self._clean_tag_name(name)
@@ -1890,26 +3175,36 @@ class ChatArchiveStore:
                 """,
                 (clean_name, clean_color, now, now),
             )
-            row = conn.execute("SELECT * FROM tags WHERE name = ?", (clean_name,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM tags WHERE name = ?", (clean_name,)
+            ).fetchone()
         return dict(row)
 
     def delete_tag(self, tag_id: int) -> bool:
         with self._connection() as conn:
-            row = conn.execute("SELECT id FROM tags WHERE id = ?", (int(tag_id),)).fetchone()
+            row = conn.execute(
+                "SELECT id FROM tags WHERE id = ?", (int(tag_id),)
+            ).fetchone()
             if not row:
                 return False
             conn.execute("DELETE FROM tags WHERE id = ?", (int(tag_id),))
             return True
 
-    def set_message_tag(self, message_uid: str, tag_id: int, enabled: bool) -> dict[str, Any]:
+    def set_message_tag(
+        self, message_uid: str, tag_id: int, enabled: bool
+    ) -> dict[str, Any]:
         uid = str(message_uid or "").strip()
         if not uid:
             raise ValueError("message_uid is required")
         now = int(time.time())
         with self._connection() as conn:
-            if not conn.execute("SELECT 1 FROM messages WHERE message_uid = ?", (uid,)).fetchone():
+            if not conn.execute(
+                "SELECT 1 FROM messages WHERE message_uid = ?", (uid,)
+            ).fetchone():
                 raise ValueError("message not found")
-            if not conn.execute("SELECT 1 FROM tags WHERE id = ?", (int(tag_id),)).fetchone():
+            if not conn.execute(
+                "SELECT 1 FROM tags WHERE id = ?", (int(tag_id),)
+            ).fetchone():
                 raise ValueError("tag not found")
             if enabled:
                 conn.execute(
@@ -1925,7 +3220,9 @@ class ChatArchiveStore:
             self._decorate_messages_locked(conn, messages)
             return {"message_uid": uid, "tags": messages[0]["tags"]}
 
-    def record_search_history(self, query: str, filters: dict[str, Any] | None = None, *, hit_count: int = 0) -> dict[str, Any]:
+    def record_search_history(
+        self, query: str, filters: dict[str, Any] | None = None, *, hit_count: int = 0
+    ) -> dict[str, Any]:
         clean_query = str(query or "").strip()
         clean_filters = self._clean_search_filters(filters or {})
         if not clean_query and not clean_filters:
@@ -1973,11 +3270,15 @@ class ChatArchiveStore:
 
     def clear_search_history(self) -> int:
         with self._connection() as conn:
-            count = int(conn.execute("SELECT count(*) FROM search_history").fetchone()[0] or 0)
+            count = int(
+                conn.execute("SELECT count(*) FROM search_history").fetchone()[0] or 0
+            )
             conn.execute("DELETE FROM search_history")
             return count
 
-    def mark_conversation_seen(self, umo: str, message_uid: str = "", seen_at: int | None = None) -> dict[str, Any]:
+    def mark_conversation_seen(
+        self, umo: str, message_uid: str = "", seen_at: int | None = None
+    ) -> dict[str, Any]:
         clean_umo = str(umo or "").strip()
         if not clean_umo:
             clean_umo = "__all__"
@@ -1986,7 +3287,10 @@ class ChatArchiveStore:
             seen_at = now
             if message_uid:
                 with self._connection() as conn:
-                    row = conn.execute("SELECT created_at FROM messages WHERE message_uid = ?", (message_uid,)).fetchone()
+                    row = conn.execute(
+                        "SELECT created_at FROM messages WHERE message_uid = ?",
+                        (message_uid,),
+                    ).fetchone()
                     if row:
                         seen_at = int(row["created_at"] or seen_at)
         with self._connection() as conn:
@@ -2001,7 +3305,11 @@ class ChatArchiveStore:
                 """,
                 (clean_umo, int(seen_at or now), str(message_uid or ""), now),
             )
-            return dict(conn.execute("SELECT * FROM conversation_state WHERE umo = ?", (clean_umo,)).fetchone())
+            return dict(
+                conn.execute(
+                    "SELECT * FROM conversation_state WHERE umo = ?", (clean_umo,)
+                ).fetchone()
+            )
 
     def get_ui_settings(self) -> dict[str, Any]:
         with self._connection() as conn:
@@ -2014,9 +3322,17 @@ class ChatArchiveStore:
             "theme": "system",
         }
         if isinstance(settings, dict):
-            defaults.update({key: settings[key] for key in defaults.keys() & settings.keys()})
-        defaults["poll_interval_seconds"] = max(5, min(int(defaults.get("poll_interval_seconds") or 15), 120))
-        defaults["theme"] = defaults["theme"] if defaults.get("theme") in {"system", "light", "dark"} else "system"
+            defaults.update(
+                {key: settings[key] for key in defaults.keys() & settings.keys()}
+            )
+        defaults["poll_interval_seconds"] = max(
+            5, min(int(defaults.get("poll_interval_seconds") or 15), 120)
+        )
+        defaults["theme"] = (
+            defaults["theme"]
+            if defaults.get("theme") in {"system", "light", "dark"}
+            else "system"
+        )
         return defaults
 
     def update_ui_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -2026,7 +3342,9 @@ class ChatArchiveStore:
             if key in incoming:
                 current[key] = bool(incoming[key])
         if "poll_interval_seconds" in incoming:
-            current["poll_interval_seconds"] = max(5, min(int(incoming.get("poll_interval_seconds") or 15), 120))
+            current["poll_interval_seconds"] = max(
+                5, min(int(incoming.get("poll_interval_seconds") or 15), 120)
+            )
         if incoming.get("theme") in {"system", "light", "dark"}:
             current["theme"] = incoming["theme"]
         with self._connection() as conn:
@@ -2068,7 +3386,9 @@ class ChatArchiveStore:
                 params.append(umo)
             if sender:
                 like = f"%{self._escape_like(sender.strip())}%"
-                where.append("(m.sender_id LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\')")
+                where.append(
+                    "(m.sender_id LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\')"
+                )
                 params.extend([like, like])
             if message_type:
                 where.append("m.message_type = ?")
@@ -2084,13 +3404,19 @@ class ChatArchiveStore:
                 )
                 params.append(media_kind)
             if favorite:
-                where.append("EXISTS (SELECT 1 FROM favorite_messages fav WHERE fav.message_uid = m.message_uid)")
+                where.append(
+                    "EXISTS (SELECT 1 FROM favorite_messages fav WHERE fav.message_uid = m.message_uid)"
+                )
             if tag_id is not None:
-                where.append("EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_uid = m.message_uid AND mt.tag_id = ?)")
+                where.append(
+                    "EXISTS (SELECT 1 FROM message_tags mt WHERE mt.message_uid = m.message_uid AND mt.tag_id = ?)"
+                )
                 params.append(int(tag_id))
             if q:
                 like = f"%{self._escape_like(q.strip())}%"
-                where.append("(m.text LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\' OR m.raw_json LIKE ? ESCAPE '\\')")
+                where.append(
+                    "(m.text LIKE ? ESCAPE '\\' OR m.sender_name LIKE ? ESCAPE '\\' OR m.raw_json LIKE ? ESCAPE '\\')"
+                )
                 params.extend([like, like, like])
             sql = f"""
                 SELECT m.* FROM messages m
@@ -2106,16 +3432,23 @@ class ChatArchiveStore:
             for row in rows:
                 last_id = int(row["id"])
                 message = self._message_row_to_dict(row)
-                message["media"] = self._media_for_message_locked(conn, message["message_uid"])
+                message["media"] = self._media_for_message_locked(
+                    conn, message["message_uid"]
+                )
                 page_messages.append(message)
             self._decorate_messages_locked(conn, page_messages)
             for message in page_messages:
                 yield message
 
     @staticmethod
-    def _media_for_message_locked(conn: sqlite3.Connection, message_uid: str) -> list[dict[str, Any]]:
+    def _media_for_message_locked(
+        conn: sqlite3.Connection, message_uid: str
+    ) -> list[dict[str, Any]]:
         media = []
-        for row in conn.execute("SELECT * FROM media WHERE message_uid = ? ORDER BY component_index", (message_uid,)).fetchall():
+        for row in conn.execute(
+            "SELECT * FROM media WHERE message_uid = ? ORDER BY component_index",
+            (message_uid,),
+        ).fetchall():
             item = dict(row)
             item["meta"] = json.loads(item.pop("meta_json") or "{}")
             media.append(item)
@@ -2168,10 +3501,21 @@ class ChatArchiveStore:
             raise ValueError(f"unsupported export format: {format}")
         if fmt == "md":
             fmt = "markdown"
-        suffix = {"json": ".json", "markdown": ".md", "txt": ".txt", "html": ".html", "zip": ".zip"}[fmt]
-        output = self.export_dir / (output_name or f"chat_archive_{int(time.time())}{suffix}")
+        suffix = {
+            "json": ".json",
+            "markdown": ".md",
+            "txt": ".txt",
+            "html": ".html",
+            "zip": ".zip",
+        }[fmt]
+        output = self.export_dir / (
+            output_name or f"chat_archive_{int(time.time())}{suffix}"
+        )
         with self._connection() as conn:
-            snapshot_max_id = int(conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0] or 0)
+            snapshot_max_id = int(
+                conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
+                or 0
+            )
             filters = self._export_filters(
                 start_ts=start_ts,
                 end_ts=end_ts,
@@ -2184,13 +3528,37 @@ class ChatArchiveStore:
                 tag_id=tag_id,
             )
             if fmt == "json":
-                self._write_export_json(conn, output, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters)
+                self._write_export_json(
+                    conn,
+                    output,
+                    snapshot_max_id=snapshot_max_id,
+                    page_size=page_size,
+                    **filters,
+                )
             elif fmt == "markdown":
-                self._write_export_markdown(conn, output, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters)
+                self._write_export_markdown(
+                    conn,
+                    output,
+                    snapshot_max_id=snapshot_max_id,
+                    page_size=page_size,
+                    **filters,
+                )
             elif fmt == "txt":
-                self._write_export_txt(conn, output, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters)
+                self._write_export_txt(
+                    conn,
+                    output,
+                    snapshot_max_id=snapshot_max_id,
+                    page_size=page_size,
+                    **filters,
+                )
             elif fmt == "html":
-                self._write_export_html(conn, output, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters)
+                self._write_export_html(
+                    conn,
+                    output,
+                    snapshot_max_id=snapshot_max_id,
+                    page_size=page_size,
+                    **filters,
+                )
             elif fmt == "zip":
                 self._write_export_zip(
                     conn,
@@ -2202,46 +3570,104 @@ class ChatArchiveStore:
                 )
         return output
 
-    def _write_export_json(self, conn: sqlite3.Connection, output: Path, *, snapshot_max_id: int, page_size: int, **filters) -> None:
+    def _write_export_json(
+        self,
+        conn: sqlite3.Connection,
+        output: Path,
+        *,
+        snapshot_max_id: int,
+        page_size: int,
+        **filters,
+    ) -> None:
         first = True
         with output.open("w", encoding="utf-8") as f:
             f.write("[\n")
-            for message in self._iter_message_rows(conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters):
+            for message in self._iter_message_rows(
+                conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters
+            ):
                 if not first:
                     f.write(",\n")
                 f.write(json.dumps(message, ensure_ascii=False, indent=2))
                 first = False
             f.write("\n]\n")
 
-    def _write_export_markdown(self, conn: sqlite3.Connection, output: Path, *, snapshot_max_id: int, page_size: int, **filters) -> None:
+    def _write_export_markdown(
+        self,
+        conn: sqlite3.Connection,
+        output: Path,
+        *,
+        snapshot_max_id: int,
+        page_size: int,
+        **filters,
+    ) -> None:
         with output.open("w", encoding="utf-8") as f:
             f.write("# 聊天归档导出\n\n")
-            for message in self._iter_message_rows(conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters):
-                f.write(f"## {self._format_export_time(message.get('created_at'))} - {message.get('sender_name') or message.get('sender_id') or '未知用户'}\n\n")
+            for message in self._iter_message_rows(
+                conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters
+            ):
+                f.write(
+                    f"## {self._format_export_time(message.get('created_at'))} - {message.get('sender_name') or message.get('sender_id') or '未知用户'}\n\n"
+                )
                 if message.get("text"):
                     f.write(str(message["text"]).strip() + "\n\n")
                 for media in message.get("media") or []:
-                    f.write(f"- 媒体: {media.get('kind') or 'file'} / {media.get('name') or media.get('source') or media.get('id')}\n")
+                    f.write(
+                        f"- 媒体: {media.get('kind') or 'file'} / {media.get('name') or media.get('source') or media.get('id')}\n"
+                    )
                 f.write("\n")
 
-    def _write_export_txt(self, conn: sqlite3.Connection, output: Path, *, snapshot_max_id: int, page_size: int, **filters) -> None:
+    def _write_export_txt(
+        self,
+        conn: sqlite3.Connection,
+        output: Path,
+        *,
+        snapshot_max_id: int,
+        page_size: int,
+        **filters,
+    ) -> None:
         with output.open("w", encoding="utf-8") as f:
-            for message in self._iter_message_rows(conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters):
-                sender = message.get("sender_name") or message.get("sender_id") or "未知用户"
-                f.write(f"[{self._format_export_time(message.get('created_at'))}] {sender}: {message.get('text') or ''}\n")
+            for message in self._iter_message_rows(
+                conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters
+            ):
+                sender = (
+                    message.get("sender_name") or message.get("sender_id") or "未知用户"
+                )
+                f.write(
+                    f"[{self._format_export_time(message.get('created_at'))}] {sender}: {message.get('text') or ''}\n"
+                )
                 for media in message.get("media") or []:
-                    f.write(f"  [媒体] {media.get('kind') or 'file'} {media.get('name') or media.get('source') or media.get('id')}\n")
+                    f.write(
+                        f"  [媒体] {media.get('kind') or 'file'} {media.get('name') or media.get('source') or media.get('id')}\n"
+                    )
 
-    def _write_export_html(self, conn: sqlite3.Connection, output: Path, *, snapshot_max_id: int, page_size: int, **filters) -> None:
+    def _write_export_html(
+        self,
+        conn: sqlite3.Connection,
+        output: Path,
+        *,
+        snapshot_max_id: int,
+        page_size: int,
+        **filters,
+    ) -> None:
         with output.open("w", encoding="utf-8") as f:
-            f.write("""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>聊天归档导出</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;background:#eef3f8;color:#17212b;margin:0;padding:24px}.msg{max-width:860px;margin:0 auto 10px;padding:12px 14px;background:#fff;border:1px solid rgba(23,33,43,.1);border-radius:10px}.meta{color:#8492a0;font-size:12px;margin-bottom:6px}.text{white-space:pre-wrap;line-height:1.5}.media{margin-top:8px;color:#52616f;font-size:13px}</style></head><body><main><h1>聊天归档导出</h1>""")
-            for message in self._iter_message_rows(conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters):
-                sender = self._html_escape(message.get("sender_name") or message.get("sender_id") or "未知用户")
+            f.write(
+                """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>聊天归档导出</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;background:#eef3f8;color:#17212b;margin:0;padding:24px}.msg{max-width:860px;margin:0 auto 10px;padding:12px 14px;background:#fff;border:1px solid rgba(23,33,43,.1);border-radius:10px}.meta{color:#8492a0;font-size:12px;margin-bottom:6px}.text{white-space:pre-wrap;line-height:1.5}.media{margin-top:8px;color:#52616f;font-size:13px}</style></head><body><main><h1>聊天归档导出</h1>"""
+            )
+            for message in self._iter_message_rows(
+                conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters
+            ):
+                sender = self._html_escape(
+                    message.get("sender_name") or message.get("sender_id") or "未知用户"
+                )
                 text = self._html_escape(message.get("text") or "")
-                f.write(f"<article class=\"msg\"><div class=\"meta\">{self._format_export_time(message.get('created_at'))} · {sender}</div><div class=\"text\">{text}</div>")
+                f.write(
+                    f'<article class="msg"><div class="meta">{self._format_export_time(message.get("created_at"))} · {sender}</div><div class="text">{text}</div>'
+                )
                 for media in message.get("media") or []:
-                    label = self._html_escape(f"{media.get('kind') or 'file'} / {media.get('name') or media.get('source') or media.get('id')}")
-                    f.write(f"<div class=\"media\">媒体: {label}</div>")
+                    label = self._html_escape(
+                        f"{media.get('kind') or 'file'} / {media.get('name') or media.get('source') or media.get('id')}"
+                    )
+                    f.write(f'<div class="media">媒体: {label}</div>')
                 f.write("</article>")
             f.write("</main></body></html>")
 
@@ -2257,7 +3683,9 @@ class ChatArchiveStore:
     ) -> None:
         manifest: list[dict[str, Any]] = []
         media_paths: list[tuple[Path, str]] = []
-        for message in self._iter_message_rows(conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters):
+        for message in self._iter_message_rows(
+            conn, snapshot_max_id=snapshot_max_id, page_size=page_size, **filters
+        ):
             manifest.append(message)
             if include_media:
                 for media in message.get("media") or []:
@@ -2266,13 +3694,20 @@ class ChatArchiveStore:
                     try:
                         resolved = path.resolve()
                         media_root = self.media_dir.resolve()
-                        if resolved.exists() and resolved.is_file() and resolved != media_root and media_root in resolved.parents:
+                        if (
+                            resolved.exists()
+                            and resolved.is_file()
+                            and resolved != media_root
+                            and media_root in resolved.parents
+                        ):
                             safe_rel = rel.replace("\\", "/").lstrip("/")
                             media_paths.append((resolved, f"media/{safe_rel}"))
                     except Exception:
                         continue
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("messages.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            zf.writestr(
+                "messages.json", json.dumps(manifest, ensure_ascii=False, indent=2)
+            )
             zf.writestr("messages.md", self._messages_to_markdown(manifest))
             seen: set[str] = set()
             for path, arcname in media_paths:
@@ -2284,12 +3719,21 @@ class ChatArchiveStore:
     def _messages_to_markdown(self, messages: list[dict[str, Any]]) -> str:
         lines = ["# 聊天归档导出", ""]
         for message in messages:
-            sender = message.get("sender_name") or message.get("sender_id") or "未知用户"
-            lines.extend([f"## {self._format_export_time(message.get('created_at'))} - {sender}", ""])
+            sender = (
+                message.get("sender_name") or message.get("sender_id") or "未知用户"
+            )
+            lines.extend(
+                [
+                    f"## {self._format_export_time(message.get('created_at'))} - {sender}",
+                    "",
+                ]
+            )
             if message.get("text"):
                 lines.extend([str(message["text"]).strip(), ""])
             for media in message.get("media") or []:
-                lines.append(f"- 媒体: {media.get('kind') or 'file'} / {media.get('name') or media.get('source') or media.get('id')}")
+                lines.append(
+                    f"- 媒体: {media.get('kind') or 'file'} / {media.get('name') or media.get('source') or media.get('id')}"
+                )
             lines.append("")
         return "\n".join(lines)
 
@@ -2318,7 +3762,9 @@ class ChatArchiveStore:
         if numeric_id <= 0:
             return None
         with self._connection() as conn:
-            row = conn.execute("SELECT * FROM media WHERE id = ?", (numeric_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM media WHERE id = ?", (numeric_id,)
+            ).fetchone()
         if not row or not row["local_path"]:
             return None
         item = dict(row)
@@ -2377,7 +3823,9 @@ class ChatArchiveStore:
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return {"path": path, "name": path.name, "mime": mime}
 
-    def get_remote_proxy_file(self, source: str, *, kind: str = "image") -> dict[str, Any] | None:
+    def get_remote_proxy_file(
+        self, source: str, *, kind: str = "image"
+    ) -> dict[str, Any] | None:
         if not self.config.proxy_remote_media:
             return None
         url = str(source or "").strip()
@@ -2390,13 +3838,27 @@ class ChatArchiveStore:
         cached = self._read_proxy_cache(meta_path)
         if cached:
             try:
-                cached_path = (self.proxy_cache_dir / str(cached.get("file") or "")).resolve()
+                cached_path = (
+                    self.proxy_cache_dir / str(cached.get("file") or "")
+                ).resolve()
                 proxy_root = self.proxy_cache_dir.resolve()
             except Exception:
                 cached_path = None
                 proxy_root = None
-            if cached_path and proxy_root and (cached_path == proxy_root or proxy_root in cached_path.parents) and cached_path.exists() and cached_path.is_file():
-                cached_mime = self._detect_remote_media_mime(media_kind, cached_path) or str(cached.get("mime") or mimetypes.guess_type(cached_path.name)[0] or "application/octet-stream")
+            if (
+                cached_path
+                and proxy_root
+                and (cached_path == proxy_root or proxy_root in cached_path.parents)
+                and cached_path.exists()
+                and cached_path.is_file()
+            ):
+                cached_mime = self._detect_remote_media_mime(
+                    media_kind, cached_path
+                ) or str(
+                    cached.get("mime")
+                    or mimetypes.guess_type(cached_path.name)[0]
+                    or "application/octet-stream"
+                )
                 return {
                     "path": cached_path,
                     "name": str(cached.get("name") or cached_path.name),
@@ -2404,11 +3866,19 @@ class ChatArchiveStore:
                 }
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
-            final_url, response = self._open_remote_media(url, image_only=media_kind == "image", enforce_allowlist=True)
+            final_url, response = self._open_remote_media(
+                url, image_only=media_kind == "image", enforce_allowlist=True
+            )
             with response:
                 raw_content_type = response.headers.get("Content-Type")
-                content_type = self._normalize_remote_media_mime(media_kind, raw_content_type)
-                if raw_content_type and not content_type and not self._content_type_allows_sniffing(raw_content_type):
+                content_type = self._normalize_remote_media_mime(
+                    media_kind, raw_content_type
+                )
+                if (
+                    raw_content_type
+                    and not content_type
+                    and not self._content_type_allows_sniffing(raw_content_type)
+                ):
                     return None
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None and int(content_length) > max_bytes:
@@ -2425,12 +3895,21 @@ class ChatArchiveStore:
                             if size > max_bytes:
                                 return None
                             f.write(chunk)
-                    detected = self._detect_remote_media_mime(media_kind, temp_path) or content_type
+                    detected = (
+                        self._detect_remote_media_mime(media_kind, temp_path)
+                        or content_type
+                    )
                     if not detected:
-                        detected = mimetypes.guess_type(Path(urlparse(final_url).path).name)[0]
+                        detected = mimetypes.guess_type(
+                            Path(urlparse(final_url).path).name
+                        )[0]
                     if not self._remote_media_mime_allowed(media_kind, detected):
                         return None
-                    suffix = self._remote_media_suffix(final_url, Path(urlparse(final_url).path).name or f"remote-{media_kind}", detected or "application/octet-stream")
+                    suffix = self._remote_media_suffix(
+                        final_url,
+                        Path(urlparse(final_url).path).name or f"remote-{media_kind}",
+                        detected or "application/octet-stream",
+                    )
                     file_name = f"{cache_key}{suffix}"
                     target = self.proxy_cache_dir / file_name
                     if not target.exists():
@@ -2438,7 +3917,9 @@ class ChatArchiveStore:
                         temp_path = None
                     meta = {
                         "file": file_name,
-                        "name": _safe_name(Path(urlparse(final_url).path).name or file_name, file_name),
+                        "name": _safe_name(
+                            Path(urlparse(final_url).path).name or file_name, file_name
+                        ),
                         "mime": detected or "application/octet-stream",
                         "source": url,
                         "kind": media_kind,
@@ -2493,7 +3974,12 @@ class ChatArchiveStore:
                 header = f.read(64)
         except OSError:
             return None
-        if header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"\xff\xf3") or header.startswith(b"\xff\xf2"):
+        if (
+            header.startswith(b"ID3")
+            or header.startswith(b"\xff\xfb")
+            or header.startswith(b"\xff\xf3")
+            or header.startswith(b"\xff\xf2")
+        ):
             return "audio/mpeg"
         if header.startswith(b"OggS"):
             return "audio/ogg"
@@ -2528,9 +4014,18 @@ class ChatArchiveStore:
         if media_kind == "image":
             return ChatArchiveStore._normalize_image_mime(content_type) is not None
         if media_kind == "video":
-            return content_type.startswith("video/") or content_type in {"application/octet-stream", "binary/octet-stream", "application/octet-stream; charset=binary"}
+            return content_type.startswith("video/") or content_type in {
+                "application/octet-stream",
+                "binary/octet-stream",
+                "application/octet-stream; charset=binary",
+            }
         if media_kind == "record":
-            return content_type.startswith("audio/") or content_type in {"application/octet-stream", "binary/octet-stream", "audio/silk", "audio/amr"}
+            return content_type.startswith("audio/") or content_type in {
+                "application/octet-stream",
+                "binary/octet-stream",
+                "audio/silk",
+                "audio/amr",
+            }
         return (
             content_type.startswith("application/")
             or content_type.startswith("text/")
@@ -2549,7 +4044,12 @@ class ChatArchiveStore:
 
     @staticmethod
     def _escape_like(value: str) -> str:
-        return str(value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return (
+            str(value or "")
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
 
     @staticmethod
     def _normalize_search_query(query: str) -> str:
@@ -2577,7 +4077,11 @@ class ChatArchiveStore:
         value = str(color or "").strip()
         if not value:
             return ""
-        if len(value) == 7 and value.startswith("#") and all(char in "0123456789abcdefABCDEF" for char in value[1:]):
+        if (
+            len(value) == 7
+            and value.startswith("#")
+            and all(char in "0123456789abcdefABCDEF" for char in value[1:])
+        ):
             return value
         return ""
 
@@ -2617,20 +4121,42 @@ class ChatArchiveStore:
 
     def stats(self) -> dict[str, Any]:
         with self._connection() as conn:
-            msg = conn.execute("SELECT count(*) AS c, min(created_at) AS first_at, max(created_at) AS last_at, sum(media_count) AS media FROM messages").fetchone()
-            db_umos = {str(row["umo"]) for row in conn.execute("SELECT DISTINCT umo FROM messages").fetchall()}
-            media = conn.execute("SELECT kind, count(*) AS c FROM media GROUP BY kind ORDER BY c DESC").fetchall()
-            favorite_count = int(conn.execute("SELECT count(*) FROM favorite_messages").fetchone()[0] or 0)
-            tag_count = int(conn.execute("SELECT count(*) FROM tags").fetchone()[0] or 0)
-            search_history_count = int(conn.execute("SELECT count(*) FROM search_history").fetchone()[0] or 0)
+            msg = conn.execute(
+                "SELECT count(*) AS c, min(created_at) AS first_at, max(created_at) AS last_at, sum(media_count) AS media FROM messages"
+            ).fetchone()
+            db_umos = {
+                str(row["umo"])
+                for row in conn.execute("SELECT DISTINCT umo FROM messages").fetchall()
+            }
+            media = conn.execute(
+                "SELECT kind, count(*) AS c FROM media GROUP BY kind ORDER BY c DESC"
+            ).fetchall()
+            favorite_count = int(
+                conn.execute("SELECT count(*) FROM favorite_messages").fetchone()[0]
+                or 0
+            )
+            tag_count = int(
+                conn.execute("SELECT count(*) FROM tags").fetchone()[0] or 0
+            )
+            search_history_count = int(
+                conn.execute("SELECT count(*) FROM search_history").fetchone()[0] or 0
+            )
             prune_meta = self._get_meta_locked(conn, "last_prune", {})
             maintenance_meta = self._get_meta_locked(conn, "last_maintenance", {})
             ui_settings = self._get_meta_locked(conn, "ui_settings", {})
         pending = self._pending_messages()
-        first_values = [int(item.get("created_at") or 0) for item in pending if item.get("created_at")]
+        first_values = [
+            int(item.get("created_at") or 0)
+            for item in pending
+            if item.get("created_at")
+        ]
         if msg["first_at"]:
             first_values.append(int(msg["first_at"]))
-        last_values = [int(item.get("created_at") or 0) for item in pending if item.get("created_at")]
+        last_values = [
+            int(item.get("created_at") or 0)
+            for item in pending
+            if item.get("created_at")
+        ]
         if msg["last_at"]:
             last_values.append(int(msg["last_at"]))
         db_bytes = self.db_bytes()
@@ -2639,11 +4165,17 @@ class ChatArchiveStore:
         max_storage_mb = self.config.max_storage_mb
         usage_percent = None
         if max_storage_mb and float(max_storage_mb) > 0:
-            usage_percent = round(storage_bytes / (float(max_storage_mb) * 1024 * 1024) * 100, 2)
+            usage_percent = round(
+                storage_bytes / (float(max_storage_mb) * 1024 * 1024) * 100, 2
+            )
         return {
             "messages": int(msg["c"] or 0) + len(pending),
-            "conversations": len(db_umos | {str(item.get("umo") or "") for item in pending if item.get("umo")}),
-            "media": int(msg["media"] or 0) + sum(int(item.get("media_count") or 0) for item in pending),
+            "conversations": len(
+                db_umos
+                | {str(item.get("umo") or "") for item in pending if item.get("umo")}
+            ),
+            "media": int(msg["media"] or 0)
+            + sum(int(item.get("media_count") or 0) for item in pending),
             "favorites": favorite_count,
             "tags": tag_count,
             "search_history": search_history_count,
@@ -2659,10 +4191,18 @@ class ChatArchiveStore:
             "storage_bytes": storage_bytes,
             "max_storage_mb": max_storage_mb,
             "storage_usage_percent": usage_percent,
-            "last_prune_at": prune_meta.get("at") if isinstance(prune_meta, dict) else None,
-            "last_prune_removed": int(prune_meta.get("removed") or 0) if isinstance(prune_meta, dict) else 0,
-            "last_prune_freed_bytes": int(prune_meta.get("freed_bytes") or 0) if isinstance(prune_meta, dict) else 0,
-            "last_maintenance": maintenance_meta if isinstance(maintenance_meta, dict) else {},
+            "last_prune_at": prune_meta.get("at")
+            if isinstance(prune_meta, dict)
+            else None,
+            "last_prune_removed": int(prune_meta.get("removed") or 0)
+            if isinstance(prune_meta, dict)
+            else 0,
+            "last_prune_freed_bytes": int(prune_meta.get("freed_bytes") or 0)
+            if isinstance(prune_meta, dict)
+            else 0,
+            "last_maintenance": maintenance_meta
+            if isinstance(maintenance_meta, dict)
+            else {},
             "ui_settings": ui_settings if isinstance(ui_settings, dict) else {},
             "pending": self.pending_count(),
         }
@@ -2707,7 +4247,13 @@ class ChatArchiveStore:
                 """
             ).fetchall()
             for row in media_missing_messages:
-                issues.append({"type": "orphan_media_row", "media_id": int(row["id"]), "message_uid": row["message_uid"]})
+                issues.append(
+                    {
+                        "type": "orphan_media_row",
+                        "media_id": int(row["id"]),
+                        "message_uid": row["message_uid"],
+                    }
+                )
 
             blob_ref_rows = conn.execute(
                 """
@@ -2742,9 +4288,25 @@ class ChatArchiveStore:
             pending_lines = 0
             fallback_lines = 0
             if self.pending_path.exists():
-                pending_lines = len([line for line in self.pending_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()])
+                pending_lines = len(
+                    [
+                        line
+                        for line in self.pending_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()
+                        if line.strip()
+                    ]
+                )
             if self.fallback_path.exists():
-                fallback_lines = len([line for line in self.fallback_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()])
+                fallback_lines = len(
+                    [
+                        line
+                        for line in self.fallback_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()
+                        if line.strip()
+                    ]
+                )
 
             result = {
                 "ok": not issues,
@@ -2776,8 +4338,12 @@ class ChatArchiveStore:
                     """
                 ).fetchall()
             }
-            blob_rows = conn.execute("SELECT hash, local_path, ref_count FROM media_blobs").fetchall()
-            known_paths = {str(row["local_path"]) for row in blob_rows if row["local_path"]}
+            blob_rows = conn.execute(
+                "SELECT hash, local_path, ref_count FROM media_blobs"
+            ).fetchall()
+            known_paths = {
+                str(row["local_path"]) for row in blob_rows if row["local_path"]
+            }
 
             for row in blob_rows:
                 media_hash = str(row["hash"] or "")
@@ -2798,7 +4364,9 @@ class ChatArchiveStore:
                     removed_file_bytes += file_bytes
                 removed_blob_rows += 1
                 if not dry_run:
-                    conn.execute("DELETE FROM media_blobs WHERE hash = ?", (media_hash,))
+                    conn.execute(
+                        "DELETE FROM media_blobs WHERE hash = ?", (media_hash,)
+                    )
 
             try:
                 for path in self.media_dir.rglob("*"):
@@ -2809,7 +4377,10 @@ class ChatArchiveStore:
                         continue
                     resolved_path = path.resolve()
                     media_root = self.media_dir.resolve()
-                    if resolved_path == media_root or media_root not in resolved_path.parents:
+                    if (
+                        resolved_path == media_root
+                        or media_root not in resolved_path.parents
+                    ):
                         continue
                     orphan_files.append(path_text)
                     file_bytes = self._safe_media_unlink(path, dry_run=dry_run)
@@ -2868,9 +4439,14 @@ class ChatArchiveStore:
         page_size: int = 500,
         after_snapshot=None,
     ) -> Path:
-        output = self.export_dir / (output_name or f"chat_archive_{int(time.time())}.json")
+        output = self.export_dir / (
+            output_name or f"chat_archive_{int(time.time())}.json"
+        )
         with self._connection() as conn:
-            snapshot_max_id = int(conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0] or 0)
+            snapshot_max_id = int(
+                conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
+                or 0
+            )
             if after_snapshot:
                 after_snapshot()
             self._write_export_json(
@@ -2887,21 +4463,31 @@ class ChatArchiveStore:
             )
         return output
 
-    def prune_older_than(self, days: int = 0, *, max_storage_mb: float | None = None) -> int:
+    def prune_older_than(
+        self, days: int = 0, *, max_storage_mb: float | None = None
+    ) -> int:
         removed = 0
         before_bytes = self.storage_bytes()
         with self._connection() as conn:
             if days and days > 0:
                 cutoff = int(time.time()) - max(1, int(days)) * 86400
-                rows = conn.execute("SELECT message_uid FROM messages WHERE created_at < ?", (cutoff,)).fetchall()
+                rows = conn.execute(
+                    "SELECT message_uid FROM messages WHERE created_at < ?", (cutoff,)
+                ).fetchall()
                 removed += len(rows)
                 for row in rows:
                     self._delete_message_locked(conn, row["message_uid"])
-            limit_mb = max_storage_mb if max_storage_mb is not None else self.config.max_storage_mb
+            limit_mb = (
+                max_storage_mb
+                if max_storage_mb is not None
+                else self.config.max_storage_mb
+            )
             if limit_mb and float(limit_mb) > 0:
                 limit_bytes = int(float(limit_mb) * 1024 * 1024)
                 while self.storage_bytes() > limit_bytes:
-                    row = conn.execute("SELECT message_uid FROM messages ORDER BY created_at ASC, id ASC LIMIT 1").fetchone()
+                    row = conn.execute(
+                        "SELECT message_uid FROM messages ORDER BY created_at ASC, id ASC LIMIT 1"
+                    ).fetchone()
                     if not row:
                         break
                     self._delete_message_locked(conn, row["message_uid"])
@@ -2924,14 +4510,20 @@ class ChatArchiveStore:
 
     def delete_message(self, message_uid: str) -> bool:
         with self._connection() as conn:
-            exists = conn.execute("SELECT 1 FROM messages WHERE message_uid = ?", (message_uid,)).fetchone()
+            exists = conn.execute(
+                "SELECT 1 FROM messages WHERE message_uid = ?", (message_uid,)
+            ).fetchone()
             if not exists:
                 return False
             self._delete_message_locked(conn, message_uid)
             return True
 
-    def _delete_message_locked(self, conn: sqlite3.Connection, message_uid: str) -> None:
-        media_rows = conn.execute("SELECT hash FROM media WHERE message_uid = ?", (message_uid,)).fetchall()
+    def _delete_message_locked(
+        self, conn: sqlite3.Connection, message_uid: str
+    ) -> None:
+        media_rows = conn.execute(
+            "SELECT hash FROM media WHERE message_uid = ?", (message_uid,)
+        ).fetchall()
         conn.execute("DELETE FROM messages WHERE message_uid = ?", (message_uid,))
         for media_row in media_rows:
             media_hash = media_row["hash"]
@@ -2945,13 +4537,18 @@ class ChatArchiveStore:
                 """,
                 (int(time.time()), media_hash),
             )
-            blob = conn.execute("SELECT * FROM media_blobs WHERE hash = ?", (media_hash,)).fetchone()
+            blob = conn.execute(
+                "SELECT * FROM media_blobs WHERE hash = ?", (media_hash,)
+            ).fetchone()
             if blob and int(blob["ref_count"] or 0) <= 0:
                 path = Path(blob["local_path"])
                 try:
                     resolved_path = path.resolve()
                     media_root = self.media_dir.resolve()
-                    if (resolved_path == media_root or media_root in resolved_path.parents) and resolved_path.exists():
+                    if (
+                        resolved_path == media_root
+                        or media_root in resolved_path.parents
+                    ) and resolved_path.exists():
                         resolved_path.unlink()
                 except Exception:
                     pass

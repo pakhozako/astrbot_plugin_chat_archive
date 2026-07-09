@@ -33,23 +33,36 @@ class ChatArchivePlugin(Star):
                 capture_media_files=bool(config.get("capture_media_files", True)),
                 max_media_mb=int(config.get("max_media_mb", 200) or 200),
                 download_remote_media=bool(config.get("download_remote_media", True)),
-                remote_media_timeout_seconds=float(config.get("remote_media_timeout_seconds", 10) or 10),
-                allow_private_remote_media=bool(config.get("allow_private_remote_media", False)),
+                remote_media_timeout_seconds=float(
+                    config.get("remote_media_timeout_seconds", 10) or 10
+                ),
+                allow_private_remote_media=bool(
+                    config.get("allow_private_remote_media", False)
+                ),
                 proxy_remote_media=bool(config.get("proxy_remote_media", True)),
                 remote_media_allowed_hosts=tuple(
                     str(item).strip().lower()
-                    for item in (config.get("remote_media_allowed_hosts", None) or sorted(REMOTE_MEDIA_ALLOWED_HOSTS))
+                    for item in (
+                        config.get("remote_media_allowed_hosts", None)
+                        or sorted(REMOTE_MEDIA_ALLOWED_HOSTS)
+                    )
                     if str(item).strip()
                 ),
-                max_storage_mb=self._optional_number(config.get("max_storage_mb", None)),
+                max_storage_mb=self._optional_number(
+                    config.get("max_storage_mb", None)
+                ),
                 durable_write=bool(config.get("durable_write", True)),
             ),
         )
-        self.web = ChatArchiveWeb(context, self.store, page_size=int(config.get("web_page_size", 80) or 80))
+        self.web = ChatArchiveWeb(
+            context, self.store, page_size=int(config.get("web_page_size", 80) or 80)
+        )
         self.enabled = bool(config.get("enabled", True))
         self.capture_private = bool(config.get("capture_private", True))
         self.capture_group = bool(config.get("capture_group", True))
-        self.ignore_prefixes = [str(x) for x in (config.get("ignore_command_prefixes", []) or [])]
+        self.ignore_prefixes = [
+            str(x) for x in (config.get("ignore_command_prefixes", []) or [])
+        ]
 
     async def initialize(self):
         self.web.register_routes()
@@ -57,10 +70,11 @@ class ChatArchivePlugin(Star):
         pending_replay = await self.store.replay_pending()
         if pending_replay["attempted"]:
             logger.info(
-                "Replay Pending: attempted=%s replayed=%s failed=%s archive=%s",
+                "Replay Pending: attempted=%s replayed=%s failed=%s corrupt=%s archive=%s",
                 pending_replay["attempted"],
                 pending_replay["replayed"],
                 pending_replay["failed"],
+                pending_replay.get("corrupt", 0),
                 pending_replay["archive_path"],
             )
             logger.info(
@@ -71,6 +85,11 @@ class ChatArchivePlugin(Star):
             )
             if pending_replay.get("cleared"):
                 logger.info("Pending Cleared: %s", self.store.pending_path)
+            if pending_replay.get("corrupt_archive_path"):
+                logger.warning(
+                    "Pending Corrupt Lines Archived: %s",
+                    pending_replay["corrupt_archive_path"],
+                )
         replay = await self.store.replay_fallback_log()
         if replay["attempted"]:
             logger.info(
@@ -119,19 +138,35 @@ class ChatArchivePlugin(Star):
         try:
             await self.store.store_event(event)
         except Exception as exc:
-            logger.warning("Chat Archive failed to store message: %s", exc, exc_info=True)
+            logger.warning(
+                "Chat Archive failed to store message: %s", exc, exc_info=True
+            )
 
     @staticmethod
     def _event_message_type(event: AstrMessageEvent) -> str:
+        # AstrBot adapters expose message type through slightly different
+        # attributes/enums; normalize the common shapes before filtering.
         for value in ChatArchivePlugin._raw_event_message_type_values(event):
             normalized = value.strip().lower().replace("-", "_")
             compact = normalized.replace("_", "")
-            if normalized in {"group", "group_message", "guild", "channel"} or compact in {
+            if normalized in {
+                "group",
+                "group_message",
+                "guild",
+                "channel",
+            } or compact in {
                 "groupmessage",
                 "messagetype.groupmessage",
             }:
                 return "group"
-            if normalized in {"private", "friend", "friend_message", "direct", "dm", "private_message"} or compact in {
+            if normalized in {
+                "private",
+                "friend",
+                "friend_message",
+                "direct",
+                "dm",
+                "private_message",
+            } or compact in {
                 "friendmessage",
                 "privatemessage",
                 "messagetype.friendmessage",
@@ -193,9 +228,27 @@ class ChatArchivePlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("chatlog", priority=100)
-    async def chatlog(self, event: AstrMessageEvent, action: str = "", arg: str = "", arg2: str = ""):
-        event.stop_event()
-        action = (action or "status").strip().lower()
+    async def chatlog(
+        self, event: AstrMessageEvent, action: str = "", arg: str = "", arg2: str = ""
+    ):
+        action_name = action
+        try:
+            event.stop_event()
+            action_name = (action or "status").strip().lower()
+            async for result in self._chatlog_command(event, action_name, arg, arg2):
+                yield result
+        except Exception as exc:
+            logger.exception(
+                "Chat Archive command failed: action=%s arg=%s arg2=%s",
+                action_name,
+                arg,
+                arg2,
+            )
+            yield event.plain_result(f"聊天归档命令执行失败: {exc}")
+
+    async def _chatlog_command(
+        self, event: AstrMessageEvent, action: str, arg: str = "", arg2: str = ""
+    ):
         if action == "status":
             stats = self.store.stats()
             storage_line = f"总占用: {self._format_mb(stats.get('storage_bytes'))}"
@@ -247,7 +300,11 @@ class ChatArchivePlugin(Star):
                 yield event.plain_result("用法: /chatlog prune <天数> [最大MB]")
                 return
             max_storage_mb = self._optional_number(arg2)
-            if days <= 0 and not max_storage_mb and not self.store.config.max_storage_mb:
+            if (
+                days <= 0
+                and not max_storage_mb
+                and not self.store.config.max_storage_mb
+            ):
                 yield event.plain_result("请提供天数或最大存储 MB")
                 return
             await self.store.flush_pending()
@@ -305,4 +362,6 @@ class ChatArchivePlugin(Star):
         if action == "ping":
             yield event.plain_result(f"ok {int(time.time())}")
             return
-        yield event.plain_result("用法: /chatlog status | export [json|markdown|txt|html|zip] | prune <天数> [最大MB] | check | gc [dry] | optimize [vacuum]")
+        yield event.plain_result(
+            "用法: /chatlog status | export [json|markdown|txt|html|zip] | prune <天数> [最大MB] | check | gc [dry] | optimize [vacuum]"
+        )

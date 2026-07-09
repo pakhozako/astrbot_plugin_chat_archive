@@ -12,7 +12,8 @@ author: "Codex"
 repo: "https://github.com/pakhozako/astrbot_plugin_chat_archive"
 support_platforms:
   - aiocqhttp
-  - webchat
+  - qq_official
+  - qq_official_webhook
   - telegram
   - discord
   - slack
