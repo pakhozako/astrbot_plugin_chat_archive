@@ -128,6 +128,7 @@ const els = {
   historyList: document.getElementById("historyList"),
   clearHistoryBtn: document.getElementById("clearHistoryBtn"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
+  railMenuBtn: queryDocument(".rail-menu"),
   railScrim: queryDocument(".rail-scrim"),
   chatAvatar: queryDocument(".chat-avatar"),
   profileAvatarLarge: queryDocument(".profile-avatar-large"),
@@ -140,6 +141,19 @@ let messageCacheUnavailable = false;
 function setSessionsOpen(open) {
   document.body.classList.toggle("sessions-open", Boolean(open));
   els.sessionToggleBtn?.setAttribute("aria-expanded", String(Boolean(open)));
+}
+
+function setRailCompact(compact) {
+  document.body.classList.toggle("rail-compact", Boolean(compact));
+  els.railMenuBtn?.setAttribute("aria-pressed", String(Boolean(compact)));
+}
+
+function handleRailMenuToggle() {
+  if (window.innerWidth <= 760) {
+    setSessionsOpen(!document.body.classList.contains("sessions-open"));
+    return;
+  }
+  setRailCompact(!document.body.classList.contains("rail-compact"));
 }
 
 function disableMessageCache() {
@@ -1137,7 +1151,7 @@ function renderMessage(item, group, active = false) {
   node.dataset.key = `msg-${uid}`;
 
   const text = messagePlainText(item);
-  const bodyHtml = messageBodyHtml(item);
+  const bodyHtml = messageBodyHtml(item).trim();
   const sender = senderDisplayName(item);
   const media = mediaForGrid(item);
   const platform = item.platform || "";
@@ -1567,7 +1581,7 @@ function renderFilters() {
 }
 
 function renderTagChipHtml(tag) {
-  const color = tag.color || "#3390ec";
+  const color = tag.color || "#256f91";
   return `<span class="tag-chip" style="--tag-color:${escapeAttr(color)}">${escapeHtml(tag.name || "标签")}</span>`;
 }
 
@@ -1603,7 +1617,7 @@ function renderTagDialog() {
       label.className = "tag-option";
       label.innerHTML = `
         <input type="checkbox" ${messageTags.has(Number(tag.id)) ? "checked" : ""} />
-        <span class="tag-dot" style="--tag-color:${escapeAttr(tag.color || "#3390ec")}"></span>
+        <span class="tag-dot" style="--tag-color:${escapeAttr(tag.color || "#256f91")}"></span>
         <span>${escapeHtml(tag.name)}</span>
         <small>${fmtNumber(tag.message_count || 0)}</small>
       `;
@@ -4191,7 +4205,7 @@ function initials(value) {
 }
 
 function avatarColor(value) {
-  const colors = ["#3390ec", "#45a886", "#d17a22", "#8e6bd8", "#d65064", "#5271c4"];
+  const colors = ["#256f91", "#5e8e63", "#b87428", "#8d6a45", "#b64242", "#5a6877"];
   let hash = 0;
   for (const char of String(value || "")) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
   return colors[hash % colors.length];
@@ -4402,6 +4416,7 @@ function bindEvents() {
   els.createTagBtn?.addEventListener("click", () => createTagFromDialog().catch((error) => toast(error.message || "创建失败")));
   els.prevSearchBtn.addEventListener("click", () => jumpSearch(-1));
   els.nextSearchBtn.addEventListener("click", () => jumpSearch(1));
+  els.railMenuBtn?.addEventListener("click", handleRailMenuToggle);
   els.sessionToggleBtn?.addEventListener("click", () => {
     setSessionsOpen(!document.body.classList.contains("sessions-open"));
   });
@@ -4469,6 +4484,7 @@ function bindEvents() {
   if (typeof window.addEventListener === "function") {
     window.addEventListener("resize", () => {
       if (window.innerWidth > 760) setSessionsOpen(false);
+      if (window.innerWidth <= 760) setRailCompact(false);
     });
   }
   let timer = null;
@@ -4622,7 +4638,7 @@ async function demoApiPost(path, body = {}) {
   const clean = endpoint(path);
   if (clean === "favorite") return { message_uid: body.message_uid, favorite: body.favorite };
   if (clean === "tags") {
-    const tag = { id: demoTags.length + 1, name: body.name || "新标签", color: body.color || "#3390ec", message_count: 0 };
+    const tag = { id: demoTags.length + 1, name: body.name || "新标签", color: body.color || "#256f91", message_count: 0 };
     demoTags.push(tag);
     return tag;
   }

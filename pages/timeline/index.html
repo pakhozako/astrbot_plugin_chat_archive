@@ -10,9 +10,8 @@
     <main class="messenger-shell shell" aria-label="聊天归档阅读器">
       <aside class="session-rail rail" aria-label="会话索引">
         <header class="rail-searchbar">
-          <button class="rail-menu icon-button" type="button" aria-label="会话菜单">☰</button>
+          <button class="rail-menu icon-button" type="button" aria-label="切换会话栏" aria-pressed="false">☰</button>
           <div class="search-shell">
-            <span class="search-icon" aria-hidden="true">⌕</span>
             <input id="searchInput" type="search" placeholder="搜索" autocomplete="off" aria-label="搜索消息" />
             <span id="searchCount" class="search-count"></span>
             <button id="prevSearchBtn" class="icon-button search-step" type="button" title="上一个结果" aria-label="上一个搜索结果">↑</button>
@@ -89,12 +88,6 @@
           <div id="timeline" class="timeline" aria-live="polite"></div>
           <button id="jumpLatestBtn" class="button jump-latest" type="button" hidden>跳到最新</button>
         </div>
-
-        <footer class="archive-composer" aria-label="只读归档工具栏">
-          <span class="composer-icon" aria-hidden="true">⌕</span>
-          <span class="composer-text">只读归档</span>
-          <span class="composer-meta">搜索、筛选、导出和查看原始记录</span>
-        </footer>
       </section>
 
       <aside id="inspectorPane" class="profile-panel inspector-pane" aria-label="归档资料">
@@ -133,7 +126,7 @@
         <header>
           <div>
             <h3 id="forwardViewerTitle">合并转发</h3>
-            <p class="panel-meta">只读归档预览</p>
+            <p class="panel-meta">转发预览</p>
           </div>
           <button id="closeForwardBtn" class="icon-button" type="button" aria-label="关闭合并转发预览">×</button>
         </header>
@@ -153,7 +146,7 @@
         <div id="tagDialogList" class="tag-dialog-list"></div>
         <div class="tag-create">
           <input id="newTagName" type="text" maxlength="40" placeholder="新标签名称" aria-label="新标签名称" />
-          <input id="newTagColor" type="color" value="#3390ec" aria-label="标签颜色" />
+          <input id="newTagColor" type="color" value="#256f91" aria-label="标签颜色" />
           <button id="createTagBtn" class="button" type="button">新建</button>
         </div>
       </form>
