@@ -4,6 +4,7 @@ import ast
 import json
 import re
 import struct
+import subprocess
 from pathlib import Path
 
 
@@ -61,6 +62,7 @@ STDLIB_IMPORTS = {
     "uuid",
     "zipfile",
 }
+FORBIDDEN_TRACKED_PATHS = (".github/workflows", "tests")
 
 
 def main() -> int:
@@ -156,6 +158,12 @@ def main() -> int:
         failures.append("storage.py pending WAL must be rooted under self.data_dir")
     if 'self.data_dir / "chat_archive.sqlite3"' not in storage_text:
         failures.append("storage.py sqlite database must be rooted under self.data_dir")
+    forbidden_tracked = git_tracked_paths_under(FORBIDDEN_TRACKED_PATHS)
+    if forbidden_tracked:
+        failures.append(
+            "publish repository must not track these local-only paths: "
+            + ", ".join(forbidden_tracked)
+        )
 
     if failures:
         for failure in failures:
@@ -251,6 +259,19 @@ def config_get_keys(path: Path) -> set[str]:
             if isinstance(key_node.value, str):
                 keys.add(key_node.value)
     return keys
+
+
+def git_tracked_paths_under(prefixes: tuple[str, ...]) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "--", *prefixes],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
 def requirement_name(import_name: str) -> str:
