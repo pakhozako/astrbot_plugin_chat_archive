@@ -32,15 +32,6 @@ pages/
     ├── index.html       ← 插件 Page 入口
     ├── app.js           ← Timeline WebUI、Bridge API、交互逻辑
     └── style.css        ← Telegram 风格界面样式
-tests/
-├── storage_smoke.py
-├── test_pending_replay.py
-├── test_media_elements.py
-├── test_reliability_stage1.py
-├── test_search_export_stage3.py
-├── test_frontend_fix_verification.py
-├── test_frontend_logic.py
-└── test_experience_stage4.py
 ```
 
 **设计原则：** 消息一旦进入插件，先写入 `pending.jsonl`，再进入内存批量队列，最后批量提交 SQLite。SQLite 是主要查询源，JSONL/Pending/Fallback 是恢复与审计辅助。

@@ -12,7 +12,7 @@
 - Split SQLite schema setup, migrations, and schema status into `schema.py`.
 - Improved LuckyLilliaBot/Milky-style message normalization for `mention_all`, `market_face`, `temp_url` media, and richer forward previews.
 - Redesigned the timeline WebUI as a denser archive console with steadier three-pane desktop layout, cleaner mobile header controls, and safer message/media width handling.
-- Added ruff configuration and made repository tests trackable instead of ignoring the whole `tests/` directory.
+- Added ruff configuration and release-package checks for the publish repository.
 - Split Pending WAL/fallback replay helpers into `wal.py` and added a shared local `scripts/run_checks.py` check entrypoint.
 
 ## 2026-07-07
