@@ -10,7 +10,8 @@
     <main class="shell">
       <aside class="rail">
         <div class="brand">
-          <div>
+          <span class="brand-mark" aria-hidden="true">CA</span>
+          <div class="brand-copy">
               <h1>聊天归档</h1>
               <p id="statLine">加载中</p>
           </div>
@@ -41,25 +42,29 @@
 
       <section class="timeline-panel">
         <header class="timeline-header">
-          <div>
+          <div class="header-copy">
             <div class="eyebrow">消息时间线</div>
             <h2 id="currentTitle">全部会话</h2>
             <p id="currentMeta" class="panel-meta">加载中</p>
             <div id="statusStrip" class="status-strip" aria-label="归档状态"></div>
           </div>
           <div class="header-actions">
-            <button id="sessionToggleBtn" class="button subtle session-toggle" type="button">会话</button>
-            <select id="exportFormat" class="select-compact" aria-label="导出格式">
-              <option value="json">JSON</option>
-              <option value="markdown">Markdown</option>
-              <option value="txt">TXT</option>
-              <option value="html">HTML</option>
-              <option value="zip">ZIP</option>
-            </select>
-            <label class="check-compact"><input id="includeMediaExport" type="checkbox" />媒体</label>
-            <button id="exportBtn" class="button">导出</button>
+            <div class="action-cluster">
+              <button id="sessionToggleBtn" class="button subtle session-toggle" type="button">会话</button>
+              <button id="loadMoreBtn" class="button subtle">加载更早</button>
+            </div>
+            <div class="action-cluster export-cluster">
+              <select id="exportFormat" class="select-compact" aria-label="导出格式">
+                <option value="json">JSON</option>
+                <option value="markdown">Markdown</option>
+                <option value="txt">TXT</option>
+                <option value="html">HTML</option>
+                <option value="zip">ZIP</option>
+              </select>
+              <label class="check-compact"><input id="includeMediaExport" type="checkbox" />媒体</label>
+              <button id="exportBtn" class="button">导出</button>
+            </div>
             <button id="settingsBtn" class="button subtle" type="button">设置</button>
-            <button id="loadMoreBtn" class="button subtle">加载更早</button>
           </div>
         </header>
         <div id="timeline" class="timeline" aria-live="polite"></div>

@@ -11,6 +11,7 @@
 - Split configuration/constants/helpers into `archive_config.py` while keeping the existing `storage.py` import surface compatible.
 - Split SQLite schema setup, migrations, and schema status into `schema.py`.
 - Improved LuckyLilliaBot/Milky-style message normalization for `mention_all`, `market_face`, `temp_url` media, and richer forward previews.
+- Redesigned the timeline WebUI as a denser archive console with steadier three-pane desktop layout, cleaner mobile header controls, and safer message/media width handling.
 - Added ruff configuration and made repository tests trackable instead of ignoring the whole `tests/` directory.
 - Split Pending WAL/fallback replay helpers into `wal.py` and added a shared local `scripts/run_checks.py` check entrypoint.
 
