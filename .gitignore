@@ -5,7 +5,8 @@ __pycache__/
 data/
 media/
 exports/
-tests/
+tests/node_test_runner.js
+tests/real13_send_28.py
 *.sqlite3
 *.sqlite3-*
 *.db

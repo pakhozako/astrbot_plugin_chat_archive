@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-09
+
+- Fixed AstrBot plugin packaging compliance: valid `support_platforms`, explicit `requirements.txt`, and 256x256 `logo.png`.
+- Tightened `astrbot_version` to the documented PEP 440 range `>=4.16,<5`.
+- Added schema version tracking with `schema_migrations`, `PRAGMA user_version`, status output, and integrity-check mismatch detection.
+- Hardened Pending WAL recovery by archiving corrupt JSONL rows separately while replaying valid entries.
+- Wrapped startup recovery/prune in logged exception guards so one recovery failure does not prevent plugin loading.
+- Switched remote media download/proxy fetches to async `httpx.AsyncClient` and added local HTTP coverage for remote image archival.
+- Split configuration/constants/helpers into `archive_config.py` while keeping the existing `storage.py` import surface compatible.
+- Added ruff configuration and made repository tests trackable instead of ignoring the whole `tests/` directory.
+- Split Pending WAL/fallback replay helpers into `wal.py`, added a shared `scripts/run_checks.py`, and wired GitHub Actions to the same check entrypoint.
+
 ## 2026-07-07
 
 - Added SQLite WAL mode, incremental indexes, LIKE escaping, media hash deduplication, numeric-only media access, storage-cap pruning, and streaming JSON export.

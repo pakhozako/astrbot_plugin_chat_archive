@@ -20,4 +20,4 @@ support_platforms:
   - satori
   - wecom
   - lark
-astrbot_version: ">=4.16"
+astrbot_version: ">=4.16,<5"

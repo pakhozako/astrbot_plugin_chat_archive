@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>媒体渲染测试 - Chat Archive</title>
+    <link rel="stylesheet" href="../pages/timeline/style.css">
+    <style>
+        body {
+            margin: 20px;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .test-section {
+            margin: 30px 0;
+            padding: 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+        }
+        .test-section h2 {
+            margin-top: 0;
+            color: #333;
+        }
+        .test-result {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .test-result.pass {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .test-result.fail {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .test-result.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .message-container {
+            margin: 15px 0;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 8px;
+        }
+        .debug-info {
+            margin: 10px 0;
+            padding: 10px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <h1>Chat Archive - 前端媒体渲染测试</h1>
+
+    <div class="test-section">
+        <h2>测试 1: 单个表情包 - 模拟用户问题场景</h2>
+        <div class="test-result info">
+            场景：对方只发送一个 GIF 表情包<br>
+            预期：只显示一个媒体块，无"图片不可用"，无临时路径
+        </div>
+        <div id="test1-container" class="message-container"></div>
+        <div id="test1-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 2: 图片消息 - DB media 存在</h2>
+        <div class="test-result info">
+            场景：DB 已归档图片<br>
+            预期：显示一个图片媒体块（compact 模式）
+        </div>
+        <div id="test2-container" class="message-container"></div>
+        <div id="test2-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 3: 混合消息 - 文字 + 图片</h2>
+        <div class="test-result info">
+            场景：文字和图片混合<br>
+            预期：文字正常显示，图片只显示一次
+        </div>
+        <div id="test3-container" class="message-container"></div>
+        <div id="test3-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 4: 占位文本过滤</h2>
+        <div class="test-result info">
+            场景：raw 里只有 [图片] 占位文本，DB media 存在<br>
+            预期：占位文本被过滤，只显示 DB media
+        </div>
+        <div id="test4-container" class="message-container"></div>
+        <div id="test4-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 5: 多个 raw 候选源</h2>
+        <div class="test-result info">
+            场景：raw 里有多个图片元素，DB media 只有一个<br>
+            预期：只显示 DB media，raw 元素被跳过
+        </div>
+        <div id="test5-container" class="message-container"></div>
+        <div id="test5-result"></div>
+    </div>
+
+    <script src="../pages/timeline/app.js"></script>
+    <script>
+        // 模拟 state 和必要函数
+        window.state = {
+            q: '',
+            messages: []
+        };
+
+        // 测试辅助函数
+        function assert(condition, message) {
+            if (!condition) {
+                throw new Error('断言失败: ' + message);
+            }
+        }
+
+        function countMediaBlocks(container) {
+            return container.querySelectorAll('.media-card, .media-thumb, img[src*="media"]').length;
+        }
+
+        function hasText(container, text) {
+            return container.textContent.includes(text);
+        }
+
+        function runTest(testId, testFn) {
+            const resultDiv = document.getElementById(testId + '-result');
+            try {
+                const result = testFn();
+                resultDiv.className = 'test-result pass';
+                resultDiv.innerHTML = '✓ 测试通过<br>' + result;
+            } catch (error) {
+                resultDiv.className = 'test-result fail';
+                resultDiv.innerHTML = '✗ 测试失败<br>' + error.message;
+                console.error(testId + ' 失败:', error);
+            }
+        }
+
+        // 测试 1: 单个表情包（核心问题场景）
+        runTest('test1', () => {
+            const container = document.getElementById('test1-container');
+
+            // 模拟用户问题：raw 里有多个临时路径，DB media 里有一个 GIF
+            const message = {
+                message_id: 'test-sticker-1',
+                text: '[图片]',
+                raw: {
+                    elements: [
+                        {
+                            picElement: {
+                                originImageUrl: 'C:\\Users\\Claude\\.astrbot\\data\\temp\\media_image_1f9fda9642b9476fbf2a9f38428c1c4b.gif',
+                                summary: '图片不可用'
+                            }
+                        },
+                        {
+                            picElement: {
+                                originImageUrl: 'C:\\temp\\another_path.gif',
+                                summary: '图片'
+                            }
+                        }
+                    ]
+                },
+                media: [
+                    {
+                        id: 1,
+                        kind: 'image',
+                        name: 'C7A8EB15DB806AB1AED0BCCB15A0E4B6.gif',
+                        source: 'https://gchat.qpic.cn/gchatpic_new/test/sticker.gif',
+                        mime: 'image/gif'
+                    }
+                ]
+            };
+
+            // 渲染消息体
+            const bodyHtml = messageBodyHtml(message);
+            const mediaItems = mediaForGrid(message);
+
+            container.innerHTML = `
+                <div class="message-text">${bodyHtml || '(无文本)'}</div>
+                <div class="media-grid">${mediaItems.map(m => `<div class="media-card">[媒体: ${m.name}]</div>`).join('')}</div>
+            `;
+
+            // 断言
+            assert(mediaItems.length === 1, `应该只有1个媒体，实际: ${mediaItems.length}`);
+            assert(mediaItems[0].kind === 'image', '媒体类型应该是 image');
+            assert(!bodyHtml.includes('C:\\'), '不应显示临时路径');
+            assert(!bodyHtml.includes('[图片]'), '不应显示占位文本');
+            assert(!bodyHtml.includes('图片不可用'), '不应显示图片不可用');
+
+            return `媒体块数量: ${mediaItems.length} (预期: 1)<br>` +
+                   `消息文本: "${bodyHtml || '(空)'}" (预期: 空或不含占位符)<br>` +
+                   `媒体来源: ${mediaItems[0].source}`;
+        });
+
+        // 测试 2: DB media 存在的图片
+        runTest('test2', () => {
+            const container = document.getElementById('test2-container');
+
+            const message = {
+                message_id: 'test-image-1',
+                text: '看看这张图',
+                media: [
+                    {
+                        id: 2,
+                        kind: 'image',
+                        name: 'photo.jpg',
+                        source: 'https://example.com/photo.jpg',
+                        mime: 'image/jpeg'
+                    }
+                ]
+            };
+
+            const bodyHtml = messageBodyHtml(message);
+            const mediaItems = mediaForGrid(message);
+
+            container.innerHTML = `
+                <div class="message-text">${bodyHtml}</div>
+                <div class="media-grid">${mediaItems.map(m => `<div class="media-card image">[图片: ${m.name}]</div>`).join('')}</div>
+            `;
+
+            assert(mediaItems.length === 1, `应该只有1个媒体，实际: ${mediaItems.length}`);
+            assert(bodyHtml.includes('看看这张图'), '应该显示消息文本');
+
+            return `媒体块数量: ${mediaItems.length}<br>消息文本正常显示`;
+        });
+
+        // 测试 3: 文字 + 图片混合
+        runTest('test3', () => {
+            const container = document.getElementById('test3-container');
+
+            const message = {
+                message_id: 'test-mixed-1',
+                text: '今天天气真好',
+                components: [
+                    { type: 'text', text: '今天天气真好' }
+                ],
+                media: [
+                    {
+                        id: 3,
+                        kind: 'image',
+                        name: 'weather.png',
+                        source: 'https://example.com/weather.png',
+                        mime: 'image/png'
+                    }
+                ]
+            };
+
+            const bodyHtml = messageBodyHtml(message);
+            const mediaItems = mediaForGrid(message);
+
+            container.innerHTML = `
+                <div class="message-text">${bodyHtml}</div>
+                <div class="media-grid">${mediaItems.map(m => `<div class="media-card">[媒体: ${m.name}]</div>`).join('')}</div>
+            `;
+
+            assert(mediaItems.length === 1, `应该只有1个媒体，实际: ${mediaItems.length}`);
+            assert(bodyHtml.includes('今天天气真好'), '应该显示文字内容');
+
+            return `文字和媒体都正确显示`;
+        });
+
+        // 测试 4: 占位文本过滤
+        runTest('test4', () => {
+            const container = document.getElementById('test4-container');
+
+            const message = {
+                message_id: 'test-placeholder-1',
+                text: '[图片]',
+                media: [
+                    {
+                        id: 4,
+                        kind: 'image',
+                        name: 'filtered.jpg',
+                        source: 'https://example.com/filtered.jpg',
+                        mime: 'image/jpeg'
+                    }
+                ]
+            };
+
+            const bodyHtml = messageBodyHtml(message);
+            const mediaItems = mediaForGrid(message);
+
+            container.innerHTML = `
+                <div class="message-text">${bodyHtml || '(已过滤占位文本)'}</div>
+                <div class="media-grid">${mediaItems.map(m => `<div class="media-card">[媒体: ${m.name}]</div>`).join('')}</div>
+            `;
+
+            assert(mediaItems.length === 1, `应该只有1个媒体，实际: ${mediaItems.length}`);
+            assert(!bodyHtml || !bodyHtml.includes('[图片]'), '占位文本应被过滤');
+
+            return `占位文本被正确过滤，只显示媒体`;
+        });
+
+        // 测试 5: 多个 raw 候选源
+        runTest('test5', () => {
+            const container = document.getElementById('test5-container');
+
+            const message = {
+                message_id: 'test-multi-raw-1',
+                raw: {
+                    elements: [
+                        { picElement: { originImageUrl: 'temp1.jpg' } },
+                        { picElement: { originImageUrl: 'temp2.jpg' } },
+                        { picElement: { originImageUrl: 'temp3.jpg' } }
+                    ]
+                },
+                media: [
+                    {
+                        id: 5,
+                        kind: 'image',
+                        name: 'archived.jpg',
+                        source: 'https://example.com/archived.jpg',
+                        mime: 'image/jpeg'
+                    }
+                ]
+            };
+
+            const bodyHtml = messageBodyHtml(message);
+            const mediaItems = mediaForGrid(message);
+
+            container.innerHTML = `
+                <div class="message-text">${bodyHtml || '(无文本)'}</div>
+                <div class="media-grid">${mediaItems.map(m => `<div class="media-card">[媒体: ${m.name}]</div>`).join('')}</div>
+            `;
+
+            assert(mediaItems.length === 1, `应该只有1个媒体（DB），实际: ${mediaItems.length}`);
+            assert(mediaItems[0].name === 'archived.jpg', '应该是 DB 归档的媒体');
+
+            return `raw 多候选源被跳过，只显示 DB media`;
+        });
+
+        // 显示测试总结
+        setTimeout(() => {
+            const results = document.querySelectorAll('.test-result');
+            let passed = 0;
+            let failed = 0;
+            results.forEach(r => {
+                if (r.classList.contains('pass')) passed++;
+                if (r.classList.contains('fail')) failed++;
+            });
+
+            const summary = document.createElement('div');
+            summary.className = 'test-section';
+            summary.innerHTML = `
+                <h2>测试总结</h2>
+                <div class="test-result ${failed === 0 ? 'pass' : 'fail'}">
+                    <strong>通过: ${passed}/5</strong><br>
+                    <strong>失败: ${failed}/5</strong><br>
+                    ${failed === 0 ? '✓ 所有测试通过！前端修复正确。' : '⚠ 有测试失败，请检查上方详情。'}
+                </div>
+            `;
+            document.body.appendChild(summary);
+        }, 100);
+    </script>
+</body>
+</html>

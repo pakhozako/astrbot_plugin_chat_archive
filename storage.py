@@ -17,14 +17,28 @@ import sqlite3
 import time
 import uuid
 import zipfile
-from contextlib import contextmanager
 from collections.abc import Iterator
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
 from urllib.parse import unquote, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+import httpx
+
+try:
+    from . import archive_config as _archive_config
+    from .wal import PendingWalMixin
+except ImportError:
+    import archive_config as _archive_config
+    from wal import PendingWalMixin
+
+MEDIA_COMPONENT_TYPES = _archive_config.MEDIA_COMPONENT_TYPES
+REMOTE_MEDIA_ALLOWED_HOSTS = _archive_config.REMOTE_MEDIA_ALLOWED_HOSTS
+SCHEMA_VERSION = _archive_config.SCHEMA_VERSION
+ArchiveConfig = _archive_config.ArchiveConfig
+_json_dumps = _archive_config.json_dumps
+_safe_name = _archive_config.safe_name
 
 try:
     from astrbot.api import logger
@@ -32,71 +46,7 @@ except ModuleNotFoundError:
     logger = logging.getLogger(__name__)
 
 
-MEDIA_COMPONENT_TYPES = {"image", "video", "record", "file"}
-DEFAULT_BATCH_SIZE = 20
-DEFAULT_FLUSH_INTERVAL_SECONDS = 3.0
-REMOTE_MEDIA_ALLOWED_HOSTS = {
-    "gchat.qpic.cn",
-    "gdynamic.qpic.cn",
-    "multimedia.nt.qq.com.cn",
-    "multimedia.qfile.qq.com",
-    "c2cpicdw.qpic.cn",
-    "c2cpicdw.qpic.com",
-    "p.qlogo.cn",
-    "q1.qlogo.cn",
-    "gxh.vip.qq.com",
-    "q.qlogo.cn",
-    "thirdqq.qlogo.cn",
-    "gxh.vip.qq.com.cn",
-    "i.gtimg.cn",
-    "i.gtimg.com",
-    "qqface.gtimg.com",
-}
-
-
-class _NoRedirectHandler(HTTPRedirectHandler):
-    def http_error_301(self, req, fp, code, msg, headers):
-        raise HTTPError(req.full_url, code, msg, headers, fp)
-
-    http_error_302 = http_error_301
-    http_error_303 = http_error_301
-    http_error_307 = http_error_301
-    http_error_308 = http_error_301
-
-
-@dataclass
-class ArchiveConfig:
-    capture_media_files: bool = True
-    max_media_mb: int = 200
-    download_remote_media: bool = True
-    remote_media_timeout_seconds: float = 10.0
-    allow_private_remote_media: bool = False
-    proxy_remote_media: bool = True
-    remote_media_allowed_hosts: tuple[str, ...] = tuple(
-        sorted(REMOTE_MEDIA_ALLOWED_HOSTS)
-    )
-    max_storage_mb: float | None = None
-    batch_size: int = DEFAULT_BATCH_SIZE
-    flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS
-    durable_write: bool = True
-
-
-def _json_dumps(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
-
-def _safe_name(value: str, fallback: str = "file") -> str:
-    name = os.path.basename(str(value or "").replace("\\", "/")).strip()
-    if not name:
-        name = fallback
-    for char in '<>:"/\\|?*\x00':
-        name = name.replace(char, "_")
-    if name in {"", ".", ".."}:
-        name = fallback
-    return name[:160]
-
-
-class ChatArchiveStore:
+class ChatArchiveStore(PendingWalMixin):
     def __init__(self, data_dir: Path, config: ArchiveConfig):
         self.data_dir = Path(data_dir)
         self.config = config
@@ -238,6 +188,11 @@ class ChatArchiveStore:
                     value TEXT NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS favorite_messages (
                     message_uid TEXT PRIMARY KEY,
                     created_at INTEGER NOT NULL,
@@ -320,6 +275,7 @@ class ChatArchiveStore:
             conn.execute(
                 "UPDATE messages SET timestamp = created_at WHERE timestamp IS NULL"
             )
+            self._run_migrations(conn)
 
     @staticmethod
     def _ensure_column(
@@ -331,6 +287,55 @@ class ChatArchiveStore:
         }
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        current = self._schema_version_locked(conn)
+        if current > SCHEMA_VERSION:
+            logger.warning(
+                "Chat Archive database schema version %s is newer than plugin schema %s",
+                current,
+                SCHEMA_VERSION,
+            )
+            return
+        self._record_schema_migration_locked(conn, 1, "baseline")
+        if current < 1:
+            current = 1
+        if current < SCHEMA_VERSION:
+            for version in range(current + 1, SCHEMA_VERSION + 1):
+                self._record_schema_migration_locked(conn, version, f"schema-{version}")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self._set_meta_locked(conn, "schema_version", SCHEMA_VERSION)
+
+    @staticmethod
+    def _schema_version_locked(conn: sqlite3.Connection) -> int:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        try:
+            user_version = int(row[0] if row else 0)
+        except (TypeError, ValueError):
+            user_version = 0
+        if user_version > 0:
+            return user_version
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("schema_version",)
+        ).fetchone()
+        if not row:
+            return 0
+        try:
+            return int(json.loads(row["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0
+
+    @staticmethod
+    def _record_schema_migration_locked(
+        conn: sqlite3.Connection, version: int, name: str
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (version, name, int(time.time())),
+        )
 
     @staticmethod
     def _set_meta_locked(conn: sqlite3.Connection, key: str, value: Any) -> None:
@@ -356,6 +361,26 @@ class ChatArchiveStore:
             return json.loads(row["value"])
         except (TypeError, json.JSONDecodeError):
             return default
+
+    def schema_info(self) -> dict[str, Any]:
+        with self._connection() as conn:
+            version = self._schema_version_locked(conn)
+            migrations = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT version, name, applied_at
+                    FROM schema_migrations
+                    ORDER BY version ASC
+                    """
+                ).fetchall()
+            ]
+        return {
+            "version": version,
+            "expected_version": SCHEMA_VERSION,
+            "up_to_date": version == SCHEMA_VERSION,
+            "migrations": migrations,
+        }
 
     async def store_event(self, event: Any) -> str:
         payload = await self._event_payload(event)
@@ -449,219 +474,6 @@ class ChatArchiveStore:
             ),
         )
 
-    async def replay_fallback_log(self) -> dict[str, Any]:
-        if not self.fallback_path.exists() or self.fallback_path.stat().st_size <= 0:
-            return {"attempted": 0, "replayed": 0, "failed": 0, "archive_path": None}
-
-        entries = self._read_fallback_entries(self.fallback_path)
-        attempted = len(entries)
-        replayed = 0
-        failed_entries: list[dict[str, Any]] = []
-
-        for entry in entries:
-            try:
-                replayed += self._write_entries([entry])
-            except Exception as exc:
-                failed = dict(entry)
-                failed["replay_error"] = str(exc)
-                failed_entries.append(failed)
-
-        archive_path = self._archive_fallback_file()
-        if failed_entries:
-            self._append_fallback(
-                failed_entries, RuntimeError("fallback replay failed")
-            )
-        return {
-            "attempted": attempted,
-            "replayed": replayed,
-            "failed": len(failed_entries),
-            "archive_path": str(archive_path) if archive_path else None,
-        }
-
-    async def replay_pending_log(self) -> dict[str, Any]:
-        return await self.replay_pending()
-
-    async def replay_pending(self) -> dict[str, Any]:
-        if not self.pending_path.exists() or self.pending_path.stat().st_size <= 0:
-            return {
-                "attempted": 0,
-                "replayed": 0,
-                "failed": 0,
-                "archive_path": None,
-                "cleared": True,
-                "corrupt": 0,
-            }
-
-        async with self._batch_lock:
-            entries, corrupt_entries = self._read_pending_entries(self.pending_path)
-            attempted = len(entries)
-            replayed = 0
-            failed_entries: list[dict[str, Any]] = []
-
-            try:
-                replayed = self._write_entries(entries)
-            except Exception:
-                logger.exception(
-                    "Chat Archive pending replay batch failed; retrying per entry"
-                )
-                replayed = 0
-                failed_entries = []
-                # Keep the normal path batched. Only fall back to per-entry replay
-                # after a batch failure so one bad record cannot block recovery.
-                for entry in entries:
-                    try:
-                        replayed += self._write_entries([entry])
-                    except Exception as exc:
-                        logger.exception(
-                            "Chat Archive pending replay entry failed: seq=%s message_uid=%s",
-                            entry.get("seq", entry.get("sequence")),
-                            (entry.get("payload") or {}).get("message_uid"),
-                        )
-                        failed = dict(entry)
-                        failed["replay_error"] = str(exc)
-                        failed_entries.append(failed)
-
-            if failed_entries:
-                self._append_fallback(
-                    failed_entries, RuntimeError("pending replay failed")
-                )
-            corrupt_archive_path = self._archive_corrupt_pending_entries(
-                corrupt_entries
-            )
-            archive_path = self._archive_pending_file()
-            self._pending_sequence = self._load_pending_sequence()
-            return {
-                "attempted": attempted,
-                "replayed": replayed,
-                "failed": len(failed_entries),
-                "archive_path": str(archive_path) if archive_path else None,
-                "cleared": not self.pending_path.exists(),
-                "corrupt": len(corrupt_entries),
-                "corrupt_archive_path": str(corrupt_archive_path)
-                if corrupt_archive_path
-                else None,
-            }
-
-    def _read_pending_entries(
-        self, path: Path
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        entries: list[dict[str, Any]] = []
-        corrupt_entries: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line_number, raw_line in enumerate(f, start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    corrupt_entries.append(
-                        {
-                            "line": line_number,
-                            "error": str(exc),
-                            "raw": line,
-                        }
-                    )
-                    continue
-                if not isinstance(record, dict):
-                    corrupt_entries.append(
-                        {
-                            "line": line_number,
-                            "error": "pending record is not an object",
-                            "raw": line,
-                        }
-                    )
-                    continue
-                payload = record.get("payload")
-                media = record.get("media") or []
-                if not isinstance(payload, dict) or not isinstance(media, list):
-                    corrupt_entries.append(
-                        {
-                            "line": line_number,
-                            "error": "pending record missing payload/media",
-                            "raw": line,
-                        }
-                    )
-                    continue
-                entry = {
-                    "payload": payload,
-                    "media": media,
-                    "fallback_logged": False,
-                }
-                if "seq" in record or "sequence" in record:
-                    entry["seq"] = record.get("seq", record.get("sequence"))
-                if "queued_at" in record:
-                    entry["queued_at"] = record.get("queued_at")
-                entries.append(entry)
-        if corrupt_entries:
-            logger.warning(
-                "Chat Archive found %s corrupt pending WAL lines in %s",
-                len(corrupt_entries),
-                path,
-            )
-        return entries, corrupt_entries
-
-    def _read_fallback_entries(self, path: Path) -> list[dict[str, Any]]:
-        entries: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                for item in record.get("items") or []:
-                    payload = item.get("payload")
-                    media = item.get("media") or []
-                    if isinstance(payload, dict) and isinstance(media, list):
-                        entries.append(
-                            {
-                                "payload": payload,
-                                "media": media,
-                                "fallback_logged": False,
-                            }
-                        )
-        return entries
-
-    def _archive_fallback_file(self) -> Path | None:
-        if not self.fallback_path.exists():
-            return None
-        archive_path = self.fallback_path.with_name(
-            f"{self.fallback_path.stem}.{int(time.time())}.replayed.jsonl"
-        )
-        self.fallback_path.replace(archive_path)
-        return archive_path
-
-    def _archive_pending_file(self) -> Path | None:
-        if not self.pending_path.exists():
-            return None
-        archive_path = self.pending_path.with_name(
-            f"{self.pending_path.stem}.{int(time.time())}.replayed.jsonl"
-        )
-        self.pending_path.replace(archive_path)
-        return archive_path
-
-    def _archive_corrupt_pending_entries(
-        self, corrupt_entries: list[dict[str, Any]]
-    ) -> Path | None:
-        if not corrupt_entries:
-            return None
-        archive_path = self.pending_path.with_name(
-            f"{self.pending_path.stem}.{int(time.time())}.corrupt.jsonl"
-        )
-        with archive_path.open("w", encoding="utf-8") as f:
-            for item in corrupt_entries:
-                f.write(_json_dumps(item) + "\n")
-            f.flush()
-            if self.config.durable_write:
-                os.fsync(f.fileno())
-        logger.warning(
-            "Chat Archive archived corrupt pending WAL lines: %s", archive_path
-        )
-        return archive_path
-
     def _schedule_flush_locked(self) -> None:
         if self._flush_task and not self._flush_task.done():
             return
@@ -686,6 +498,7 @@ class ChatArchiveStore:
             return 0
         entries = list(self._batch_queue)
         try:
+            await self._prepare_media_for_write(entries)
             written = self._write_entries(entries)
         except Exception as exc:
             logger.exception(
@@ -697,88 +510,7 @@ class ChatArchiveStore:
         self.remove_pending(entries)
         return written
 
-    def _next_pending_sequence(self) -> int:
-        self._pending_sequence += 1
-        return self._pending_sequence
-
-    def _load_pending_sequence(self) -> int:
-        max_sequence = 0
-        if not self.pending_path.exists():
-            return max_sequence
-        try:
-            with self.pending_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    try:
-                        max_sequence = max(
-                            max_sequence,
-                            int(record.get("seq", record.get("sequence")) or 0),
-                        )
-                    except (TypeError, ValueError):
-                        continue
-        except OSError:
-            return max_sequence
-        return max_sequence
-
-    def append_pending(self, entry: dict[str, Any]) -> None:
-        record = {
-            "seq": entry.get("seq", entry.get("sequence")),
-            "queued_at": entry.get("queued_at"),
-            "payload": entry["payload"],
-            "media": entry["media"],
-        }
-        self._write_jsonl_record(
-            self.pending_path, record, durable=self.config.durable_write
-        )
-
-    def remove_pending(self, entries: list[dict[str, Any]]) -> None:
-        # Rewriting the WAL preserves unknown/corrupt lines instead of deleting
-        # them, so successful flushes never erase data we did not understand.
-        seqs = {
-            int(entry.get("seq", entry.get("sequence")))
-            for entry in entries
-            if entry.get("seq", entry.get("sequence")) is not None
-        }
-        if not seqs or not self.pending_path.exists():
-            return
-
-        remaining: list[str] = []
-        try:
-            with self.pending_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        record = json.loads(stripped)
-                        seq = int(record.get("seq", record.get("sequence")) or 0)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        remaining.append(line if line.endswith("\n") else line + "\n")
-                        continue
-                    if seq not in seqs:
-                        remaining.append(line if line.endswith("\n") else line + "\n")
-        except OSError:
-            return
-
-        if remaining:
-            temp_path = self.pending_path.with_suffix(self.pending_path.suffix + ".tmp")
-            with temp_path.open("w", encoding="utf-8") as f:
-                f.writelines(remaining)
-                f.flush()
-                if self.config.durable_write:
-                    os.fsync(f.fileno())
-            temp_path.replace(self.pending_path)
-            return
-        try:
-            self.pending_path.unlink()
-        except FileNotFoundError:
-            pass
-
     def _write_entries(self, entries: list[dict[str, Any]]) -> int:
-        self._prepare_media_for_write(entries)
         records_to_append: list[dict[str, Any]] = []
         inserted = False
         with self._connection() as conn:
@@ -897,37 +629,6 @@ class ChatArchiveStore:
                 for record in records_to_append:
                     f.write(_json_dumps(record) + "\n")
         return len(records_to_append)
-
-    def _append_fallback(self, entries: list[dict[str, Any]], exc: Exception) -> None:
-        failed = [entry for entry in entries if not entry.get("fallback_logged")]
-        if not failed:
-            return
-        record = {
-            "failed_at": int(time.time()),
-            "error": str(exc),
-            "items": [
-                {
-                    "payload": entry["payload"],
-                    "media": entry["media"],
-                }
-                for entry in failed
-            ],
-        }
-        self._write_jsonl_record(
-            self.fallback_path, record, durable=self.config.durable_write
-        )
-        for entry in failed:
-            entry["fallback_logged"] = True
-
-    @staticmethod
-    def _write_jsonl_record(
-        path: Path, record: dict[str, Any], *, durable: bool
-    ) -> None:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(_json_dumps(record) + "\n")
-            f.flush()
-            if durable:
-                os.fsync(f.fileno())
 
     async def _event_payload(self, event: Any) -> dict[str, Any]:
         message_obj = getattr(event, "message_obj", None)
@@ -1132,6 +833,7 @@ class ChatArchiveStore:
         *,
         capture_files: bool = True,
     ) -> list[dict[str, Any]]:
+        _ = (message_uid, created_at, capture_files)
         rows: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
         for index, kind, raw_data in self._iter_media_candidates(
@@ -1164,15 +866,6 @@ class ChatArchiveStore:
                 or raw_data.get("fileSize")
                 or raw_data.get("file_size")
             )
-            if capture_files:
-                local_path, relative_path, size, sha256, detected_mime = (
-                    self._copy_media_file(
-                        kind,
-                        str(source or ""),
-                        str(name or kind),
-                        created_at,
-                    )
-                )
             rows.append(
                 {
                     "component_index": int(index or 0),
@@ -2346,7 +2039,7 @@ class ChatArchiveStore:
         width = min(int(size.get("width") or 120), 300)
         return f"https://gxh.vip.qq.com/club/item/parcel/item/{emoji_id[:2]}/{emoji_id}/raw{width}.gif"
 
-    def _prepare_media_for_write(self, entries: list[dict[str, Any]]) -> None:
+    async def _prepare_media_for_write(self, entries: list[dict[str, Any]]) -> None:
         for entry in entries:
             payload = entry.get("payload") or {}
             created_at = int(payload.get("created_at") or time.time())
@@ -2361,13 +2054,17 @@ class ChatArchiveStore:
                 source = str(row.get("source") or "")
                 if not source:
                     continue
-                local_path, relative_path, size, sha256, detected_mime = (
-                    self._copy_media_file(
-                        str(row.get("kind") or ""),
-                        source,
-                        str(row.get("name") or row.get("kind") or "media"),
-                        created_at,
-                    )
+                (
+                    local_path,
+                    relative_path,
+                    size,
+                    sha256,
+                    detected_mime,
+                ) = await self._copy_media_file(
+                    str(row.get("kind") or ""),
+                    source,
+                    str(row.get("name") or row.get("kind") or "media"),
+                    created_at,
                 )
                 if local_path:
                     row["local_path"] = local_path
@@ -2380,13 +2077,13 @@ class ChatArchiveStore:
                 if detected_mime and not row.get("mime"):
                     row["mime"] = detected_mime
 
-    def _copy_media_file(
+    async def _copy_media_file(
         self, kind: str, source: str, name: str, created_at: int
     ) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         if not self.config.capture_media_files or not source:
             return None, None, None, None, None
         if source.startswith(("http://", "https://")):
-            return self._download_remote_media(kind, source, name, created_at)
+            return await self._download_remote_media(kind, source, name, created_at)
         if source.startswith(("base64://", "data:")):
             return self._copy_embedded_media(kind, source, name, created_at)
         source_path = source
@@ -2468,15 +2165,17 @@ class ChatArchiveStore:
         except (ValueError, OSError, binascii.Error):
             return None, None, None, None, None
 
-    def _download_remote_media(
+    async def _download_remote_media(
         self, kind: str, source: str, name: str, created_at: int
     ) -> tuple[str | None, str | None, int | None, str | None, str | None]:
         if kind != "image" or not self.config.download_remote_media:
             return None, None, None, None, None
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
-            final_url, response = self._open_remote_media(source, image_only=True)
-            with response:
+            async with self._open_remote_media(source, image_only=True) as (
+                final_url,
+                response,
+            ):
                 raw_content_type = response.headers.get("Content-Type")
                 content_type = self._normalize_image_mime(raw_content_type)
                 if (
@@ -2496,10 +2195,7 @@ class ChatArchiveStore:
                 size = 0
                 try:
                     with temp_path.open("wb") as f:
-                        while True:
-                            chunk = response.read(1024 * 256)
-                            if not chunk:
-                                break
+                        async for chunk in response.aiter_bytes(1024 * 256):
                             size += len(chunk)
                             if size > max_bytes:
                                 return None, None, size, None, content_type or None
@@ -2533,49 +2229,62 @@ class ChatArchiveStore:
                             temp_path.unlink()
                         except FileNotFoundError:
                             pass
-        except (OSError, HTTPError, TimeoutError, ValueError):
+        except (OSError, httpx.HTTPError, TimeoutError, ValueError):
             return None, None, None, None, None
 
-    def _open_remote_media(
+    @staticmethod
+    def _remote_media_headers(
+        current_url: str, *, image_only: bool, referer_retry: bool
+    ) -> dict[str, str]:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+            if image_only
+            else "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            **({"Referer": current_url} if referer_retry else {}),
+        }
+
+    @asynccontextmanager
+    async def _open_remote_media(
         self, source: str, *, image_only: bool = True, enforce_allowlist: bool = False
     ):
         current_url = source
-        opener = build_opener(_NoRedirectHandler)
         timeout = max(1.0, float(self.config.remote_media_timeout_seconds or 10.0))
         referer_retry = False
-        for _ in range(4):
-            parsed = urlparse(current_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-                raise ValueError("unsupported remote media url")
-            self._validate_remote_media_host(parsed.hostname)
-            if enforce_allowlist:
-                self._validate_remote_media_allowed_host(parsed.hostname)
-            request = Request(
-                current_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-                    if image_only
-                    else "*/*",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    **({"Referer": current_url} if referer_retry else {}),
-                },
-            )
-            try:
-                response = opener.open(request, timeout=timeout)
-            except HTTPError as exc:
-                if exc.code in {301, 302, 303, 307, 308}:
-                    location = exc.headers.get("Location")
-                    if not location:
-                        raise
-                    current_url = urljoin(current_url, location)
-                    referer_retry = False
-                    continue
-                if exc.code == 403 and not referer_retry:
-                    referer_retry = True
-                    continue
-                raise
-            return current_url, response
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=httpx.Timeout(timeout),
+            trust_env=False,
+        ) as client:
+            for _ in range(4):
+                parsed = urlparse(current_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                    raise ValueError("unsupported remote media url")
+                self._validate_remote_media_host(parsed.hostname)
+                if enforce_allowlist:
+                    self._validate_remote_media_allowed_host(parsed.hostname)
+                headers = self._remote_media_headers(
+                    current_url,
+                    image_only=image_only,
+                    referer_retry=referer_retry,
+                )
+                async with client.stream(
+                    "GET", current_url, headers=headers
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location:
+                            response.raise_for_status()
+                        current_url = urljoin(current_url, location)
+                        referer_retry = False
+                        continue
+                    if response.status_code == 403 and not referer_retry:
+                        referer_retry = True
+                        continue
+                    response.raise_for_status()
+                    yield current_url, response
+                    return
         raise ValueError("too many remote media redirects")
 
     def _validate_remote_media_host(self, hostname: str) -> None:
@@ -3826,6 +3535,11 @@ class ChatArchiveStore:
     def get_remote_proxy_file(
         self, source: str, *, kind: str = "image"
     ) -> dict[str, Any] | None:
+        return self._get_cached_remote_proxy_file(source, kind=kind)
+
+    def _get_cached_remote_proxy_file(
+        self, source: str, *, kind: str = "image"
+    ) -> dict[str, Any] | None:
         if not self.config.proxy_remote_media:
             return None
         url = str(source or "").strip()
@@ -3864,12 +3578,28 @@ class ChatArchiveStore:
                     "name": str(cached.get("name") or cached_path.name),
                     "mime": cached_mime,
                 }
+        return None
+
+    async def get_remote_proxy_file_async(
+        self, source: str, *, kind: str = "image"
+    ) -> dict[str, Any] | None:
+        cached = self._get_cached_remote_proxy_file(source, kind=kind)
+        if cached:
+            return cached
+        if not self.config.proxy_remote_media:
+            return None
+        url = str(source or "").strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        media_kind = self._normalize_media_kind(kind) or "image"
+        cache_key = hashlib.sha256(f"{media_kind}:{url}".encode("utf-8")).hexdigest()
+        meta_path = self.proxy_cache_dir / f"{cache_key}.json"
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
-            final_url, response = self._open_remote_media(
+            async with self._open_remote_media(
                 url, image_only=media_kind == "image", enforce_allowlist=True
-            )
-            with response:
+            ) as (final_url, response):
                 raw_content_type = response.headers.get("Content-Type")
                 content_type = self._normalize_remote_media_mime(
                     media_kind, raw_content_type
@@ -3887,10 +3617,7 @@ class ChatArchiveStore:
                 size = 0
                 try:
                     with temp_path.open("wb") as f:
-                        while True:
-                            chunk = response.read(1024 * 256)
-                            if not chunk:
-                                break
+                        async for chunk in response.aiter_bytes(1024 * 256):
                             size += len(chunk)
                             if size > max_bytes:
                                 return None
@@ -3934,7 +3661,7 @@ class ChatArchiveStore:
                             temp_path.unlink()
                         except FileNotFoundError:
                             pass
-        except (OSError, HTTPError, TimeoutError, ValueError):
+        except (OSError, httpx.HTTPError, TimeoutError, ValueError):
             return None
 
     def _detect_remote_media_mime(self, kind: str, path: Path) -> str | None:
@@ -4144,6 +3871,7 @@ class ChatArchiveStore:
             prune_meta = self._get_meta_locked(conn, "last_prune", {})
             maintenance_meta = self._get_meta_locked(conn, "last_maintenance", {})
             ui_settings = self._get_meta_locked(conn, "ui_settings", {})
+            schema_version = self._schema_version_locked(conn)
         pending = self._pending_messages()
         first_values = [
             int(item.get("created_at") or 0)
@@ -4205,6 +3933,8 @@ class ChatArchiveStore:
             else {},
             "ui_settings": ui_settings if isinstance(ui_settings, dict) else {},
             "pending": self.pending_count(),
+            "schema_version": schema_version,
+            "expected_schema_version": SCHEMA_VERSION,
         }
 
     def integrity_check(self) -> dict[str, Any]:
@@ -4214,6 +3944,16 @@ class ChatArchiveStore:
             integrity = str(integrity_row[0] if integrity_row else "")
             if integrity.lower() != "ok":
                 issues.append({"type": "sqlite_integrity", "detail": integrity})
+
+            schema_version = self._schema_version_locked(conn)
+            if schema_version != SCHEMA_VERSION:
+                issues.append(
+                    {
+                        "type": "schema_version_mismatch",
+                        "actual": schema_version,
+                        "expected": SCHEMA_VERSION,
+                    }
+                )
 
             foreign_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
             for row in foreign_rows:
@@ -4316,6 +4056,8 @@ class ChatArchiveStore:
                 "issue_count": len(issues),
                 "pending_lines": pending_lines,
                 "fallback_lines": fallback_lines,
+                "schema_version": schema_version,
+                "expected_schema_version": SCHEMA_VERSION,
             }
             self._set_meta_locked(conn, "last_integrity_check", result)
             return result

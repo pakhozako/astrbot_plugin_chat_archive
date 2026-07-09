@@ -66,44 +66,50 @@ class ChatArchivePlugin(Star):
 
     async def initialize(self):
         self.web.register_routes()
-        logger.info("Replay Pending: checking %s", self.store.pending_path)
-        pending_replay = await self.store.replay_pending()
-        if pending_replay["attempted"]:
-            logger.info(
-                "Replay Pending: attempted=%s replayed=%s failed=%s corrupt=%s archive=%s",
-                pending_replay["attempted"],
-                pending_replay["replayed"],
-                pending_replay["failed"],
-                pending_replay.get("corrupt", 0),
-                pending_replay["archive_path"],
-            )
-            logger.info(
-                "Replay Finished: pending attempted=%s replayed=%s failed=%s",
-                pending_replay["attempted"],
-                pending_replay["replayed"],
-                pending_replay["failed"],
-            )
-            if pending_replay.get("cleared"):
-                logger.info("Pending Cleared: %s", self.store.pending_path)
-            if pending_replay.get("corrupt_archive_path"):
-                logger.warning(
-                    "Pending Corrupt Lines Archived: %s",
-                    pending_replay["corrupt_archive_path"],
+        try:
+            logger.info("Replay Pending: checking %s", self.store.pending_path)
+            pending_replay = await self.store.replay_pending()
+            if pending_replay["attempted"]:
+                logger.info(
+                    "Replay Pending: attempted=%s replayed=%s failed=%s corrupt=%s archive=%s",
+                    pending_replay["attempted"],
+                    pending_replay["replayed"],
+                    pending_replay["failed"],
+                    pending_replay.get("corrupt", 0),
+                    pending_replay["archive_path"],
                 )
-        replay = await self.store.replay_fallback_log()
-        if replay["attempted"]:
-            logger.info(
-                "Chat Archive fallback replay attempted=%s replayed=%s failed=%s archive=%s",
-                replay["attempted"],
-                replay["replayed"],
-                replay["failed"],
-                replay["archive_path"],
-            )
-        retention_days = int(self.config.get("retention_days", 0) or 0)
-        if retention_days > 0:
-            removed = self.store.prune_older_than(retention_days)
-            if removed:
-                logger.info("Chat Archive pruned %s old messages", removed)
+                logger.info(
+                    "Replay Finished: pending attempted=%s replayed=%s failed=%s",
+                    pending_replay["attempted"],
+                    pending_replay["replayed"],
+                    pending_replay["failed"],
+                )
+                if pending_replay.get("cleared"):
+                    logger.info("Pending Cleared: %s", self.store.pending_path)
+                if pending_replay.get("corrupt_archive_path"):
+                    logger.warning(
+                        "Pending Corrupt Lines Archived: %s",
+                        pending_replay["corrupt_archive_path"],
+                    )
+            replay = await self.store.replay_fallback_log()
+            if replay["attempted"]:
+                logger.info(
+                    "Chat Archive fallback replay attempted=%s replayed=%s failed=%s archive=%s",
+                    replay["attempted"],
+                    replay["replayed"],
+                    replay["failed"],
+                    replay["archive_path"],
+                )
+        except Exception:
+            logger.exception("Chat Archive startup recovery failed")
+        try:
+            retention_days = int(self.config.get("retention_days", 0) or 0)
+            if retention_days > 0:
+                removed = self.store.prune_older_than(retention_days)
+                if removed:
+                    logger.info("Chat Archive pruned %s old messages", removed)
+        except Exception:
+            logger.exception("Chat Archive startup retention prune failed")
         logger.info("Chat Archive initialized: %s", self.store.db_path)
 
     async def terminate(self):
@@ -265,6 +271,7 @@ class ChatArchivePlugin(Star):
                         f"标签数: {stats.get('tags', 0)}",
                         f"搜索历史: {stats.get('search_history', 0)}",
                         f"待提交队列条数: {self.store.pending_count()}",
+                        f"Schema: {stats.get('schema_version')} / {stats.get('expected_schema_version')}",
                         f"DB 文件大小: {self._format_mb(stats.get('db_bytes'))}",
                         f"媒体目录大小: {self._format_mb(stats.get('media_bytes'))}",
                         storage_line,

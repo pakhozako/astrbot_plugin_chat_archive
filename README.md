@@ -16,11 +16,17 @@ English: **AstrBot Chat Archive** captures text and media metadata from AstrBot 
 
 ```text
 main.py                  ← 插件入口、生命周期、消息捕获和 /chatlog 命令
-storage.py               ← SQLite 存储、Pending WAL、搜索、导出、媒体 GC
+archive_config.py        ← 配置数据类、常量、JSON/文件名辅助函数
+storage.py               ← SQLite 存储、搜索、导出、媒体归档和媒体 GC
+wal.py                   ← Pending WAL / fallback replay / JSONL 可靠写入
 web.py                   ← 插件 Web API、媒体文件和导出文件安全路由
 metadata.yaml            ← AstrBot 插件元数据和 Page 声明
 _conf_schema.json        ← AstrBot WebUI 配置表单
+requirements.txt         ← AstrBot 安装插件时需要安装的第三方运行时依赖
+pyproject.toml           ← ruff 静态检查/格式化配置
+logo.png                 ← 插件市场图标
 CHANGELOG.md             ← 变更记录
+.github/workflows/ci.yml ← GitHub Actions 检查入口
 pages/
 └── timeline/
     ├── index.html       ← 插件 Page 入口
@@ -29,9 +35,16 @@ pages/
 tests/
 ├── storage_smoke.py
 ├── test_pending_replay.py
+├── test_media_elements.py
 ├── test_reliability_stage1.py
 ├── test_search_export_stage3.py
+├── test_frontend_fix_verification.py
+├── test_frontend_logic.py
 └── test_experience_stage4.py
+scripts/
+├── run_checks.py        ← 本地/CI 共用检查入口
+├── forward_cache_smoke.py
+└── onebot_render_smoke.js
 ```
 
 **设计原则：** 消息一旦进入插件，先写入 `pending.jsonl`，再进入内存批量队列，最后批量提交 SQLite。SQLite 是主要查询源，JSONL/Pending/Fallback 是恢复与审计辅助。
@@ -93,7 +106,12 @@ fallback_failed_batches.jsonl
 media/                      去重后的媒体实体文件
 proxy_cache/                WebUI 远程媒体代理缓存
 exports/                    导出文件
+pending.*.replayed.jsonl    已成功回放的 Pending WAL 归档
+pending.*.corrupt.jsonl     无法解析的 Pending WAL 行隔离归档
+schema_migrations           SQLite 内部迁移记录表
 ```
+
+聊天内容、原始事件 JSON、媒体文件和导出文件都保存在 AstrBot 分配的数据目录中。请按需设置保留天数、容量上限和备份策略；卸载插件前如需保留记录，请先备份该数据目录。
 
 ---
 
@@ -123,7 +141,7 @@ exports/                    导出文件
 
 | 命令 | 说明 |
 |------|------|
-| `/chatlog status` | 查看消息数、会话数、媒体数、Pending、DB 大小、最近 prune 信息 |
+| `/chatlog status` | 查看消息数、会话数、媒体数、Pending、Schema、DB 大小、最近 prune 信息 |
 | `/chatlog export [json\|markdown\|txt\|html\|zip]` | 导出归档；ZIP 会包含消息文件，可打包媒体 |
 | `/chatlog prune <天数> [最大MB]` | 按时间和可选容量上限清理旧消息 |
 | `/chatlog check` | 执行 SQLite 完整性、外键、会话计数和媒体引用检查 |
@@ -164,8 +182,10 @@ timeline
 | SQLite 写入成功 | 只移除已提交条目的 pending 记录 |
 | SQLite 写入失败 | 条目写入 fallback 文件，pending 保留或等待重放 |
 | 进程被强杀 | 下次启动先回放 `pending.jsonl`，再回放 fallback |
+| Pending 行损坏 | 有效行继续回放，损坏行隔离到 `pending.*.corrupt.jsonl` 并记录日志 |
 | 重复回放 | `message_uid` 唯一约束防止重复写入 |
 | 媒体引用变化 | 删除消息时递减 `media_blobs.ref_count`，降到 0 才删除实体文件 |
+| Schema 升级 | `schema_migrations` 和 `PRAGMA user_version` 记录当前数据库结构版本 |
 
 启动日志中可观察：
 
@@ -174,7 +194,18 @@ Replay Pending
 Replay Finished
 Pending Cleared
 Chat Archive fallback replay
+Pending Corrupt Lines Archived
 ```
+
+---
+
+## 🌐 网络与媒体安全
+
+- 远程媒体下载和 WebUI 代理使用 `httpx.AsyncClient`，避免在消息事件链路里执行同步网络请求。
+- 默认拒绝内网、本机和非公网地址，只有开启 `allow_private_remote_media` 后才允许访问私网媒体。
+- `/image-proxy`、`/media-proxy` 受 `remote_media_allowed_hosts` 白名单限制。
+- `/media/<id>` 和 `/export-file` 只返回数据库或 `exports/` 目录内确认存在的文件。
+- 运行时第三方依赖只包含 `httpx`；手工调试脚本如需额外工具，请在开发环境单独安装。
 
 ---
 
@@ -186,6 +217,23 @@ Chat Archive fallback replay
 - 导出开始时取当前消息上界，确保导出过程中新写入的消息不会进入本次快照。
 - JSON/Markdown/TXT/HTML/ZIP 均为游标分页写入，避免一次性加载全表。
 - WebUI 导出完成后通过受控 `/export-file?name=...` 下载生成文件，该路由只接受 `exports/` 目录内的文件名。
+
+---
+
+## ✅ 发布前检查
+
+```bash
+python scripts/run_checks.py
+```
+
+该命令会运行 ruff、py_compile、WAL/可靠性/媒体/搜索导出/体验/前端 smoke，以及 OneBot 渲染和 forward cache 检查。GitHub Actions 使用同一个入口，避免本地和 CI 检查清单漂移。
+
+发布到插件市场前还需确认：
+
+- `metadata.yaml` 的 `version`、`repo`、`support_platforms`、`astrbot_version` 与发布内容一致。
+- `requirements.txt` 只包含运行时第三方依赖。
+- `logo.png` 保持 256x256、1:1。
+- `CHANGELOG.md` 已记录用户可感知的变更和迁移影响。
 
 ## 🙏 致谢
 

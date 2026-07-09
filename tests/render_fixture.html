@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="../pages/timeline/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <div><h1>聊天归档</h1><p id="statLine">1,284 条消息 · 6 个会话</p></div>
+          <button class="icon-button">刷新</button>
+        </div>
+        <div class="search-box">
+          <div class="search-shell">
+            <input type="search" placeholder="搜索消息或发送者" />
+            <span class="search-count">3/12</span>
+            <button class="icon-button">上</button>
+            <button class="icon-button">下</button>
+          </div>
+          <div class="filter-grid">
+            <input type="search" placeholder="发送者" />
+            <select><option>全部类型</option></select>
+            <select><option>全部媒体</option></select>
+          </div>
+        </div>
+        <div class="conversation-list">
+          <button class="conversation active">
+            <div class="conversation-avatar" style="--avatar-bg:#3390ec">技</div>
+            <div class="conversation-main">
+              <div class="conversation-title-row"><div class="conversation-title">技术交流群</div><span class="conversation-sub">14:22</span></div>
+              <div class="conversation-sub">Alice: 这个 bug 修好了吗</div>
+            </div>
+          </button>
+          <button class="conversation">
+            <div class="conversation-avatar" style="--avatar-bg:#7c5cff">项</div>
+            <div class="conversation-main">
+              <div class="conversation-title-row"><div class="conversation-title">项目讨论</div><span class="conversation-sub">昨天</span></div>
+              <div class="conversation-sub">Bob: 好的，我看一下</div>
+            </div>
+          </button>
+          <button class="conversation">
+            <div class="conversation-avatar" style="--avatar-bg:#e0803a">闲</div>
+            <div class="conversation-main">
+              <div class="conversation-title-row"><div class="conversation-title">闲聊摸鱼</div><span class="conversation-sub">周一</span></div>
+              <div class="conversation-sub">[图片]</div>
+            </div>
+          </button>
+        </div>
+      </aside>
+
+      <section class="timeline-panel">
+        <header class="timeline-header">
+          <div>
+            <div class="eyebrow">消息时间线</div>
+            <h2>技术交流群</h2>
+            <p class="panel-meta">328 条消息 · 最近 14:22</p>
+          </div>
+          <div class="header-actions">
+            <button class="button subtle">会话</button>
+            <select class="select-compact"><option>JSON</option></select>
+            <button class="button">导出</button>
+            <button class="button subtle">设置</button>
+          </div>
+        </header>
+        <div class="timeline" id="tl"></div>
+      </section>
+
+      <aside class="inspector-pane">
+        <header><div><h3>归档面板</h3><p class="panel-meta">当前会话概览</p></div></header>
+        <div class="inspector-tabs">
+          <button class="active">概览</button><button>媒体</button><button>成员</button><button>文件</button>
+        </div>
+        <div class="inspector-content"></div>
+      </aside>
+    </main>
+    <script>
+      const rows = [
+        {self:false, first:true, last:false, name:'Alice', badge:'管理', text:'早上好，今天的部署计划有变化吗？'},
+        {self:false, first:false, last:true, name:'Alice', text:'我看日志里还有几个报错没处理。'},
+        {self:true, first:true, last:true, text:'刚看了，媒体代理那块已经修了，我推到 main 了。'},
+        {self:false, first:true, last:true, name:'Bob', badge:'群主', badgeClass:'owner', text:'辛苦！单个表情包重复渲染的问题也一起解决了吗？'},
+        {self:true, first:true, last:false, text:'解决了。现在 DB 有归档媒体时会跳过 raw 里的临时源。'},
+        {self:true, first:false, last:true, text:'不会再出现三个"图片不可用"加一个 GIF 的情况了。', tags:[{name:'已修复',color:'#4 caf50'}]},
+      ];
+      const tl = document.getElementById('tl');
+      tl.innerHTML = '<div class="day-divider"><span>今天</span></div>' + rows.map(r => {
+        const cls = ['message-row', r.self?'self':'other', r.first?'group-first':'', r.last?'group-last':''].filter(Boolean).join(' ');
+        const avatar = (!r.self && r.last) ? `<div class="avatar" style="--avatar-bg:#3390ec">${(r.name||'?')[0]}</div>` : (!r.self ? '<div class="avatar-spacer"></div>' : '');
+        const name = (!r.self && r.first) ? `<div class="sender">${r.name}${r.badge?`<span class="sender-badge ${r.badgeClass||'admin'}">${r.badge}</span>`:''}</div>` : '';
+        const tags = r.tags ? `<div class="tag-row">${r.tags.map(t=>`<span class="tag-chip" style="--tag-color:${t.color}">${t.name}</span>`).join('')}</div>` : '';
+        const body = `<div class="bubble-shell"><div class="bubble">${name}<div class="message-text">${r.text}</div>${tags}<div class="message-foot"><span class="message-platform">qq</span><span class="message-time">14:2${Math.floor(Math.random()*9)}</span></div></div></div>`;
+        return `<article class="${cls}">${avatar}${body}</article>`;
+      }).join('');
+    </script>
+  </body>
+</html>

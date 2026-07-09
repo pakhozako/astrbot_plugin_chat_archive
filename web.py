@@ -320,7 +320,9 @@ class ChatArchiveWeb:
         return self._image_data_response(row)
 
     async def image_proxy(self):
-        row = self.store.get_remote_proxy_file(str(request.query.get("url", "") or ""))
+        row = await self.store.get_remote_proxy_file_async(
+            str(request.query.get("url", "") or "")
+        )
         if not row:
             return json_response(
                 {"ok": False, "message": "image proxy blocked or unavailable"},
@@ -332,7 +334,7 @@ class ChatArchiveWeb:
         )
 
     async def image_data(self):
-        row = self.store.get_remote_proxy_file(
+        row = await self.store.get_remote_proxy_file_async(
             str(request.query.get("url", "") or ""), kind="image"
         )
         if not row:
@@ -343,7 +345,7 @@ class ChatArchiveWeb:
         return self._image_data_response(row)
 
     async def media_proxy(self):
-        row = self.store.get_remote_proxy_file(
+        row = await self.store.get_remote_proxy_file_async(
             str(request.query.get("url", "") or ""),
             kind=str(request.query.get("kind", "") or "file"),
         )
