@@ -17,6 +17,7 @@ English: **AstrBot Chat Archive** captures text and media metadata from AstrBot 
 ```text
 main.py                  ← 插件入口、生命周期、消息捕获和 /chatlog 命令
 archive_config.py        ← 配置数据类、常量、JSON/文件名辅助函数
+schema.py                ← SQLite 连接、建表、迁移和 schema 状态
 storage.py               ← SQLite 存储、搜索、导出、媒体归档和媒体 GC
 wal.py                   ← Pending WAL / fallback replay / JSONL 可靠写入
 web.py                   ← 插件 Web API、媒体文件和导出文件安全路由

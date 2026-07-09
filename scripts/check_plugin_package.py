@@ -22,12 +22,14 @@ REQUIRED_METADATA = {
 RUNTIME_PYTHON = {
     "archive_config.py",
     "main.py",
+    "schema.py",
     "storage.py",
     "wal.py",
     "web.py",
 }
 LOCAL_IMPORTS = {
     "archive_config",
+    "schema",
     "storage",
     "wal",
     "web",

@@ -9,6 +9,8 @@
 - Wrapped startup recovery/prune in logged exception guards so one recovery failure does not prevent plugin loading.
 - Switched remote media download/proxy fetches to async `httpx.AsyncClient` and added local HTTP coverage for remote image archival.
 - Split configuration/constants/helpers into `archive_config.py` while keeping the existing `storage.py` import surface compatible.
+- Split SQLite schema setup, migrations, and schema status into `schema.py`.
+- Improved LuckyLilliaBot/Milky-style message normalization for `mention_all`, `market_face`, `temp_url` media, and richer forward previews.
 - Added ruff configuration and made repository tests trackable instead of ignoring the whole `tests/` directory.
 - Split Pending WAL/fallback replay helpers into `wal.py` and added a shared local `scripts/run_checks.py` check entrypoint.
 

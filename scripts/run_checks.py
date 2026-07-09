@@ -14,6 +14,7 @@ CHECKS = [
         "py_compile",
         "archive_config.py",
         "main.py",
+        "schema.py",
         "storage.py",
         "wal.py",
         "web.py",

@@ -257,6 +257,76 @@ async def main() -> None:
             == "https://gxh.vip.qq.com/club/item/parcel/item/ab/abcdef/raw120.gif"
         ), tolerant_media[1]
 
+        milky_raw = {
+            "segments": [
+                {"type": "mention_all", "data": {}},
+                {
+                    "type": "mention",
+                    "data": {"user_id": 10001, "name": "Alice"},
+                },
+                {
+                    "type": "market_face",
+                    "data": {
+                        "emoji_id": "fedcba",
+                        "summary": "收藏表情",
+                    },
+                },
+                {
+                    "type": "image",
+                    "data": {
+                        "resource_id": "img-resource",
+                        "temp_url": "https://gchat.qpic.cn/offpic_new/milky-image.png",
+                        "summary": "Milky 图片",
+                        "sub_type": "sticker",
+                    },
+                },
+                {
+                    "type": "record",
+                    "data": {
+                        "resource_id": "record-resource",
+                        "temp_url": "https://multimedia.nt.qq.com.cn/audio/milky.amr",
+                        "duration": 5,
+                    },
+                },
+                {
+                    "type": "file",
+                    "data": {
+                        "file_id": "file-resource",
+                        "file_name": "report.pdf",
+                        "file_size": 2048,
+                    },
+                },
+            ]
+        }
+        await store.store_event(DummyEvent("media-elements-5", milky_raw))
+        await store.flush_pending()
+        result = store.list_messages(limit=40)
+        milky = next(
+            item for item in result["items"] if item["message_id"] == "media-elements-5"
+        )
+        assert milky["text"] == "@全体成员@Alice收藏表情Milky 图片report.pdf", milky
+        milky_media = milky["media"]
+        assert [item["kind"] for item in milky_media] == [
+            "image",
+            "image",
+            "record",
+            "file",
+        ], milky_media
+        assert (
+            milky_media[0]["source"]
+            == "https://gxh.vip.qq.com/club/item/parcel/item/fe/fedcba/raw120.gif"
+        ), milky_media[0]
+        assert (
+            milky_media[1]["source"]
+            == "https://gchat.qpic.cn/offpic_new/milky-image.png"
+        ), milky_media[1]
+        assert (
+            milky_media[2]["source"]
+            == "https://multimedia.nt.qq.com.cn/audio/milky.amr"
+        ), milky_media[2]
+        assert milky_media[3]["source"] == "file-resource", milky_media[3]
+        assert milky_media[3]["name"] == "report.pdf", milky_media[3]
+
         probe = root / "probe"
         probe.mkdir()
         mp4 = probe / "clip.bin"
