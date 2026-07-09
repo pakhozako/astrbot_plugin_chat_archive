@@ -10,7 +10,7 @@
 - Switched remote media download/proxy fetches to async `httpx.AsyncClient` and added local HTTP coverage for remote image archival.
 - Split configuration/constants/helpers into `archive_config.py` while keeping the existing `storage.py` import surface compatible.
 - Added ruff configuration and made repository tests trackable instead of ignoring the whole `tests/` directory.
-- Split Pending WAL/fallback replay helpers into `wal.py`, added a shared `scripts/run_checks.py`, and wired GitHub Actions to the same check entrypoint.
+- Split Pending WAL/fallback replay helpers into `wal.py` and added a shared local `scripts/run_checks.py` check entrypoint.
 
 ## 2026-07-07
 

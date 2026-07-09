@@ -5,6 +5,7 @@ import sys
 
 
 CHECKS = [
+    [sys.executable, "scripts/check_plugin_package.py"],
     [sys.executable, "-m", "ruff", "check", "."],
     [sys.executable, "-m", "ruff", "format", "--check", "."],
     [
