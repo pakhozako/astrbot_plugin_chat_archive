@@ -86,6 +86,11 @@ def main() -> int:
         failures.append(
             "metadata.yaml astrbot_version must be a bounded PEP 440 range like >=4.16,<5"
         )
+    main_constants = module_string_constants(ROOT / "main.py")
+    if main_constants.get("PLUGIN_NAME") != metadata.get("name"):
+        failures.append("main.py PLUGIN_NAME must match metadata.yaml name")
+    if main_constants.get("PLUGIN_VERSION") != metadata.get("version"):
+        failures.append("main.py PLUGIN_VERSION must match metadata.yaml version")
 
     logo_path = ROOT / "logo.png"
     if not logo_path.exists():
@@ -187,6 +192,21 @@ def runtime_imports() -> set[str]:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names.add(node.module.split(".", 1)[0])
     return names
+
+
+def module_string_constants(path: Path) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    tree = ast.parse(path.read_text(encoding="utf-8"), path)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            constants[target.id] = value.value
+    return constants
 
 
 def requirement_name(import_name: str) -> str:
