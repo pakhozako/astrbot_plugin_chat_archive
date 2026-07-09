@@ -3035,6 +3035,24 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             "tag_id": tag_id,
         }
 
+    def _export_output_path(self, output_name: str | None, suffix: str) -> Path:
+        name = str(output_name or f"chat_archive_{int(time.time())}{suffix}").strip()
+        if not name:
+            name = f"chat_archive_{int(time.time())}{suffix}"
+        if "/" in name or "\\" in name or ":" in name:
+            raise ValueError("export output_name must be a single file name")
+        safe = _safe_name(name, fallback="")
+        if not safe or safe != name:
+            raise ValueError("export output_name contains unsafe characters")
+        try:
+            output = (self.export_dir / safe).resolve()
+            export_root = self.export_dir.resolve()
+        except Exception as exc:
+            raise ValueError("export output_name is not a valid path") from exc
+        if output == export_root or export_root not in output.parents:
+            raise ValueError("export output_name must stay under exports directory")
+        return output
+
     def export_archive(
         self,
         *,
@@ -3064,9 +3082,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             "html": ".html",
             "zip": ".zip",
         }[fmt]
-        output = self.export_dir / (
-            output_name or f"chat_archive_{int(time.time())}{suffix}"
-        )
+        output = self._export_output_path(output_name, suffix)
         with self._connection() as conn:
             snapshot_max_id = int(
                 conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
@@ -4028,9 +4044,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         page_size: int = 500,
         after_snapshot=None,
     ) -> Path:
-        output = self.export_dir / (
-            output_name or f"chat_archive_{int(time.time())}.json"
-        )
+        output = self._export_output_path(output_name, ".json")
         with self._connection() as conn:
             snapshot_max_id = int(
                 conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
