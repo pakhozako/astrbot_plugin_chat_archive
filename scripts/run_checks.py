@@ -20,11 +20,13 @@ CHECKS = [
         "web.py",
         "scripts/export_safety_smoke.py",
         "scripts/forward_cache_smoke.py",
+        "scripts/media_gc_smoke.py",
         "scripts/wal_reliability_smoke.py",
     ],
     ["node", "scripts/onebot_render_smoke.js"],
     [sys.executable, "scripts/export_safety_smoke.py"],
     [sys.executable, "scripts/forward_cache_smoke.py"],
+    [sys.executable, "scripts/media_gc_smoke.py"],
     [sys.executable, "scripts/wal_reliability_smoke.py"],
 ]
 
