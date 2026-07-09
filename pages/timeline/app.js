@@ -65,6 +65,10 @@ const forwardDataInFlight = new Map();
 const IMAGE_LOAD_TIMEOUT_MS = 12000;
 const IMAGE_DATA_FALLBACK_TIMEOUT_MS = 5000;
 
+function queryDocument(selector) {
+  return typeof document.querySelector === "function" ? document.querySelector(selector) : null;
+}
+
 const els = {
   statLine: document.getElementById("statLine"),
   refreshBtn: document.getElementById("refreshBtn"),
@@ -124,11 +128,19 @@ const els = {
   historyList: document.getElementById("historyList"),
   clearHistoryBtn: document.getElementById("clearHistoryBtn"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
+  railScrim: queryDocument(".rail-scrim"),
+  chatAvatar: queryDocument(".chat-avatar"),
+  profileAvatarLarge: queryDocument(".profile-avatar-large"),
 };
 
 let loadingOlder = false;
 let messageCacheDb = null;
 let messageCacheUnavailable = false;
+
+function setSessionsOpen(open) {
+  document.body.classList.toggle("sessions-open", Boolean(open));
+  els.sessionToggleBtn?.setAttribute("aria-expanded", String(Boolean(open)));
+}
 
 function disableMessageCache() {
   messageCacheUnavailable = true;
@@ -462,20 +474,20 @@ function renderInspector() {
   }
   const latest = messages[messages.length - 1];
   els.inspectorContent.innerHTML = `
-    <section class="inspector-card session-card">
+    <section class="inspector-card session-card profile-session-card">
       <div class="session-avatar" style="--avatar-bg:${avatarColor(state.currentUmo || "archive")}">${escapeHtml(initials(current?.sample_sender || state.currentUmo || "归档"))}</div>
       <div>
         <strong>${escapeHtml(title)}</strong>
         <span>${escapeHtml(state.currentUmo || "跨会话总览")}</span>
       </div>
     </section>
-    <section class="inspector-card metric-grid">
+    <section class="inspector-card profile-stat-list" aria-label="载入概览">
       ${renderMetric("消息", stats.messages)}
       ${renderMetric("发送者", stats.people)}
       ${renderMetric("媒体", stats.media)}
       ${renderMetric("文件", stats.files)}
     </section>
-    <section class="inspector-card">
+    <section class="inspector-card profile-section">
       <h4>最近消息</h4>
       ${
         latest
@@ -487,7 +499,7 @@ function renderInspector() {
           : `<div class="empty-inline">暂无已载入消息。</div>`
       }
     </section>
-    <section class="inspector-card">
+    <section class="inspector-card profile-section">
       <h4>可靠性状态</h4>
       <div class="inspector-kv"><span>Pending</span><strong>${escapeHtml(fmtNumber(state.stats?.pending || 0))}</strong></div>
       <div class="inspector-kv"><span>DB</span><strong>${escapeHtml(fmtBytes(state.stats?.db_bytes || 0))}</strong></div>
@@ -498,7 +510,7 @@ function renderInspector() {
 }
 
 function renderMetric(label, value) {
-  return `<div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(fmtNumber(value))}</strong></div>`;
+  return `<div class="profile-stat-row metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(fmtNumber(value))}</strong></div>`;
 }
 
 function conversationStats(messages) {
@@ -916,7 +928,7 @@ function renderConversations() {
         state.currentUmo = item.umo || "";
         state.messages = [];
         state.hasMore = false;
-        document.body.classList.remove("sessions-open");
+        setSessionsOpen(false);
         renderConversations();
         await loadFilters();
         await loadMessages({ stickToBottom: true });
@@ -1716,10 +1728,20 @@ function fillSelect(select, emptyLabel, rows, labeler) {
 
 function updateHeader() {
   const current = state.conversations.find((item) => item.umo === state.currentUmo);
-  els.currentTitle.textContent = state.currentUmo ? shortUmo(state.currentUmo) : "全部会话";
+  const title = state.currentUmo ? shortUmo(state.currentUmo) : "全部会话";
+  const avatarLabel = initials(current?.sample_sender || title || "归档");
+  els.currentTitle.textContent = title;
   els.currentMeta.textContent = state.currentUmo
     ? `${fmtNumber(current?.message_count || state.messages.length)} 条消息 / ${current?.latest_at ? fmtFullTime(current.latest_at) : "暂无最新时间"}`
     : `已载入 ${fmtNumber(state.messages.length)} 条 / ${state.hasMore ? "还有更早消息" : "已到最早消息"}`;
+  if (els.chatAvatar) {
+    els.chatAvatar.textContent = avatarLabel;
+    els.chatAvatar.style.setProperty("--avatar-bg", avatarColor(state.currentUmo || title));
+  }
+  if (els.profileAvatarLarge) {
+    els.profileAvatarLarge.textContent = avatarLabel;
+    els.profileAvatarLarge.style.setProperty("--avatar-bg", avatarColor(state.currentUmo || title));
+  }
   updateSearchUi();
   renderInspector();
 }
@@ -4381,8 +4403,9 @@ function bindEvents() {
   els.prevSearchBtn.addEventListener("click", () => jumpSearch(-1));
   els.nextSearchBtn.addEventListener("click", () => jumpSearch(1));
   els.sessionToggleBtn?.addEventListener("click", () => {
-    document.body.classList.toggle("sessions-open");
+    setSessionsOpen(!document.body.classList.contains("sessions-open"));
   });
+  els.railScrim?.addEventListener("click", () => setSessionsOpen(false));
   els.inspectorPane?.querySelectorAll("[data-inspector-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       state.inspectorTab = button.dataset.inspectorTab || "summary";
@@ -4429,6 +4452,7 @@ function bindEvents() {
       closeForwardViewer();
       closeMediaViewer();
       els.detailPane.hidden = true;
+      setSessionsOpen(false);
     }
     if (!els.mediaViewer.hidden && event.key === "ArrowLeft") {
       state.mediaIndex = Math.max(0, state.mediaIndex - 1);
@@ -4442,6 +4466,11 @@ function bindEvents() {
       jumpSearch(event.shiftKey ? -1 : 1);
     }
   });
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("resize", () => {
+      if (window.innerWidth > 760) setSessionsOpen(false);
+    });
+  }
   let timer = null;
   let filterTimer = null;
   els.searchInput.addEventListener("input", () => {
