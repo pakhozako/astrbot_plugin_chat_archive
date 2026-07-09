@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import struct
 from pathlib import Path
@@ -91,6 +92,23 @@ def main() -> int:
         failures.append("main.py PLUGIN_NAME must match metadata.yaml name")
     if main_constants.get("PLUGIN_VERSION") != metadata.get("version"):
         failures.append("main.py PLUGIN_VERSION must match metadata.yaml version")
+    config_schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    config_schema_keys = {
+        key for key, value in config_schema.items() if isinstance(value, dict)
+    }
+    runtime_config_keys = config_get_keys(ROOT / "main.py")
+    missing_config_keys = sorted(runtime_config_keys - config_schema_keys)
+    if missing_config_keys:
+        failures.append(
+            "_conf_schema.json missing runtime config keys: "
+            + ", ".join(missing_config_keys)
+        )
+    unused_config_keys = sorted(config_schema_keys - runtime_config_keys)
+    if unused_config_keys:
+        failures.append(
+            "_conf_schema.json lists config keys not read by runtime: "
+            + ", ".join(unused_config_keys)
+        )
 
     logo_path = ROOT / "logo.png"
     if not logo_path.exists():
@@ -207,6 +225,32 @@ def module_string_constants(path: Path) -> dict[str, str]:
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             constants[target.id] = value.value
     return constants
+
+
+def config_get_keys(path: Path) -> set[str]:
+    keys: set[str] = set()
+    tree = ast.parse(path.read_text(encoding="utf-8"), path)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "get":
+            continue
+        if not node.args:
+            continue
+        owner = func.value
+        is_config = isinstance(owner, ast.Name) and owner.id == "config"
+        is_self_config = (
+            isinstance(owner, ast.Attribute)
+            and owner.attr == "config"
+            and isinstance(owner.value, ast.Name)
+            and owner.value.id == "self"
+        )
+        key_node = node.args[0]
+        if (is_config or is_self_config) and isinstance(key_node, ast.Constant):
+            if isinstance(key_node.value, str):
+                keys.add(key_node.value)
+    return keys
 
 
 def requirement_name(import_name: str) -> str:
