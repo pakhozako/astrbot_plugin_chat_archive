@@ -6,6 +6,9 @@ const MESSAGE_CACHE_STORE = "session_messages";
 const MESSAGE_CACHE_VERSION = 1;
 const MESSAGE_CACHE_LIMIT = 150;
 
+// WebUI 运行在 AstrBot 插件页 iframe 内，也能在本地 demo 模式打开。
+// 这里集中保存所有筛选、缓存和弹窗状态，避免多个渲染函数之间互相读 DOM
+// 推断状态，后续维护搜索、媒体查看器和合并转发查看器时会更可控。
 const demoTags = [
   { id: 1, name: "重点", color: "#d65064", message_count: 6 },
   { id: 2, name: "待处理", color: "#d17a22", message_count: 4 },
@@ -1874,6 +1877,8 @@ function mediaForGrid(item) {
   return preferStableMediaItems(normalized);
 }
 
+// 合并转发里的媒体会被后端写入 meta._archive_context。前端只展示简短
+// 来源说明，不把完整 forward id 堆到卡片上，避免媒体墙信息密度失控。
 function mediaContextLabel(item) {
   const context = item?.meta?._archive_context || item?.meta?.forward_context || {};
   if (!context || typeof context !== "object") return "";

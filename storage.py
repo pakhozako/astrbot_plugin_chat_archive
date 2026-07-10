@@ -363,10 +363,16 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             or ""
         )
         raw_text = self._message_text_from_raw(raw)
-        if not adapter_text or self._should_prefer_raw_forward_text(
-            adapter_text, raw_text
+        component_text = self._message_text_from_components(components)
+        expanded_text = component_text or raw_text
+        if component_text and self._should_prefer_raw_forward_text(
+            raw_text, component_text
         ):
-            text = raw_text
+            expanded_text = component_text
+        if not adapter_text or self._should_prefer_raw_forward_text(
+            adapter_text, expanded_text
+        ):
+            text = expanded_text
         else:
             text = adapter_text
 
@@ -513,6 +519,41 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             ),
         )
 
+    def _message_text_from_components(self, components: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for component in components or []:
+            if not isinstance(component, dict):
+                continue
+            kind = str(component.get("kind") or "").lower()
+            data = (
+                component.get("data") if isinstance(component.get("data"), dict) else {}
+            )
+            if kind in {"node", "nodes"}:
+                # AstrBot 的 OneBot v11 适配器可能已经把合并转发解析成
+                # Node/Nodes 组件。优先直读这个结构，避免重复请求协议端 API。
+                messages = self._normalize_forward_messages(
+                    self._node_messages_from_component(kind, data)
+                )
+                text = self._forward_messages_plain_text(messages)
+                if text:
+                    parts.append(f"[合并转发]\n{text}")
+                continue
+            text = self._message_element_text(data)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    def _node_messages_from_component(
+        self, kind: str, data: dict[str, Any]
+    ) -> list[Any]:
+        if kind == "node":
+            return [data]
+        for key in ("nodes", "messages", "items", "content", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
     @staticmethod
     def _should_prefer_raw_forward_text(adapter_text: str, raw_text: str) -> bool:
         if not raw_text or raw_text == adapter_text:
@@ -647,6 +688,24 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                 data = component.toDict()
             except Exception:
                 pass
+        converter = getattr(component, "convert_to_file_path", None)
+        if callable(converter) and self._normalize_media_kind(kind):
+            try:
+                converted_path = await converter()
+            except Exception:
+                logger.warning(
+                    "Chat Archive media component conversion failed: kind=%s",
+                    kind,
+                    exc_info=True,
+                )
+            else:
+                if converted_path:
+                    if not isinstance(data, dict):
+                        data = {"value": data}
+                    # AstrBot 核心会在进入插件前把 Image/Record 标准化落地；
+                    # 这里优先保存它给出的本地路径，避免重复下载同一份媒体。
+                    data.setdefault("file_path", str(converted_path))
+                    data.setdefault("file", str(converted_path))
         return {"index": index, "kind": kind, "data": data}
 
     def _safe_jsonable(self, value: Any) -> Any:
@@ -785,6 +844,16 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             )
             if nested_kind:
                 yield index, nested_kind, nested_data
+            if kind in {"node", "nodes"}:
+                for (
+                    nested_index,
+                    nested_kind,
+                    nested_data,
+                ) in self._iter_nested_media_candidates(
+                    {"type": kind, "data": raw_data},
+                    base_index=10000 + index * 1000,
+                ):
+                    yield nested_index, nested_kind, nested_data
         for index, element in enumerate(self._raw_message_elements(raw_message)):
             kind, data = self._media_kind_and_data(element)
             if kind:
@@ -830,7 +899,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         current_context = context
         if segment:
             segment_type, segment_data = segment
-            if segment_type == "forward":
+            if segment_type in {"forward", "nodes"}:
                 current_context = self._forward_media_context(segment_data, context)
             elif segment_type == "node":
                 current_context = self._forward_node_media_context(
@@ -1875,6 +1944,12 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             return "image", data["mfaceElement"]
         if isinstance(data.get("marketFaceElement"), dict):
             return "image", data["marketFaceElement"]
+        if isinstance(data.get("faceElement"), dict):
+            face = data["faceElement"]
+            # 普通 QQ 小表情通常只有 ID/名称，没有可保存文件；只有协议端给了
+            # url/file/path 时才纳入媒体表，避免把纯文本表情误计为“未落盘媒体”。
+            if self._first_media_value(face, self._media_source_keys("image")):
+                return "image", face
         if isinstance(data.get("market_face"), dict):
             return "image", data["market_face"]
         if isinstance(data.get("mface"), dict):

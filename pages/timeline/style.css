@@ -1,3 +1,5 @@
+/* 主题变量集中在这里：后面的会话栏、时间线、媒体查看器都只消费 token。
+   这样切换亮/暗色和微调密度时，不需要在几千行组件样式里逐个改颜色。 */
 :root {
   color-scheme: light;
   --paper: #fffcf6;
@@ -204,6 +206,8 @@ p {
   background: transparent;
 }
 
+/* 三栏主结构保持固定职责：左侧会话、中央时间线、右侧巡检面板。
+   使用 grid 而不是浮动卡片，是为了让长时间滚动归档时仍然稳定、不跳动。 */
 .messenger-shell,
 .shell {
   display: grid;
@@ -1124,6 +1128,8 @@ mark {
   margin-top: 8px;
 }
 
+/* 媒体卡片同时承载普通消息附件和合并转发节点媒体。
+   尺寸和控件状态固定，避免图片加载、音视频控件出现时把聊天气泡撑跳。 */
 .media-card {
   display: grid;
   gap: 6px;
@@ -2082,6 +2088,8 @@ mark {
   flex: 1;
 }
 
+/* 合并转发和媒体查看器都用全屏 overlay：归档内容可能很长，
+   独立层能保留原时间线滚动位置，也方便键盘/点击空白关闭。 */
 .forward-viewer,
 .media-viewer {
   position: fixed;

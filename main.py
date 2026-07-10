@@ -221,6 +221,13 @@ class ChatArchivePlugin(Star):
     async def _hydrate_onebot_forward_event(self, event: AstrMessageEvent) -> None:
         if self._onebot_forward_api_unavailable:
             return
+        if self._event_has_expanded_forward_content(event):
+            logger.debug(
+                "Chat Archive skip get_forward_msg because event already has Node/Nodes content"
+            )
+            return
+        if not self._is_aiocqhttp_event(event):
+            return
         forward_ids = self._event_forward_ids(event)
         if not forward_ids:
             return
@@ -268,6 +275,10 @@ class ChatArchivePlugin(Star):
     async def _call_onebot_forward_api(
         self, event: AstrMessageEvent, forward_id: str
     ) -> Any:
+        if not self._is_aiocqhttp_event(event):
+            # 官方文档要求协议端 API 只在 aiocqhttp 事件上调用。Telegram、
+            # Discord 等平台没有 OneBot get_forward_msg，直接走占位符兜底即可。
+            raise RuntimeError("get_forward_msg API is only available on aiocqhttp")
         client = self._event_bot_client(event)
         if client is None:
             self._onebot_forward_api_unavailable = True
@@ -284,14 +295,14 @@ class ChatArchivePlugin(Star):
                 (
                     getattr(api, "call_action", None),
                     ("get_forward_msg",),
-                    {"id": forward_id},
+                    {"message_id": forward_id},
                 )
             )
             candidates.append(
                 (
                     getattr(api, "call_action", None),
                     ("get_forward_msg",),
-                    {"message_id": forward_id},
+                    {"id": forward_id},
                 )
             )
         candidates.extend(
@@ -299,16 +310,11 @@ class ChatArchivePlugin(Star):
                 (
                     getattr(client, "call_action", None),
                     ("get_forward_msg",),
-                    {"id": forward_id},
+                    {"message_id": forward_id},
                 ),
                 (
                     getattr(client, "call_action", None),
                     ("get_forward_msg",),
-                    {"message_id": forward_id},
-                ),
-                (
-                    getattr(client, "call_api", None),
-                    ("get_forward_msg",),
                     {"id": forward_id},
                 ),
                 (
@@ -316,12 +322,17 @@ class ChatArchivePlugin(Star):
                     ("get_forward_msg",),
                     {"message_id": forward_id},
                 ),
-                (getattr(client, "get_forward_msg", None), (), {"id": forward_id}),
+                (
+                    getattr(client, "call_api", None),
+                    ("get_forward_msg",),
+                    {"id": forward_id},
+                ),
                 (
                     getattr(client, "get_forward_msg", None),
                     (),
                     {"message_id": forward_id},
                 ),
+                (getattr(client, "get_forward_msg", None), (), {"id": forward_id}),
             ]
         )
 
@@ -352,6 +363,24 @@ class ChatArchivePlugin(Star):
             self._onebot_forward_api_unavailable = True
         raise RuntimeError("get_forward_msg API is not available")
 
+    @staticmethod
+    def _is_aiocqhttp_event(event: AstrMessageEvent) -> bool:
+        getter = getattr(event, "get_platform_name", None)
+        if callable(getter):
+            try:
+                return str(getter() or "").lower() == "aiocqhttp"
+            except Exception:
+                logger.debug(
+                    "Chat Archive event.get_platform_name failed", exc_info=True
+                )
+        platform_meta = getattr(event, "platform_meta", None)
+        name = (
+            getattr(platform_meta, "name", "")
+            or getattr(platform_meta, "platform_name", "")
+            or ""
+        )
+        return str(name).lower() == "aiocqhttp"
+
     def _event_bot_client(self, event: AstrMessageEvent) -> Any:
         message_obj = getattr(event, "message_obj", None)
         candidates = [
@@ -371,6 +400,90 @@ class ChatArchivePlugin(Star):
             if candidate is not None:
                 return candidate
         return None
+
+    def _event_has_expanded_forward_content(self, event: AstrMessageEvent) -> bool:
+        message_obj = getattr(event, "message_obj", None)
+        values = [
+            getattr(message_obj, "message", None),
+            getattr(message_obj, "raw_message", None),
+        ]
+        seen_objects: set[int] = set()
+        return any(
+            self._value_has_expanded_forward_content(value, seen_objects)
+            for value in values
+        )
+
+    def _value_has_expanded_forward_content(
+        self, value: Any, seen_objects: set[int], depth: int = 0
+    ) -> bool:
+        if depth > 8 or value is None:
+            return False
+        if isinstance(value, str):
+            parsed = self._json_loads_maybe(value)
+            return (
+                self._value_has_expanded_forward_content(
+                    parsed, seen_objects, depth + 1
+                )
+                if parsed is not None
+                else False
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(
+                self._value_has_expanded_forward_content(item, seen_objects, depth + 1)
+                for item in value
+            )
+        if not isinstance(value, dict):
+            kind = str(
+                getattr(getattr(value, "type", None), "value", None)
+                or getattr(value, "type", "")
+                or value.__class__.__name__
+                or ""
+            ).lower()
+            if kind in {"node", "nodes"}:
+                return True
+            object_id = id(value)
+            if object_id in seen_objects:
+                return False
+            seen_objects.add(object_id)
+            converted = self._object_to_jsonable_mapping(value)
+            return (
+                self._value_has_expanded_forward_content(
+                    converted, seen_objects, depth + 1
+                )
+                if converted is not None
+                else False
+            )
+
+        kind = self._component_kind(value)
+        if kind in {"node", "nodes"}:
+            return True
+        segment = self._onebot_forward_segment(value)
+        if segment and isinstance(segment[1].get("messages"), list):
+            return True
+        if kind == "forward" and any(
+            isinstance(value.get(key), list) for key in ("messages", "items", "content")
+        ):
+            return True
+        return any(
+            self._value_has_expanded_forward_content(item, seen_objects, depth + 1)
+            for item in value.values()
+            if isinstance(item, (dict, list, str))
+        )
+
+    @staticmethod
+    def _component_kind(value: dict[str, Any]) -> str:
+        return (
+            str(
+                value.get("type")
+                or value.get("kind")
+                or value.get("segment_type")
+                or value.get("typeName")
+                or value.get("__class__")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
 
     def _onebot_forward_payload_from_api(
         self, forward_id: str, result: Any
