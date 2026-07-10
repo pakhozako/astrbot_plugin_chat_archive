@@ -504,22 +504,14 @@ class ChatArchivePlugin(Star):
             return None
 
         messages, truncated = self._limited_forward_messages(messages)
-        normalized = self.store._normalize_forward_messages(messages)
-        count = len(normalized) or len(messages)
-        previews = [
-            f"{item.get('sender')}: {item.get('text')}"
-            for item in normalized
-            if item.get("text")
-        ][:5]
-        if truncated and FORWARD_TRUNCATED_TEXT not in previews:
-            previews.append(FORWARD_TRUNCATED_TEXT)
+        count = len(self.store._normalize_forward_messages(messages)) or len(messages)
         return {
             "id": forward_id,
             "title": "合并转发",
             "summary": f"{count} 条消息",
-            "preview": previews,
             "messages": messages,
             "source": "get_forward_msg",
+            "truncated": truncated,
         }
 
     async def _hydrate_nested_forward_payload(

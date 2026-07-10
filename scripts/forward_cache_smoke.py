@@ -240,9 +240,10 @@ async def main() -> None:
             rich_previews
         )
         assert rich_previews[0]["title"] == "群聊记录", rich_previews
-        assert rich_previews[0]["previews"] == ["Alice: 早上好", "Bob: 收到"], (
-            rich_previews
-        )
+        assert rich_previews[0]["previews"] == [
+            "Alice: 早上好",
+            "Bob: @全体成员[图片]",
+        ], rich_previews
         rich_detail = store.get_forward_preview(rich_forward_id)
         assert rich_detail and rich_detail["message_count"] == 2, rich_detail
         assert rich_detail["messages"][1]["text"] == "@全体成员[图片]", rich_detail

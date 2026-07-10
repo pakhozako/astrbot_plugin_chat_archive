@@ -1164,10 +1164,9 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         messages = self._normalize_forward_messages(
             data.get("messages") or data.get("items") or []
         )
-        if not preview:
-            preview = [
-                message.get("text") or "" for message in messages if message.get("text")
-            ][:5]
+        generated_preview = self._forward_preview_lines(messages)
+        if generated_preview:
+            preview = generated_preview
         if not preview:
             preview = [f"转发 ID: {self._short_forward_id(forward_id)}"]
         return self._build_forward_archive(
@@ -1184,9 +1183,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         forward_id = self._first_text(data, ("id", "resid", "res_id", "forward_id"))
         content = data.get("content") if isinstance(data.get("content"), list) else []
         messages = self._normalize_forward_messages(content)
-        previews = [
-            message.get("text") or "" for message in messages if message.get("text")
-        ][:5]
+        previews = self._forward_preview_lines(messages)
         if not forward_id:
             return None
         return self._build_forward_archive(
@@ -1257,6 +1254,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         )
         previews = (
             parsed["previews"]
+            or self._forward_preview_lines(messages)
             or [
                 f"{item.get('sender')}: {item.get('text')}"
                 for item in messages
@@ -1296,7 +1294,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             return None
         news = detail.get("news") if isinstance(detail.get("news"), list) else []
         messages = self._normalize_forward_messages(news)
-        previews = [
+        previews = self._forward_preview_lines(messages) or [
             self._first_text(item, ("text", "title", "desc"))
             for item in news
             if isinstance(item, dict)
@@ -1513,13 +1511,16 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         if kind in {"at", "mention"}:
             return self._mention_text(data)
         if kind == "image":
-            return "[图片]"
+            name = self._first_text(data, ("fileName", "file_name", "name", "file"))
+            return f"[图片: {name}]" if name else "[图片]"
         if kind == "face":
             return self._first_text(data, ("faceText", "name", "text")) or "[表情]"
         if kind in {"record", "audio", "voice", "ptt"}:
-            return "[语音]"
+            name = self._first_text(data, ("fileName", "file_name", "name", "file"))
+            return f"[语音: {name}]" if name else "[语音]"
         if kind == "video":
-            return "[视频]"
+            name = self._first_text(data, ("fileName", "file_name", "name", "file"))
+            return f"[视频: {name}]" if name else "[视频]"
         if kind == "file":
             name = self._first_text(data, ("fileName", "file_name", "name", "file"))
             return f"[文件: {name}]" if name else "[文件]"
@@ -1559,6 +1560,30 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             lines.append(f"{sender}: {text}" if sender else text)
         return "\n".join(lines)[:12000]
 
+    @classmethod
+    def _forward_preview_lines(
+        cls, messages: list[dict[str, Any]], *, limit: int = 5
+    ) -> list[str]:
+        lines: list[str] = []
+        for item in messages:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            sender = str(item.get("sender") or "").strip()
+            sender_id = str(item.get("sender_id") or "").strip()
+            if sender and sender_id and sender_id not in sender:
+                sender = f"{sender}({sender_id})"
+            summary = cls._truncate_forward_preview_text(text)
+            lines.append(f"{sender}: {summary}" if sender else summary)
+            if len(lines) >= limit:
+                break
+        return lines
+
+    @staticmethod
+    def _truncate_forward_preview_text(value: str, limit: int = 40) -> str:
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
     @staticmethod
     def _forward_sender_id(item: dict[str, Any]) -> str:
         sender = item.get("sender")
@@ -1578,8 +1603,8 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         sender = item.get("sender")
         if isinstance(sender, dict):
             for key in (
-                "nickname",
                 "card",
+                "nickname",
                 "name",
                 "user_name",
                 "userName",
@@ -1652,6 +1677,9 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             new_count = int(archive.get("message_count") or 0)
             existing_count = int(existing["message_count"] or 0) if existing else -1
             if not existing or new_count >= existing_count:
+                # forward_archives 是两阶段缓存：第一次可能只有 forward_id 占位，
+                # message_count 为 0；之后同 ID 再次出现并成功 get_forward_msg 时，
+                # 用更完整的 messages/previews 覆盖旧占位，避免一次协议端失败永久卡死。
                 messages = (
                     archive.get("messages")
                     if isinstance(archive.get("messages"), list)
