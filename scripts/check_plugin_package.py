@@ -46,6 +46,7 @@ STDLIB_IMPORTS = {
     "dataclasses",
     "hashlib",
     "html",
+    "inspect",
     "ipaddress",
     "json",
     "logging",

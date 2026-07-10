@@ -121,6 +121,39 @@ async def main() -> None:
                 ),
             )
         )
+        hydrated_forward_id = "hydrated-forward-id"
+        hydrated_raw = onebot_forward_raw(
+            hydrated_forward_id, message_id=1700000001, message_seq=371496
+        )
+        hydrated_raw["data"]["message"][0]["data"].update(
+            {
+                "summary": "2 条消息",
+                "messages": [
+                    {
+                        "type": "node",
+                        "data": {
+                            "sender": {"nickname": "Alice", "user_id": 10001},
+                            "time": 1783649500,
+                            "content": [
+                                {"type": "text", "data": {"text": "第一条节点正文"}}
+                            ],
+                        },
+                    },
+                    {
+                        "type": "node",
+                        "data": {
+                            "sender": {"nickname": "Bob", "user_id": 10002},
+                            "time": 1783649510,
+                            "content": [
+                                {"type": "at", "data": {"qq": "all"}},
+                                {"type": "image", "data": {"summary": "群截图"}},
+                            ],
+                        },
+                    },
+                ],
+            }
+        )
+        await store.store_event(DummyForwardEvent("forward-msg-1d", hydrated_raw))
         rich_forward_id = "rich-forward-id"
         await store.store_event(
             DummyForwardEvent(
@@ -168,7 +201,7 @@ async def main() -> None:
         await store.flush_pending()
 
         listed = store.list_messages(limit=5)["items"]
-        assert len(listed) == 4, listed
+        assert len(listed) == 5, listed
         first = next(item for item in listed if item["message_id"] == "forward-msg-1")
         previews = first.get("forward_previews") or []
         assert previews and previews[0]["forward_id"] == FORWARD_ID, previews
@@ -188,6 +221,17 @@ async def main() -> None:
         assert detail["refs"] and detail["refs"][0]["message_id"] == "forward-msg-1", (
             detail
         )
+
+        hydrated = next(
+            item for item in listed if item["message_id"] == "forward-msg-1d"
+        )
+        assert "Alice: 第一条节点正文" in hydrated["text"], hydrated
+        assert "Bob: @全体成员[图片]" in hydrated["text"], hydrated
+        hydrated_detail = store.get_forward_preview(hydrated_forward_id)
+        assert hydrated_detail and hydrated_detail["message_count"] == 2, (
+            hydrated_detail
+        )
+        assert hydrated_detail["messages"][0]["sender"] == "Alice", hydrated_detail
 
         rich = next(item for item in listed if item["message_id"] == "forward-msg-2")
         rich_previews = rich.get("forward_previews") or []

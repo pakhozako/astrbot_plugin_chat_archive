@@ -355,13 +355,18 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             or getattr(event, "type", "")
         )
 
-        text = str(
+        adapter_text = str(
             getattr(event, "message_str", "")
             or getattr(message_obj, "message_str", "")
             or ""
         )
-        if not text:
-            text = self._message_text_from_raw(raw)
+        raw_text = self._message_text_from_raw(raw)
+        if not adapter_text or self._should_prefer_raw_forward_text(
+            adapter_text, raw_text
+        ):
+            text = raw_text
+        else:
+            text = adapter_text
 
         return {
             "message_uid": self._message_uid(umo, message_id, created_at, sender_id),
@@ -506,6 +511,15 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             ),
         )
 
+    @staticmethod
+    def _should_prefer_raw_forward_text(adapter_text: str, raw_text: str) -> bool:
+        if not raw_text or raw_text == adapter_text:
+            return False
+        text = str(adapter_text or "").strip()
+        if text in {"[聊天记录]", "[合并转发]"}:
+            return True
+        return bool(re.fullmatch(r"(?:\[CQ:forward,[^\]]+\]\s*)+", text))
+
     def _message_element_text(self, element: dict[str, Any]) -> str:
         if not isinstance(element, dict):
             return ""
@@ -573,6 +587,13 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                 data, ("summary", "title", "name", "fileName", "file_name", "file")
             )
         if normalized == "forward":
+            forwarded_text = self._forward_messages_plain_text(
+                self._normalize_forward_messages(
+                    data.get("messages") or data.get("items") or []
+                )
+            )
+            if forwarded_text:
+                return forwarded_text
             return (
                 self._first_text(data, ("summary", "title", "prompt")) or "[聊天记录]"
             )
@@ -1093,6 +1114,12 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                 continue
             if not isinstance(item, dict):
                 continue
+            onebot_segment = self._onebot_segment(item)
+            if onebot_segment and onebot_segment[0] == "node":
+                # OneBot get_forward_msg 常见返回是
+                # {"type":"node","data":{"sender":...,"content":[...]}}。
+                # 这里提前拆掉 node 外壳，后面的 sender/content 归一化逻辑就能复用。
+                item = dict(onebot_segment[1])
             segments = self._normalize_forward_segments(item)
             text = self._first_text(
                 item,
@@ -1248,9 +1275,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         if kind in {"mention_all", "at_all"}:
             return "@全体成员"
         if kind in {"at", "mention"}:
-            return "@" + (
-                self._first_text(data, ("qq", "user_id", "uid", "uin")) or "成员"
-            )
+            return self._mention_text(data)
         if kind == "image":
             return "[图片]"
         if kind == "face":
@@ -1263,7 +1288,12 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             name = self._first_text(data, ("fileName", "file_name", "name", "file"))
             return f"[文件: {name}]" if name else "[文件]"
         if kind == "forward":
-            return "[聊天记录]"
+            forwarded_text = self._forward_messages_plain_text(
+                self._normalize_forward_messages(
+                    data.get("messages") or data.get("items") or []
+                )
+            )
+            return forwarded_text or "[聊天记录]"
         if kind == "json":
             parsed = self._json_loads_maybe(
                 data.get("data") or data.get("value") or data
@@ -1274,6 +1304,17 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                 else "[JSON]"
             )
         return self._first_text(data, ("summary", "text", "content", "title", "name"))
+
+    @staticmethod
+    def _forward_messages_plain_text(messages: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for item in messages[:200]:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            sender = str(item.get("sender") or "").strip()
+            lines.append(f"{sender}: {text}" if sender else text)
+        return "\n".join(lines)[:12000]
 
     @staticmethod
     def _forward_sender_name(item: dict[str, Any]) -> str:

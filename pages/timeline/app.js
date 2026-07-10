@@ -3266,7 +3266,7 @@ function renderForwardViewerBody(parsed, loading = false) {
       `)
       .join("");
   }
-  const note = loading ? "正在读取归档缓存..." : parsed.resId ? "该合并转发当前只有摘要；如果后端之后补到 get_forward_msg 节点，会自动在这里展开。" : "该合并转发只有摘要，原始消息正文未随归档保存。";
+  const note = loading ? "正在读取归档缓存..." : parsed.resId ? "该合并转发当前只有摘要，协议端未返回可归档的节点正文。" : "该合并转发只有摘要，原始消息正文未随归档保存。";
   return `
     <div class="forward-preview-list">
       ${(parsed.previews || []).map((preview) => `<p>${escapeHtml(preview)}</p>`).join("") || `<p>${escapeHtml(parsed.summary || note)}</p>`}

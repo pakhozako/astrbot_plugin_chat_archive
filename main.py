@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import inspect
+import json
+import re
 import time
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -13,6 +17,8 @@ from .web import ChatArchiveWeb
 
 PLUGIN_NAME = "astrbot_plugin_chat_archive"
 PLUGIN_VERSION = "0.1.0"
+MAX_FORWARD_HYDRATE_IDS = 5
+ONEBOT_FORWARD_CQ_RE = re.compile(r"\[CQ:forward,[^\]]*?\bid=([^,\]]+)[^\]]*\]")
 
 
 @register(
@@ -142,6 +148,7 @@ class ChatArchivePlugin(Star):
         if any(text.startswith(prefix) for prefix in self.ignore_prefixes):
             return
         try:
+            await self._hydrate_onebot_forward_event(event)
             await self.store.store_event(event)
         except Exception as exc:
             logger.warning(
@@ -204,6 +211,351 @@ class ChatArchivePlugin(Star):
                 if value and value not in values:
                     values.append(value)
         return values
+
+    async def _hydrate_onebot_forward_event(self, event: AstrMessageEvent) -> None:
+        forward_ids = self._event_forward_ids(event)
+        if not forward_ids:
+            return
+        hydrated: dict[str, dict[str, Any]] = {}
+        for forward_id in forward_ids[:MAX_FORWARD_HYDRATE_IDS]:
+            try:
+                result = await self._call_onebot_forward_api(event, forward_id)
+            except Exception as exc:
+                log_method = (
+                    logger.debug
+                    if isinstance(exc, RuntimeError) and "not available" in str(exc)
+                    else logger.warning
+                )
+                log_method(
+                    "Chat Archive get_forward_msg failed: id=%s error=%s",
+                    self._short_forward_id(forward_id),
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            payload = self._onebot_forward_payload_from_api(forward_id, result)
+            if payload:
+                hydrated[forward_id] = payload
+        if not hydrated:
+            return
+        self._apply_hydrated_forward_payloads(event, hydrated)
+        logger.debug(
+            "Chat Archive hydrated %s merged forward message(s)", len(hydrated)
+        )
+
+    async def _call_onebot_forward_api(
+        self, event: AstrMessageEvent, forward_id: str
+    ) -> Any:
+        client = getattr(event, "bot", None)
+        if client is None:
+            message_obj = getattr(event, "message_obj", None)
+            client = getattr(message_obj, "bot", None)
+        if client is None:
+            raise RuntimeError("event.bot is not available")
+
+        # AstrBot 文档示例是 event.bot.api.call_action；aiocqhttp 同时支持
+        # bot.call_action 和 bot.get_forward_msg。这里按最常见到最直接的顺序尝试，
+        # 失败后保留原始合并转发 ID，不让协议端差异影响普通归档。
+        candidates: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+        api = getattr(client, "api", None)
+        if api is not None:
+            candidates.append(
+                (
+                    getattr(api, "call_action", None),
+                    ("get_forward_msg",),
+                    {"id": forward_id},
+                )
+            )
+        candidates.extend(
+            [
+                (
+                    getattr(client, "call_action", None),
+                    ("get_forward_msg",),
+                    {"id": forward_id},
+                ),
+                (
+                    getattr(client, "call_api", None),
+                    ("get_forward_msg",),
+                    {"id": forward_id},
+                ),
+                (getattr(client, "get_forward_msg", None), (), {"id": forward_id}),
+            ]
+        )
+
+        last_error: Exception | None = None
+        for func, args, kwargs in candidates:
+            if not callable(func):
+                continue
+            try:
+                result = func(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            except Exception as exc:
+                last_error = exc
+                logger.debug(
+                    "Chat Archive forward API candidate failed: id=%s func=%s",
+                    self._short_forward_id(forward_id),
+                    getattr(func, "__name__", repr(func)),
+                    exc_info=True,
+                )
+        if last_error:
+            raise last_error
+        raise RuntimeError("get_forward_msg API is not available")
+
+    def _onebot_forward_payload_from_api(
+        self, forward_id: str, result: Any
+    ) -> dict[str, Any] | None:
+        data = self._safe_jsonable(result)
+        if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
+            data = data["data"]
+
+        messages: Any = None
+        if isinstance(data, list):
+            messages = data
+        elif isinstance(data, dict):
+            for key in ("messages", "message", "items", "nodes", "content"):
+                if isinstance(data.get(key), list):
+                    messages = data[key]
+                    break
+        if not isinstance(messages, list) or not messages:
+            return None
+
+        normalized = self.store._normalize_forward_messages(messages)
+        count = len(normalized) or len(messages)
+        previews = [
+            f"{item.get('sender')}: {item.get('text')}"
+            for item in normalized
+            if item.get("text")
+        ][:5]
+        return {
+            "id": forward_id,
+            "title": "合并转发",
+            "summary": f"{count} 条消息",
+            "preview": previews,
+            "messages": messages,
+            "source": "get_forward_msg",
+        }
+
+    def _apply_hydrated_forward_payloads(
+        self, event: AstrMessageEvent, hydrated: dict[str, dict[str, Any]]
+    ) -> None:
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is None:
+            return
+
+        raw = getattr(message_obj, "raw_message", None)
+        raw_with_nodes, changed = self._merge_forward_payloads(raw, hydrated)
+        if not changed:
+            # 有些 AstrBot/OneBot 组合只给 raw_message 字符串，例如
+            # [CQ:forward,id=...]。这种情况下包一层 message[]，让 storage 复用
+            # 现有 OneBot segment 解析，不额外制造展示层特例。
+            raw_with_nodes = {
+                "raw_message": self._safe_jsonable(raw),
+                "message": [
+                    {"type": "forward", "data": payload}
+                    for payload in hydrated.values()
+                ],
+            }
+        self._set_attr_safely(message_obj, "raw_message", raw_with_nodes)
+
+        message = getattr(message_obj, "message", None)
+        message_with_nodes, message_changed = self._merge_forward_payloads(
+            message, hydrated
+        )
+        if message_changed:
+            self._set_attr_safely(message_obj, "message", message_with_nodes)
+
+        self._clear_forward_marker_text(event)
+
+    def _merge_forward_payloads(
+        self, value: Any, hydrated: dict[str, dict[str, Any]], depth: int = 0
+    ) -> tuple[Any, bool]:
+        if depth > 8 or value is None:
+            return value, False
+        if isinstance(value, list):
+            changed = False
+            items = []
+            for item in value:
+                merged, item_changed = self._merge_forward_payloads(
+                    item, hydrated, depth + 1
+                )
+                changed = changed or item_changed
+                items.append(merged)
+            return (items, True) if changed else (value, False)
+        if not isinstance(value, dict):
+            return value, False
+
+        forward_id, data = self._onebot_forward_segment(value)
+        if forward_id and forward_id in hydrated:
+            merged_data = dict(data)
+            merged_data.update(hydrated[forward_id])
+            merged = dict(value)
+            merged["data"] = merged_data
+            return merged, True
+
+        changed = False
+        merged_dict: dict[str, Any] = {}
+        for key, item in value.items():
+            merged_item, item_changed = self._merge_forward_payloads(
+                item, hydrated, depth + 1
+            )
+            changed = changed or item_changed
+            merged_dict[key] = merged_item
+        return (merged_dict, True) if changed else (value, False)
+
+    def _event_forward_ids(self, event: AstrMessageEvent) -> list[str]:
+        message_obj = getattr(event, "message_obj", None)
+        values = [
+            getattr(message_obj, "raw_message", None),
+            getattr(message_obj, "message", None),
+            getattr(event, "message_str", None),
+            getattr(message_obj, "message_str", None),
+        ]
+        result: list[str] = []
+        seen_objects: set[int] = set()
+        for value in values:
+            self._collect_forward_ids(value, result, seen_objects)
+            if len(result) >= MAX_FORWARD_HYDRATE_IDS:
+                break
+        return result
+
+    def _collect_forward_ids(
+        self,
+        value: Any,
+        result: list[str],
+        seen_objects: set[int],
+        depth: int = 0,
+    ) -> None:
+        if depth > 8 or len(result) >= MAX_FORWARD_HYDRATE_IDS or value is None:
+            return
+        if isinstance(value, str):
+            for match in ONEBOT_FORWARD_CQ_RE.findall(value):
+                self._append_forward_id(result, match)
+            parsed = self._json_loads_maybe(value)
+            if parsed is not None:
+                self._collect_forward_ids(parsed, result, seen_objects, depth + 1)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                self._collect_forward_ids(item, result, seen_objects, depth + 1)
+            return
+        if not isinstance(value, dict):
+            object_id = id(value)
+            if object_id in seen_objects:
+                return
+            seen_objects.add(object_id)
+            converted = self._object_to_jsonable_mapping(value)
+            if converted is not None:
+                self._collect_forward_ids(converted, result, seen_objects, depth + 1)
+            return
+
+        forward_id, _ = self._onebot_forward_segment(value)
+        self._append_forward_id(result, forward_id)
+        for item in value.values():
+            self._collect_forward_ids(item, result, seen_objects, depth + 1)
+
+    @staticmethod
+    def _onebot_forward_segment(value: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        segment_type = (
+            str(
+                value.get("type")
+                or value.get("kind")
+                or value.get("segment_type")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        if segment_type != "forward":
+            return "", {}
+        data = value.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        forward_id = ""
+        for key in ("id", "resid", "res_id", "forward_id"):
+            forward_id = str(data.get(key) or "").strip()
+            if forward_id:
+                break
+        return forward_id, data
+
+    @staticmethod
+    def _append_forward_id(result: list[str], forward_id: Any) -> None:
+        text = str(forward_id or "").strip()
+        if text and text not in result:
+            result.append(text)
+
+    @staticmethod
+    def _short_forward_id(value: Any) -> str:
+        text = str(value or "").strip()
+        return text if len(text) <= 24 else f"{text[:10]}...{text[-8:]}"
+
+    @staticmethod
+    def _json_loads_maybe(value: str) -> Any:
+        text = value.strip()
+        if not text or text[0] not in "[{":
+            return None
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _safe_jsonable(cls, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, bytes):
+            return f"<bytes:{len(value)}>"
+        if isinstance(value, (list, tuple, set)):
+            return [cls._safe_jsonable(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): cls._safe_jsonable(item) for key, item in value.items()}
+        converted = cls._object_to_jsonable_mapping(value)
+        return cls._safe_jsonable(converted) if converted is not None else repr(value)
+
+    @staticmethod
+    def _object_to_jsonable_mapping(value: Any) -> dict[str, Any] | None:
+        for method_name in ("toDict", "model_dump"):
+            method = getattr(value, method_name, None)
+            if callable(method):
+                try:
+                    converted = method()
+                except Exception:
+                    continue
+                if isinstance(converted, dict):
+                    return converted
+        if hasattr(value, "__dict__"):
+            return {
+                str(key): item
+                for key, item in vars(value).items()
+                if not str(key).startswith("_")
+            }
+        return None
+
+    def _clear_forward_marker_text(self, event: AstrMessageEvent) -> None:
+        message_obj = getattr(event, "message_obj", None)
+        for owner in (event, message_obj):
+            if owner is None:
+                continue
+            text = str(getattr(owner, "message_str", "") or "").strip()
+            if self._is_forward_marker_text(text):
+                self._set_attr_safely(owner, "message_str", "")
+
+    @staticmethod
+    def _is_forward_marker_text(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if text in {"[聊天记录]", "[合并转发]"}:
+            return True
+        return bool(re.fullmatch(r"(?:\[CQ:forward,[^\]]+\]\s*)+", text))
+
+    @staticmethod
+    def _set_attr_safely(target: Any, name: str, value: Any) -> None:
+        try:
+            setattr(target, name, value)
+        except Exception:
+            logger.debug("Chat Archive could not set %s on %r", name, target)
 
     @staticmethod
     def _optional_number(value):
