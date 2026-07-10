@@ -125,8 +125,39 @@ const announcementRaw = {
   },
 };
 
-const forwardId = "2fz1pK0FJwlrHNU9DLEskChlmbh7EjVjfnd38qf//7gjf8Gc30qY/bmY4K5zYsXK";
-const forwardRaw = {
+const forwardId = "gbzl4SGAxJwfZRGrlYxD2ATg9rW/7MLItnwdcclK6ww/T2W7VQzgMC+whTi92nzW";
+const secondForwardId = "LCYdNHpRxYlnWquG6xK7a/m9WlDG0kTNxCzdFxg7xzlddGSrNYJ45bcyWLZY8x2T";
+const thirdForwardId = "lAfmPXCj9thJrfr8Ne1vBGfUEV2zdfcrVhFI4myq2gXOFoc4OpHNLo2mEjXIY4cl";
+function onebotForwardEnvelope(id, messageId, seq, sender = {}) {
+  return {
+    status: "ok",
+    retcode: 0,
+    data: {
+      time: 1783649390,
+      message_type: "group",
+      sub_type: "normal",
+      message_id: messageId,
+      message_seq: seq,
+      group_id: 972752812,
+      user_id: sender.user_id || 3926537572,
+      message: [{ type: "forward", data: { id } }],
+      raw_message: `[CQ:forward,id=${id}]`,
+      font: 0,
+      sender: {
+        user_id: sender.user_id || 3926537572,
+        nickname: sender.nickname || "Claude",
+        card: sender.card || "我不是Claude",
+        role: "admin",
+        sex: "unknown",
+        age: 0,
+      },
+      anonymous: null,
+      real_id: messageId,
+    },
+  };
+}
+const forwardRaw = onebotForwardEnvelope(forwardId, -1446084226, 371495);
+const compactForwardRaw = {
   status: "ok",
   data: {
     message: [{ type: "forward", data: { id: forwardId } }],
@@ -171,6 +202,25 @@ const forwardHtml = app.messageBodyHtml(message(forwardRaw));
 assert.match(forwardHtml, /合并转发/);
 assert.match(forwardHtml, /OneBot 合并转发/);
 assert.equal(app.messagePlainText(message(forwardRaw)), `[合并转发] ${forwardId}`);
+assert.equal(app.messagePlainText(message(compactForwardRaw)), `[合并转发] ${forwardId}`);
+assert.equal(
+  app.messagePlainText(
+    message(onebotForwardEnvelope(secondForwardId, 1570462735, 371488)),
+  ),
+  `[合并转发] ${secondForwardId}`,
+);
+assert.equal(
+  app.messagePlainText(
+    message(
+      onebotForwardEnvelope(thirdForwardId, -1349952399, 371451, {
+        user_id: 2413474391,
+        nickname: "Elaina",
+        card: "Elaina",
+      }),
+    ),
+  ),
+  `[合并转发] ${thirdForwardId}`,
+);
 
 assert.equal(app.messageBodyHtml(sticker), "");
 assert.equal(app.mediaForGrid(sticker).length, 1);

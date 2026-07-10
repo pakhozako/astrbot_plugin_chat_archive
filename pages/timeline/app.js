@@ -2744,6 +2744,8 @@ function renderNoticeElementHtml(notice) {
 
 function forwardElementFromRaw(raw) {
   if (!raw || typeof raw !== "object") return null;
+  // 非 OneBot 适配器通常把合并转发作为对象字段挂在 raw 上；
+  // OneBot 的 `type: forward` 消息段已经在 oneBotSegment() 分支里处理。
   return (
     raw.multiForwardMsgElement ||
     raw.forwardElement ||
@@ -3448,6 +3450,9 @@ function expandMessageElements(value) {
   if (typeof value !== "object") return [];
   const raw = unwrapMessageElement(value);
   if (!raw || typeof raw !== "object") return [];
+  // 各适配器给的原始结构不统一：OneBot 可能给整包事件（data.message[]），
+  // AstrBot 组件可能给 messageChain，QQ/Milky 风格又常见 elements/msgElements。
+  // 先把这些数组拆成消息段，避免合并转发、图片等内容被误渲染成泛 JSON 卡片。
   const arrays = [
     raw.elements,
     raw.msgElements,
@@ -3456,8 +3461,10 @@ function expandMessageElements(value) {
     raw.message_chain,
     raw.segments,
     raw.payload?.elements,
+    raw.payload?.message,
     raw.data?.elements,
     raw.data?.message,
+    raw.data?.messages,
     raw.message_obj?.message,
   ].filter(Array.isArray);
   if (arrays.length) return arrays.flatMap((items) => items.flatMap((item) => expandMessageElements(item)));

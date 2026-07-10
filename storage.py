@@ -771,6 +771,9 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
     def _extract_forward_archives(
         self, payload: dict[str, Any]
     ) -> list[dict[str, Any]]:
+        # 合并转发在不同适配器里的位置不一样：OneBot 常见是整包事件
+        # `status -> data -> message[]`，QQ/Milky 一类适配器则可能直接把
+        # forward 对象挂在组件数据里。这里两边都扫一遍，最后按 forward_id 去重。
         archives: list[dict[str, Any]] = []
         for component in payload.get("components") or []:
             if not isinstance(component, dict):
@@ -883,6 +886,9 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             "meta",
             "extra",
         ):
+            # 递归扫这些容器字段，才能捕获完整 OneBot 事件包，例如：
+            # {"status":"ok","data":{"message":[{"type":"forward",...}]}}.
+            # 上面的 depth 限制是为了防止异常 payload 自引用时无限递归。
             nested = value.get(key)
             if nested is value:
                 continue

@@ -14,7 +14,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from storage import ArchiveConfig, ChatArchiveStore
 
 
-FORWARD_ID = "2fz1pK0FJwlrHNU9DLEskChlmbh7EjVjfnd38qf//7gjf8Gc30qY/bmY4K5zYsXK"
+FORWARD_ID = "gbzl4SGAxJwfZRGrlYxD2ATg9rW/7MLItnwdcclK6ww/T2W7VQzgMC+whTi92nzW"
+SECOND_FORWARD_ID = "LCYdNHpRxYlnWquG6xK7a/m9WlDG0kTNxCzdFxg7xzlddGSrNYJ45bcyWLZY8x2T"
+THIRD_FORWARD_ID = "lAfmPXCj9thJrfr8Ne1vBGfUEV2zdfcrVhFI4myq2gXOFoc4OpHNLo2mEjXIY4cl"
+
+
+def onebot_forward_raw(
+    forward_id: str,
+    *,
+    message_id: int,
+    message_seq: int,
+    user_id: int = 3926537572,
+    nickname: str = "Claude",
+    card: str = "我不是Claude",
+) -> dict:
+    return {
+        "status": "ok",
+        "retcode": 0,
+        "data": {
+            "time": 1783649390,
+            "message_type": "group",
+            "sub_type": "normal",
+            "message_id": message_id,
+            "message_seq": message_seq,
+            "group_id": 972752812,
+            "user_id": user_id,
+            "message": [{"type": "forward", "data": {"id": forward_id}}],
+            "raw_message": f"[CQ:forward,id={forward_id}]",
+            "font": 0,
+            "sender": {
+                "user_id": user_id,
+                "nickname": nickname,
+                "card": card,
+                "role": "admin",
+                "sex": "unknown",
+                "age": 0,
+            },
+            "anonymous": None,
+            "real_id": message_id,
+        },
+    }
 
 
 class DummyForwardEvent:
@@ -27,17 +66,9 @@ class DummyForwardEvent:
         self.message_obj = SimpleNamespace(
             message=[],
             raw_message=raw_message
-            or {
-                "status": "ok",
-                "data": {
-                    "message": [
-                        {
-                            "type": "forward",
-                            "data": {"id": FORWARD_ID},
-                        }
-                    ]
-                },
-            },
+            or onebot_forward_raw(
+                FORWARD_ID, message_id=-1446084226, message_seq=371495
+            ),
             sender=SimpleNamespace(user_id="alice", nickname="Alice"),
             timestamp=int(time.time()),
             message_id=message_id,
@@ -69,6 +100,27 @@ async def main() -> None:
             ),
         )
         await store.store_event(DummyForwardEvent("forward-msg-1"))
+        await store.store_event(
+            DummyForwardEvent(
+                "forward-msg-1b",
+                onebot_forward_raw(
+                    SECOND_FORWARD_ID, message_id=1570462735, message_seq=371488
+                ),
+            )
+        )
+        await store.store_event(
+            DummyForwardEvent(
+                "forward-msg-1c",
+                onebot_forward_raw(
+                    THIRD_FORWARD_ID,
+                    message_id=-1349952399,
+                    message_seq=371451,
+                    user_id=2413474391,
+                    nickname="Elaina",
+                    card="Elaina",
+                ),
+            )
+        )
         rich_forward_id = "rich-forward-id"
         await store.store_event(
             DummyForwardEvent(
@@ -116,11 +168,20 @@ async def main() -> None:
         await store.flush_pending()
 
         listed = store.list_messages(limit=5)["items"]
-        assert len(listed) == 2, listed
+        assert len(listed) == 4, listed
         first = next(item for item in listed if item["message_id"] == "forward-msg-1")
         previews = first.get("forward_previews") or []
         assert previews and previews[0]["forward_id"] == FORWARD_ID, previews
         assert previews[0]["summary"] == "OneBot 合并转发", previews
+        for message_id, forward_id in (
+            ("forward-msg-1b", SECOND_FORWARD_ID),
+            ("forward-msg-1c", THIRD_FORWARD_ID),
+        ):
+            item = next(row for row in listed if row["message_id"] == message_id)
+            item_previews = item.get("forward_previews") or []
+            assert item_previews and item_previews[0]["forward_id"] == forward_id, (
+                item_previews
+            )
 
         detail = store.get_forward_preview(FORWARD_ID)
         assert detail and detail["forward_id"] == FORWARD_ID, detail
