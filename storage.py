@@ -40,6 +40,8 @@ SCHEMA_VERSION = _archive_config.SCHEMA_VERSION
 ArchiveConfig = _archive_config.ArchiveConfig
 _json_dumps = _archive_config.json_dumps
 _safe_name = _archive_config.safe_name
+FORWARD_MAX_MESSAGES = 200
+FORWARD_TRUNCATED_TEXT = "[已省略更多内容]"
 
 try:
     from astrbot.api import logger
@@ -593,7 +595,14 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                 )
             )
             if forwarded_text:
-                return forwarded_text
+                forward_id = self._first_text(
+                    data, ("id", "resid", "res_id", "forward_id")
+                )
+                header = f"[合并转发:{forward_id}]" if forward_id else "[合并转发]"
+                return f"{header}\n{forwarded_text}"
+            forward_id = self._first_text(data, ("id", "resid", "res_id", "forward_id"))
+            if forward_id:
+                return f"[合并转发:{forward_id}]"
             return (
                 self._first_text(data, ("summary", "title", "prompt")) or "[聊天记录]"
             )
@@ -684,7 +693,12 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             source = self._normalize_qpic_source(source)
             if not source and kind == "image":
                 source = self._market_face_source(raw_data)
-            name = (
+            context = (
+                raw_data.get("_archive_context")
+                if isinstance(raw_data.get("_archive_context"), dict)
+                else {}
+            )
+            base_name = (
                 raw_data.get("name")
                 or raw_data.get("fileName")
                 or raw_data.get("file_name")
@@ -694,6 +708,7 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                 or raw_data.get("summary")
                 or _safe_name(str(source or kind), fallback=kind)
             )
+            name = self._contextual_media_name(str(base_name or kind), context)
             key = (kind, str(source or ""), str(name or ""))
             if key in seen:
                 continue
@@ -733,6 +748,24 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             )
         return rows
 
+    @staticmethod
+    def _contextual_media_name(name: str, context: dict[str, Any]) -> str:
+        if not context:
+            return name
+        sender = str(context.get("sender") or "").strip()
+        sender_id = str(context.get("sender_id") or "").strip()
+        forward_id = str(context.get("forward_id") or "").strip()
+        actor = sender
+        if actor and sender_id and sender_id not in actor:
+            actor = f"{actor}({sender_id})"
+        prefix = "合并转发"
+        if actor:
+            prefix += f" / {actor}"
+        if forward_id:
+            short_id = forward_id if len(forward_id) <= 16 else f"{forward_id[:8]}..."
+            prefix += f" / {short_id}"
+        return f"{prefix} / {name}"
+
     def _iter_media_candidates(
         self, components: list[dict[str, Any]], raw_message: Any
     ) -> Iterator[tuple[int, str, dict[str, Any]]]:
@@ -756,6 +789,119 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             kind, data = self._media_kind_and_data(element)
             if kind:
                 yield index, kind, data
+        # 合并转发的媒体藏在 forward.data.messages[].content[] 里，顶层
+        # _raw_message_elements 只会看到 forward 段本身。这里再做一次受限深扫，
+        # 让转发节点里的图片/语音/视频也进入同一套下载、去重和展示流程。
+        for index, kind, data in self._iter_nested_media_candidates(
+            raw_message, base_index=10000
+        ):
+            yield index, kind, data
+
+    def _iter_nested_media_candidates(
+        self,
+        value: Any,
+        *,
+        base_index: int = 0,
+        depth: int = 0,
+        context: dict[str, Any] | None = None,
+    ) -> Iterator[tuple[int, str, dict[str, Any]]]:
+        if depth > 8 or value is None:
+            return
+        if isinstance(value, str):
+            parsed = self._json_loads_maybe(value)
+            if parsed is not None:
+                yield from self._iter_nested_media_candidates(
+                    parsed, base_index=base_index, depth=depth + 1, context=context
+                )
+            return
+        if isinstance(value, list):
+            for offset, item in enumerate(value):
+                yield from self._iter_nested_media_candidates(
+                    item,
+                    base_index=base_index + offset,
+                    depth=depth + 1,
+                    context=context,
+                )
+            return
+        if not isinstance(value, dict):
+            return
+
+        segment = self._onebot_segment(value)
+        current_context = context
+        if segment:
+            segment_type, segment_data = segment
+            if segment_type == "forward":
+                current_context = self._forward_media_context(segment_data, context)
+            elif segment_type == "node":
+                current_context = self._forward_node_media_context(
+                    segment_data, context
+                )
+
+        kind, data = self._media_kind_and_data(value)
+        if kind:
+            yield (
+                base_index + depth,
+                kind,
+                self._with_media_context(data, current_context),
+            )
+
+        for key in (
+            "messages",
+            "items",
+            "content",
+            "message",
+            "segments",
+            "elements",
+            "messageChain",
+            "message_chain",
+            "data",
+            "payload",
+        ):
+            nested = value.get(key)
+            if nested is value or nested is None:
+                continue
+            if isinstance(nested, (dict, list, str)):
+                yield from self._iter_nested_media_candidates(
+                    nested,
+                    base_index=base_index + depth + 1,
+                    depth=depth + 1,
+                    context=current_context,
+                )
+
+    def _forward_media_context(
+        self, data: dict[str, Any], parent: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        context = dict(parent or {})
+        forward_id = self._first_text(data, ("id", "resid", "res_id", "forward_id"))
+        if forward_id:
+            context["forward_id"] = forward_id
+        context["source"] = "forward"
+        return context
+
+    def _forward_node_media_context(
+        self, data: dict[str, Any], parent: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        context = dict(parent or {})
+        sender = self._forward_sender_name(data)
+        sender_id = self._forward_sender_id(data)
+        if sender:
+            context["sender"] = sender
+        if sender_id:
+            context["sender_id"] = sender_id
+        context["source"] = "forward_node"
+        return context
+
+    @staticmethod
+    def _with_media_context(
+        data: dict[str, Any], context: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if not context:
+            return data
+        # meta 中带上上下文，前端和导出可以知道这个媒体来自哪条合并转发。
+        # 只复制一层，避免修改原始 raw payload，保证兜底原文仍可追溯。
+        copied = dict(data)
+        copied["_archive_context"] = dict(context)
+        return copied
 
     def _raw_message_elements(self, raw: Any) -> list[dict[str, Any]]:
         if isinstance(raw, list):
@@ -1100,12 +1246,17 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
         if not isinstance(items, list):
             return []
         messages: list[dict[str, Any]] = []
-        for index, item in enumerate(items):
+        # 合并转发可能被滥用成超大 payload。这里把“可归档节点”限制在
+        # 200 条以内，最后一个位置留给截断提示，避免一次消息拖垮 SQLite/JSONL。
+        truncated = len(items) > FORWARD_MAX_MESSAGES
+        visible_items = items[: FORWARD_MAX_MESSAGES - 1] if truncated else items
+        for index, item in enumerate(visible_items):
             if isinstance(item, str):
                 messages.append(
                     {
                         "id": f"line-{index}",
                         "sender": "消息",
+                        "sender_id": "",
                         "text": item,
                         "time": "",
                         "segments": [{"type": "text", "data": {"text": item}}],
@@ -1132,18 +1283,34 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                     "raw_message",
                 ),
             ) or "".join(self._forward_segment_text(segment) for segment in segments)
+            sender = self._forward_sender_name(item)
+            sender_id = self._forward_sender_id(item)
             messages.append(
                 {
                     "id": self._first_text(
                         item, ("msgId", "msgSeq", "message_id", "message_seq", "id")
                     )
                     or f"line-{index}",
-                    "sender": self._forward_sender_name(item),
+                    "sender": sender,
+                    "sender_id": sender_id,
                     "text": text or "[消息]",
                     "time": self._first_text(
                         item, ("time", "timestamp", "msgTime", "msg_time")
                     ),
                     "segments": segments,
+                }
+            )
+        if truncated:
+            messages.append(
+                {
+                    "id": "truncated",
+                    "sender": "系统",
+                    "sender_id": "",
+                    "text": FORWARD_TRUNCATED_TEXT,
+                    "time": "",
+                    "segments": [
+                        {"type": "text", "data": {"text": FORWARD_TRUNCATED_TEXT}}
+                    ],
                 }
             )
         return messages
@@ -1293,7 +1460,11 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                     data.get("messages") or data.get("items") or []
                 )
             )
-            return forwarded_text or "[聊天记录]"
+            forward_id = self._first_text(data, ("id", "resid", "res_id", "forward_id"))
+            if forwarded_text:
+                header = f"[合并转发:{forward_id}]" if forward_id else "[合并转发]"
+                return f"{header}\n{forwarded_text}"
+            return f"[合并转发:{forward_id}]" if forward_id else "[聊天记录]"
         if kind == "json":
             parsed = self._json_loads_maybe(
                 data.get("data") or data.get("value") or data
@@ -1313,8 +1484,25 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
             if not text:
                 continue
             sender = str(item.get("sender") or "").strip()
+            sender_id = str(item.get("sender_id") or "").strip()
+            if sender and sender_id and sender_id not in sender:
+                sender = f"{sender}({sender_id})"
             lines.append(f"{sender}: {text}" if sender else text)
         return "\n".join(lines)[:12000]
+
+    @staticmethod
+    def _forward_sender_id(item: dict[str, Any]) -> str:
+        sender = item.get("sender")
+        if isinstance(sender, dict):
+            for key in ("user_id", "uin", "uid", "sender_id", "senderId"):
+                text = str(sender.get(key) or "").strip()
+                if text:
+                    return text
+        for key in ("user_id", "userId", "uin", "uid", "sender_id", "senderId"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                return text
+        return ""
 
     @staticmethod
     def _forward_sender_name(item: dict[str, Any]) -> str:
@@ -1960,6 +2148,18 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                     str(row.get("name") or row.get("kind") or "media"),
                     created_at,
                 )
+                if (
+                    source.startswith(("http://", "https://"))
+                    and not local_path
+                    and self.config.download_remote_media
+                ):
+                    # 下载失败不能阻断归档：消息正文和原始 source 仍然入库，
+                    # 同时打一条 warning，后续可从日志定位过期 URL 或协议端异常。
+                    logger.warning(
+                        "Chat Archive media download failed: kind=%s source=%s",
+                        row.get("kind") or "",
+                        self._short_media_source(source),
+                    )
                 if local_path:
                     row["local_path"] = local_path
                 if relative_path:
@@ -2062,16 +2262,21 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
     async def _download_remote_media(
         self, kind: str, source: str, name: str, created_at: int
     ) -> tuple[str | None, str | None, int | None, str | None, str | None]:
-        if kind != "image" or not self.config.download_remote_media:
+        media_kind = self._normalize_media_kind(kind) or "file"
+        if not self.config.download_remote_media:
             return None, None, None, None, None
         max_bytes = max(1, int(self.config.max_media_mb)) * 1024 * 1024
         try:
-            async with self._open_remote_media(source, image_only=True) as (
+            async with self._open_remote_media(
+                source, image_only=media_kind == "image"
+            ) as (
                 final_url,
                 response,
             ):
                 raw_content_type = response.headers.get("Content-Type")
-                content_type = self._normalize_image_mime(raw_content_type)
+                content_type = self._normalize_remote_media_mime(
+                    media_kind, raw_content_type
+                )
                 if (
                     raw_content_type
                     and not content_type
@@ -2097,15 +2302,21 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                             f.write(chunk)
                     if size <= 0:
                         return None, None, 0, None, content_type or None
-                    detected_type = self._detect_image_mime(temp_path)
+                    detected_type = self._detect_remote_media_mime(
+                        media_kind, temp_path
+                    )
                     if not detected_type:
                         if not content_type:
                             return None, None, size, None, None
                         detected_type = content_type
+                    if not self._remote_media_mime_allowed(media_kind, detected_type):
+                        return None, None, size, None, detected_type
                     content_type = detected_type
                     sha256 = digest.hexdigest()
                     suffix = self._remote_media_suffix(final_url, name, content_type)
-                    target = self._media_target_path(kind, created_at, sha256, suffix)
+                    target = self._media_target_path(
+                        media_kind, created_at, sha256, suffix
+                    )
                     if not target.exists():
                         target.parent.mkdir(parents=True, exist_ok=True)
                         temp_path.replace(target)
@@ -2125,6 +2336,11 @@ class ChatArchiveStore(SchemaMixin, PendingWalMixin):
                             pass
         except (OSError, httpx.HTTPError, TimeoutError, ValueError):
             return None, None, None, None, None
+
+    @staticmethod
+    def _short_media_source(source: str) -> str:
+        text = str(source or "").strip()
+        return text if len(text) <= 120 else f"{text[:80]}...{text[-24:]}"
 
     @staticmethod
     def _remote_media_headers(

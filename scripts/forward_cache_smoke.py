@@ -225,8 +225,9 @@ async def main() -> None:
         hydrated = next(
             item for item in listed if item["message_id"] == "forward-msg-1d"
         )
-        assert "Alice: 第一条节点正文" in hydrated["text"], hydrated
-        assert "Bob: @全体成员[图片]" in hydrated["text"], hydrated
+        assert "[合并转发:hydrated-forward-id]" in hydrated["text"], hydrated
+        assert "Alice(10001): 第一条节点正文" in hydrated["text"], hydrated
+        assert "Bob(10002): @全体成员[图片]" in hydrated["text"], hydrated
         hydrated_detail = store.get_forward_preview(hydrated_forward_id)
         assert hydrated_detail and hydrated_detail["message_count"] == 2, (
             hydrated_detail

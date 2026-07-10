@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -18,6 +19,10 @@ from .web import ChatArchiveWeb
 PLUGIN_NAME = "astrbot_plugin_chat_archive"
 PLUGIN_VERSION = "0.1.0"
 MAX_FORWARD_HYDRATE_IDS = 5
+MAX_FORWARD_HYDRATE_DEPTH = 3
+MAX_FORWARD_HYDRATE_NODES = 200
+FORWARD_API_TIMEOUT_SECONDS = 10
+FORWARD_TRUNCATED_TEXT = "[已省略更多内容]"
 ONEBOT_FORWARD_CQ_RE = re.compile(r"\[CQ:forward,[^\]]*?\bid=([^,\]]+)[^\]]*\]")
 
 
@@ -69,6 +74,7 @@ class ChatArchivePlugin(Star):
         self.ignore_prefixes = [
             str(x) for x in (config.get("ignore_command_prefixes", []) or [])
         ]
+        self._onebot_forward_api_unavailable = False
 
     async def initialize(self):
         self.web.register_routes()
@@ -213,6 +219,8 @@ class ChatArchivePlugin(Star):
         return values
 
     async def _hydrate_onebot_forward_event(self, event: AstrMessageEvent) -> None:
+        if self._onebot_forward_api_unavailable:
+            return
         forward_ids = self._event_forward_ids(event)
         if not forward_ids:
             return
@@ -235,7 +243,21 @@ class ChatArchivePlugin(Star):
                 continue
             payload = self._onebot_forward_payload_from_api(forward_id, result)
             if payload:
+                # 嵌套合并转发只追到有限深度和有限节点数。群聊里有人会转发
+                # 非常大的聊天记录，归档需要“尽力展开”，但不能为了展开把存储拖死。
+                await self._hydrate_nested_forward_payload(
+                    event,
+                    payload,
+                    depth=1,
+                    seen_ids={forward_id},
+                    remaining_nodes=[MAX_FORWARD_HYDRATE_NODES],
+                )
                 hydrated[forward_id] = payload
+            else:
+                logger.warning(
+                    "Chat Archive get_forward_msg returned empty payload: id=%s",
+                    self._short_forward_id(forward_id),
+                )
         if not hydrated:
             return
         self._apply_hydrated_forward_payloads(event, hydrated)
@@ -246,16 +268,15 @@ class ChatArchivePlugin(Star):
     async def _call_onebot_forward_api(
         self, event: AstrMessageEvent, forward_id: str
     ) -> Any:
-        client = getattr(event, "bot", None)
+        client = self._event_bot_client(event)
         if client is None:
-            message_obj = getattr(event, "message_obj", None)
-            client = getattr(message_obj, "bot", None)
-        if client is None:
+            self._onebot_forward_api_unavailable = True
             raise RuntimeError("event.bot is not available")
 
         # AstrBot 文档示例是 event.bot.api.call_action；aiocqhttp 同时支持
-        # bot.call_action 和 bot.get_forward_msg。这里按最常见到最直接的顺序尝试，
-        # 失败后保留原始合并转发 ID，不让协议端差异影响普通归档。
+        # bot.call_action 和 bot.get_forward_msg。不同 OneBot 实现有的收 id，
+        # 有的收 message_id，所以两种签名都试一遍；所有尝试都失败时回到占位符，
+        # 不能让协议端差异影响普通消息归档。
         candidates: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
         api = getattr(client, "api", None)
         if api is not None:
@@ -266,6 +287,13 @@ class ChatArchivePlugin(Star):
                     {"id": forward_id},
                 )
             )
+            candidates.append(
+                (
+                    getattr(api, "call_action", None),
+                    ("get_forward_msg",),
+                    {"message_id": forward_id},
+                )
+            )
         candidates.extend(
             [
                 (
@@ -274,22 +302,41 @@ class ChatArchivePlugin(Star):
                     {"id": forward_id},
                 ),
                 (
+                    getattr(client, "call_action", None),
+                    ("get_forward_msg",),
+                    {"message_id": forward_id},
+                ),
+                (
                     getattr(client, "call_api", None),
                     ("get_forward_msg",),
                     {"id": forward_id},
                 ),
+                (
+                    getattr(client, "call_api", None),
+                    ("get_forward_msg",),
+                    {"message_id": forward_id},
+                ),
                 (getattr(client, "get_forward_msg", None), (), {"id": forward_id}),
+                (
+                    getattr(client, "get_forward_msg", None),
+                    (),
+                    {"message_id": forward_id},
+                ),
             ]
         )
 
         last_error: Exception | None = None
+        attempted = False
         for func, args, kwargs in candidates:
             if not callable(func):
                 continue
+            attempted = True
             try:
                 result = func(*args, **kwargs)
                 if inspect.isawaitable(result):
-                    result = await result
+                    result = await asyncio.wait_for(
+                        result, timeout=FORWARD_API_TIMEOUT_SECONDS
+                    )
                 return result
             except Exception as exc:
                 last_error = exc
@@ -301,7 +348,29 @@ class ChatArchivePlugin(Star):
                 )
         if last_error:
             raise last_error
+        if not attempted:
+            self._onebot_forward_api_unavailable = True
         raise RuntimeError("get_forward_msg API is not available")
+
+    def _event_bot_client(self, event: AstrMessageEvent) -> Any:
+        message_obj = getattr(event, "message_obj", None)
+        candidates = [
+            getattr(event, "bot", None),
+            getattr(event, "client", None),
+            getattr(message_obj, "bot", None),
+            getattr(message_obj, "client", None),
+        ]
+        for owner in (event, message_obj):
+            getter = getattr(owner, "get_client", None) if owner is not None else None
+            if callable(getter):
+                try:
+                    candidates.append(getter())
+                except Exception:
+                    logger.debug("Chat Archive event.get_client failed", exc_info=True)
+        for candidate in candidates:
+            if candidate is not None:
+                return candidate
+        return None
 
     def _onebot_forward_payload_from_api(
         self, forward_id: str, result: Any
@@ -321,6 +390,7 @@ class ChatArchivePlugin(Star):
         if not isinstance(messages, list) or not messages:
             return None
 
+        messages, truncated = self._limited_forward_messages(messages)
         normalized = self.store._normalize_forward_messages(messages)
         count = len(normalized) or len(messages)
         previews = [
@@ -328,6 +398,8 @@ class ChatArchivePlugin(Star):
             for item in normalized
             if item.get("text")
         ][:5]
+        if truncated and FORWARD_TRUNCATED_TEXT not in previews:
+            previews.append(FORWARD_TRUNCATED_TEXT)
         return {
             "id": forward_id,
             "title": "合并转发",
@@ -335,6 +407,123 @@ class ChatArchivePlugin(Star):
             "preview": previews,
             "messages": messages,
             "source": "get_forward_msg",
+        }
+
+    async def _hydrate_nested_forward_payload(
+        self,
+        event: AstrMessageEvent,
+        payload: dict[str, Any],
+        *,
+        depth: int,
+        seen_ids: set[str],
+        remaining_nodes: list[int],
+    ) -> None:
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return
+        await self._hydrate_nested_forward_value(
+            event,
+            messages,
+            depth=depth,
+            seen_ids=seen_ids,
+            remaining_nodes=remaining_nodes,
+        )
+
+    async def _hydrate_nested_forward_value(
+        self,
+        event: AstrMessageEvent,
+        value: Any,
+        *,
+        depth: int,
+        seen_ids: set[str],
+        remaining_nodes: list[int],
+    ) -> None:
+        if remaining_nodes[0] <= 0:
+            return
+        if isinstance(value, list):
+            for item in value:
+                remaining_nodes[0] -= 1
+                if remaining_nodes[0] <= 0:
+                    if isinstance(item, dict):
+                        self._mark_forward_truncated(item)
+                    return
+                await self._hydrate_nested_forward_value(
+                    event,
+                    item,
+                    depth=depth,
+                    seen_ids=seen_ids,
+                    remaining_nodes=remaining_nodes,
+                )
+            return
+        if not isinstance(value, dict):
+            return
+
+        forward_id, data = self._onebot_forward_segment(value)
+        if forward_id:
+            if (
+                depth >= MAX_FORWARD_HYDRATE_DEPTH
+                or forward_id in seen_ids
+                or remaining_nodes[0] <= 0
+            ):
+                self._mark_forward_truncated(data)
+                return
+            try:
+                result = await self._call_onebot_forward_api(event, forward_id)
+                nested_payload = self._onebot_forward_payload_from_api(
+                    forward_id, result
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Chat Archive nested get_forward_msg failed: id=%s error=%s",
+                    self._short_forward_id(forward_id),
+                    exc,
+                    exc_info=True,
+                )
+                return
+            if nested_payload:
+                data.update(nested_payload)
+                seen_ids.add(forward_id)
+                await self._hydrate_nested_forward_payload(
+                    event,
+                    nested_payload,
+                    depth=depth + 1,
+                    seen_ids=seen_ids,
+                    remaining_nodes=remaining_nodes,
+                )
+            return
+
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                await self._hydrate_nested_forward_value(
+                    event,
+                    item,
+                    depth=depth,
+                    seen_ids=seen_ids,
+                    remaining_nodes=remaining_nodes,
+                )
+
+    @staticmethod
+    def _limited_forward_messages(messages: list[Any]) -> tuple[list[Any], bool]:
+        if len(messages) <= MAX_FORWARD_HYDRATE_NODES:
+            return messages, False
+        visible = list(messages[: MAX_FORWARD_HYDRATE_NODES - 1])
+        visible.append(ChatArchivePlugin._truncated_forward_node())
+        return visible, True
+
+    @staticmethod
+    def _mark_forward_truncated(data: dict[str, Any]) -> None:
+        data.setdefault("messages", [ChatArchivePlugin._truncated_forward_node()])
+        data.setdefault("summary", FORWARD_TRUNCATED_TEXT)
+        data.setdefault("preview", [FORWARD_TRUNCATED_TEXT])
+
+    @staticmethod
+    def _truncated_forward_node() -> dict[str, Any]:
+        return {
+            "type": "node",
+            "data": {
+                "sender": {"nickname": "系统"},
+                "content": [{"type": "text", "data": {"text": FORWARD_TRUNCATED_TEXT}}],
+            },
         }
 
     def _apply_hydrated_forward_payloads(

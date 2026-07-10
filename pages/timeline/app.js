@@ -1341,6 +1341,7 @@ function renderMedia(item) {
   const card = document.createElement("div");
   const displayUrl = mediaDisplayUrl(item);
   const kind = normalizeMediaKind(item.kind);
+  const contextLabel = mediaContextLabel(item);
   card.className = `media-card ${kind}`;
   if (displayUrl && kind === "image") {
     const button = document.createElement("button");
@@ -1386,6 +1387,7 @@ function renderMedia(item) {
     <div class="file-main">
       <div class="media-kind">${escapeHtml(mediaKindLabel(kind))}</div>
       <div class="media-meta">${escapeHtml(item.name || item.source || "未命名媒体")}</div>
+      ${contextLabel ? `<div class="media-meta">${escapeHtml(contextLabel)}</div>` : ""}
     </div>
     ${displayUrl ? `<button class="media-download" type="button" aria-label="下载媒体">下载</button>` : `<span class="media-meta">仅来源</span>`}
   `;
@@ -1514,6 +1516,7 @@ function renderMediaViewer() {
   els.mediaViewerBody.replaceChildren();
   const kind = normalizeMediaKind(item.kind);
   const displayUrl = mediaDisplayUrl(item);
+  const contextLabel = mediaContextLabel(item);
   let node;
   if (kind === "image") {
     node = document.createElement("img");
@@ -1545,7 +1548,7 @@ function renderMediaViewer() {
       node.src = displayUrl;
     }
   }
-  els.mediaViewerCaption.textContent = `${item.name || mediaKindLabel(kind)} / ${state.mediaIndex + 1}/${state.mediaItems.length}`;
+  els.mediaViewerCaption.textContent = `${item.name || mediaKindLabel(kind)}${contextLabel ? ` / ${contextLabel}` : ""} / ${state.mediaIndex + 1}/${state.mediaItems.length}`;
   els.prevMediaBtn.disabled = state.mediaIndex <= 0;
   els.nextMediaBtn.disabled = state.mediaIndex >= state.mediaItems.length - 1;
   els.downloadViewerBtn.disabled = !displayUrl;
@@ -1869,6 +1872,18 @@ function mediaForGrid(item) {
   if (!dbMedia.length) return dedupeMediaItems(inlineMedia).filter((mediaItem) => !isTemporaryLocalMedia(mediaItem));
   const normalized = dedupeMediaItems(dbMedia).filter((mediaItem) => !isTemporaryLocalMedia(mediaItem) || isStableMediaItem(mediaItem));
   return preferStableMediaItems(normalized);
+}
+
+function mediaContextLabel(item) {
+  const context = item?.meta?._archive_context || item?.meta?.forward_context || {};
+  if (!context || typeof context !== "object") return "";
+  const forwardId = String(context.forward_id || "").trim();
+  const sender = String(context.sender || "").trim();
+  const senderId = String(context.sender_id || "").trim();
+  const actor = senderId && sender && !sender.includes(senderId) ? `${sender}(${senderId})` : (sender || senderId);
+  if (!forwardId && !actor) return "";
+  const shortId = forwardId.length > 18 ? `${forwardId.slice(0, 10)}...${forwardId.slice(-6)}` : forwardId;
+  return `合并转发${actor ? ` / ${actor}` : ""}${shortId ? ` / ${shortId}` : ""}`;
 }
 
 function dedupeMediaItems(items) {
